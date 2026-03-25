@@ -270,11 +270,12 @@ FROM traces-apm*
 ## Works with
 
 - **Elastic APM** — primary telemetry backend; traces, logs, and metrics in one place
-- **Kibana** — service maps, APM dashboards, ES|QL analytics, SLO management
-- **Elastic Cloud** — fully managed deployment, Serverless supported
-- **OpenTelemetry Collector** — optional intermediate collector for DCGM/Prometheus pipelines
-- **Prometheus** — metrics scraping compatible via OTLP bridge
-- **Grafana** — works alongside Elastic for teams running a mixed observability stack
+- **Kibana** — service maps, APM dashboards, ES|QL analytics, Discover, SLO management
+- **Elastic Cloud Serverless** — zero-ops deployment; OTLP ingest endpoint ready out of the box
+- **Elastic Cloud on Kubernetes (ECK)** — self-managed; same OTLP endpoint, full data control
+- **OpenTelemetry Collector** — drop-in for teams that need a collector tier; configure the `otlphttp` exporter to point at your Elastic endpoint, all pipelines work unchanged
+- **OTel Collector contrib receivers** — `prometheusreceiver`, `hostmetricsreceiver`, `dockerstatsreceiver` all forward to Elastic via the same OTLP/HTTP pipeline this project uses
+- **Elastic Fleet + EDOT managed agents** — for teams using Fleet-managed instrumentation alongside this project; both write to the same APM indices
 - **GitHub Actions** — CI-friendly; smoke tests run headlessly against any Elastic endpoint
 - **Docker** — full suite runs in a single `docker compose up` with no local runtimes required
 - **Claude Code · Cursor · GitHub Copilot · Gemini CLI · Windsurf · Roo · Cline · Codex** — via the agentskills.io skill package
