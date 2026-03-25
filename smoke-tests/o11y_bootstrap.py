@@ -14,10 +14,14 @@ Usage:
 """
 
 import logging
+import os
+import platform
+import socket
 
 from opentelemetry import trace, metrics
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.sampling import TraceIdRatioBased, ParentBased
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 
@@ -36,7 +40,8 @@ class O11yBootstrap:
     """Bootstrap all three OTel signals (traces, logs, metrics) for a service."""
 
     def __init__(self, service_name: str, endpoint: str, api_key: str,
-                 env: str = "smoke-test", version: str = "smoke"):
+                 env: str = "smoke-test", version: str = "smoke",
+                 sampler=None):
         endpoint = endpoint.rstrip("/")
         headers = {"Authorization": f"ApiKey {api_key}"}
 
@@ -44,10 +49,17 @@ class O11yBootstrap:
             "service.name":                service_name,
             "service.version":             version,
             "deployment.environment.name": env,
+            "host.name":                   socket.gethostname(),
+            "process.pid":                 os.getpid(),
+            "os.name":                     platform.system(),
+            "telemetry.sdk.name":          "edot-autopilot",
         })
 
         # ── Traces ────────────────────────────────────────────────────────
-        self._trace_provider = TracerProvider(resource=resource)
+        tracer_kwargs = {"resource": resource}
+        if sampler is not None:
+            tracer_kwargs["sampler"] = sampler
+        self._trace_provider = TracerProvider(**tracer_kwargs)
         self._trace_provider.add_span_processor(BatchSpanProcessor(
             OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", headers=headers),
             max_export_batch_size=64,

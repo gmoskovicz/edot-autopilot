@@ -79,6 +79,22 @@ session_expired = sessions.meter.create_counter("session.expired",           des
 
 suspicious_logins = gateway.meter.create_counter("auth.suspicious_logins",   description="Suspicious login events detected")
 
+# Observable gauge callbacks
+def _active_sessions_cb(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.randint(150, 450), {"region": "us-east-1"})
+
+def _mfa_queue_depth_cb(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.randint(0, 25), {"channel": "totp"})
+
+auth.meter.create_observable_gauge(
+    "auth.active_sessions", [_active_sessions_cb],
+    description="Active authenticated sessions")
+mfa.meter.create_observable_gauge(
+    "mfa.pending_queue_depth", [_mfa_queue_depth_cb],
+    description="MFA challenges pending delivery")
+
 
 # ── User profiles ─────────────────────────────────────────────────────────────
 USERS = [
@@ -213,6 +229,10 @@ def svc_mfa(request_id: str, user: dict, parent_tp: str,
         ) as entry_span:
             time.sleep(random.uniform(0.03, 0.09))
             mfa_challenges.add(1, attributes={"auth.mfa_type": user["mfa_type"]})
+            entry_span.add_event("mfa.challenge.sent", {
+                "mfa.channel": user["mfa_type"],
+                "mfa.challenge_id": challenge_id,
+            })
             mfa.logger.info(
                 f"MFA challenge issued: {challenge_id}",
                 extra={"request.id": request_id, "user.id": user["id"],
@@ -240,6 +260,10 @@ def svc_mfa(request_id: str, user: dict, parent_tp: str,
             dur_ms = (time.time() - t0) * 1000
             entry_span.set_attribute("mfa.verified", True)
             entry_span.set_attribute("mfa.verification_ms", round(dur_ms, 2))
+            entry_span.add_event("mfa.challenge.verified", {
+                "mfa.attempts": 1,
+                "mfa.verification_ms": round(dur_ms, 2),
+            })
             mfa_latency.record(dur_ms, attributes={"auth.mfa_type": user["mfa_type"], "result": "success"})
 
             mfa.logger.info(
@@ -505,6 +529,10 @@ def run_auth_flow(scenario: str, user: dict, auth_method: str,
                     return False
 
                 auth_span.set_attribute("auth.password_verified", True)
+                auth_span.add_event("auth.credentials.validated", {
+                    "auth.method": auth_method,
+                    "user.id": user["id"],
+                })
 
             # Step 2: MFA challenge
             mfa_ok, tp_mfa = svc_mfa(
@@ -513,6 +541,10 @@ def run_auth_flow(scenario: str, user: dict, auth_method: str,
             # Step 3: create session
             session_id, tp_sess = svc_session_store(
                 request_id, user, ip, device_type, tp_root, action="create")
+            root_span.add_event("auth.session.created", {
+                "session.ttl_seconds": 28800,
+                "session.id": session_id[:16],
+            })
 
             # Step 4: issue tokens
             access_token, refresh_token, tp_tok = svc_token_service(

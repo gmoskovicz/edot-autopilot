@@ -42,6 +42,14 @@ Drop CLAUDE.md into any repository root and run in Claude Code:
 - Business-aware: reads source code to understand intent before instrumenting
 - No intermediate collector required for application instrumentation
 
+## Smoke test scenarios (60+ tests)
+- 9-service e-commerce checkout platform (60-ecommerce): checkout → catalog → inventory → pricing → fraud → payment → orders → notifications
+- 7-service auth platform (61-auth-platform): gateway → auth → directory → MFA → tokens → sessions → audit
+- 7-service data pipeline (62-data-pipeline): ingest → schema → dedup → transform → enrich → storage → index
+- 7-service ML inference (63-ml-inference): gateway → cache → A/B → features → registry → serving → explainability
+- 7-service SaaS ops (64-saas-ops): portal → billing → provisioner → resources → DNS → notifications → compliance
+- Cross-tier scenario: single trace_id flowing Tier A → B → C → D (4 connected service nodes in APM service map)
+
 ## Related resources
 
 - Elastic EDOT: https://www.elastic.co/docs/reference/opentelemetry

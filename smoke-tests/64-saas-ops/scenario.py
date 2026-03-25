@@ -94,6 +94,22 @@ comp_checks       = compliance.meter.create_counter("compliance.checks_passed", 
 comp_violations   = compliance.meter.create_counter("compliance.violations",     description="Compliance violations found")
 gdpr_exports      = compliance.meter.create_counter("gdpr.data_exports",         description="GDPR data export requests")
 
+# Observable gauge callbacks
+def _tenant_active_cb(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.randint(45, 180), {"region": "us-east-1"})
+
+def _resource_pool_cb(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.uniform(0.45, 0.85), {"resource": "cpu"})
+
+billing.meter.create_observable_gauge(
+    "billing.active_tenants", [_tenant_active_cb],
+    description="Number of active tenants")
+allocator.meter.create_observable_gauge(
+    "resource.pool_utilization", [_resource_pool_cb],
+    description="Resource pool utilization ratio")
+
 
 # ── Plans & tenant profiles ────────────────────────────────────────────────────
 PLANS = {
@@ -331,6 +347,12 @@ def svc_provisioner(operation_id: str, tenant: dict, plan: str, subscription_id:
         ) as entry_span:
             provisioner_tp = inject_traceparent(entry_span)
 
+            entry_span.add_event("provisioning.started", {
+                "tenant.id": tenant["id"],
+                "tenant.plan": plan,
+                "tenant.region": tenant["region"],
+            })
+
             provisioner.logger.info(
                 f"provisioning started: {tenant['name']} plan={plan} region={tenant['region']}",
                 extra={"operation.id": operation_id, "tenant.id": tenant["id"],
@@ -342,6 +364,11 @@ def svc_provisioner(operation_id: str, tenant: dict, plan: str, subscription_id:
                 namespace, cpu, mem, tp_res = svc_resource_allocator(
                     operation_id, tenant, plan, provisioner_tp,
                     force_quota_exceeded=force_quota)
+                entry_span.add_event("provisioning.resources.allocated", {
+                    "cpu.cores": cpu,
+                    "memory.gb": mem,
+                    "k8s.namespace": namespace,
+                })
             except Exception as e:
                 entry_span.record_exception(e)
                 entry_span.set_status(StatusCode.ERROR, str(e))
@@ -464,6 +491,11 @@ def svc_dns_manager(operation_id: str, tenant: dict, parent_tp: str) -> tuple:
             entry_span.set_attribute("dns.zone_created",  True)
             entry_span.set_attribute("ssl.cert_id",       cert_id)
             entry_span.set_attribute("dns.domain",        tenant["domain"])
+            entry_span.add_event("provisioning.dns.registered", {
+                "dns.domain": tenant["domain"],
+                "ssl.cert_id": cert_id,
+                "ssl.provider": ssl_provider,
+            })
 
             dns_zones.add(1, attributes={"dns.backend": "route53"})
             dns_latency.record(dur_ms, attributes={"ssl.provider": ssl_provider})

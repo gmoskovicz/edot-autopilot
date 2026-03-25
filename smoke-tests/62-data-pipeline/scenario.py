@@ -93,6 +93,22 @@ sto_retries     = storage.meter.create_counter("storage.retries",         descri
 idx_docs        = indexer.meter.create_counter("index.docs_indexed",      description="Documents indexed")
 idx_latency     = indexer.meter.create_histogram("index.duration_ms",     description="Index operation latency", unit="ms")
 
+# Observable gauge callbacks
+def _queue_depth_cb(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.randint(0, 500), {"queue": "ingest-raw"})
+
+def _dedup_cache_ratio_cb(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.uniform(0.88, 0.97), {"cache": "redis-dedup"})
+
+ingest.meter.create_observable_gauge(
+    "ingest.queue_depth", [_queue_depth_cb],
+    description="Ingest queue depth")
+dedup.meter.create_observable_gauge(
+    "dedup.cache_hit_ratio", [_dedup_cache_ratio_cb],
+    description="Dedup cache hit ratio")
+
 
 # ── Event type definitions ─────────────────────────────────────────────────────
 EVENT_TYPES  = ["clickstream", "purchase", "signup", "search", "error", "pageview", "api_call"]
@@ -350,6 +366,10 @@ def svc_transform(batch_id: str, event_type: str, source: str, records: list,
                         "transform.mapping": f"{event_type}-to-canonical-v2",
                         "records.count": len(records)}
         ) as entry_span:
+            entry_span.add_event("pipeline.batch.received", {
+                "batch.size": len(records),
+                "event.type": event_type,
+            })
             time.sleep(random.uniform(0.02, 0.08))
 
             if force_malformed:
@@ -381,6 +401,11 @@ def svc_transform(batch_id: str, event_type: str, source: str, records: list,
             entry_span.set_attribute("transform.bytes_out",       bytes_out)
             entry_span.set_attribute("transform.fields_mapped",   random.randint(5, 20))
             entry_span.set_attribute("transform.fields_dropped",  random.randint(0, 4))
+            entry_span.add_event("pipeline.transform.applied", {
+                "transform.rule": "normalize",
+                "transform.mapping": f"{event_type}-to-canonical-v2",
+                "records.transformed": transformed_count,
+            })
 
             transform.logger.info(
                 f"transform complete: {transformed_count} records normalized",
@@ -446,6 +471,12 @@ def svc_enrichment(batch_id: str, event_type: str, records: list, source: str,
             entry_span.set_attribute("enrichment.user_segment",   user_segment)
             entry_span.set_attribute("enrichment.records_enriched", enriched_count)
             entry_span.set_attribute("enrichment.geo_hit_rate",   0.97)
+            entry_span.add_event("pipeline.records.enriched", {
+                "enrichment.fields_added": 5,
+                "enrichment.geo_country": geo_country,
+                "enrichment.user_segment": user_segment,
+                "records.enriched": enriched_count,
+            })
 
             enrichment.logger.info(
                 f"enrichment complete: {enriched_count} records enriched",

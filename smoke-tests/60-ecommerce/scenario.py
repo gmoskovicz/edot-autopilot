@@ -24,7 +24,7 @@ Run:
     python3 60-ecommerce/scenario.py
 """
 
-import os, sys, uuid, time, random
+import os, sys, uuid, time, random, threading
 from pathlib import Path
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
@@ -39,8 +39,10 @@ if env_file.exists():
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from o11y_bootstrap import O11yBootstrap
 
-from opentelemetry.trace import SpanKind, StatusCode
+from opentelemetry.trace import SpanKind, StatusCode, Link
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry import baggage
+from opentelemetry.baggage.propagation import W3CBaggagePropagator
 
 ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
 API_KEY  = os.environ["ELASTIC_API_KEY"]
@@ -95,6 +97,36 @@ order_errors   = orders.meter.create_counter("order.errors",             descrip
 # notification-service
 notif_sent     = notify.meter.create_counter("notification.sent",        description="Notifications sent")
 notif_latency  = notify.meter.create_histogram("notification.duration_ms", description="Notification latency", unit="ms")
+
+# ── Observable gauges ─────────────────────────────────────────────────────────
+_active_checkouts = 0
+_active_checkouts_lock = threading.Lock()
+
+def _checkout_active_callback(options):
+    from opentelemetry.metrics import Observation
+    with _active_checkouts_lock:
+        yield Observation(_active_checkouts, {"env": ENV})
+
+def _fraud_cache_callback(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.uniform(0.75, 0.95), {"model": "xgb-v4.1"})
+
+def _payment_pool_callback(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.randint(3, 10), {"processor": "stripe"})
+
+checkout.meter.create_observable_gauge(
+    "checkout.active_sessions", [_checkout_active_callback],
+    description="Currently active checkout sessions"
+)
+fraud.meter.create_observable_gauge(
+    "fraud.model_cache_hit_ratio", [_fraud_cache_callback],
+    description="Fraud model feature cache hit ratio"
+)
+processor.meter.create_observable_gauge(
+    "payment.connection_pool_size", [_payment_pool_callback],
+    description="Active payment processor connections"
+)
 
 
 # ── Product catalog ────────────────────────────────────────────────────────────
@@ -347,6 +379,7 @@ def svc_fraud_detection(payment_id: str, customer: dict, amount_usd: float,
                         "customer.tier": customer["tier"]}
         ) as entry_span:
             time.sleep(random.uniform(0.05, 0.15))
+            entry_span.add_event("fraud.features.loaded", {"fraud.feature_count": 147, "fraud.model": "xgb-v4.1"})
 
             # Compute fraud score based on customer history + amount
             base_score = min(0.05 + (customer["fraud_history"] * 0.12), 0.95)
@@ -356,6 +389,8 @@ def svc_fraud_detection(payment_id: str, customer: dict, amount_usd: float,
             score = round(min(base_score + random.uniform(-0.03, 0.03), 1.0), 4)
             decision = "block" if score > 0.85 else "allow"
             risk_tier = "HIGH" if score > 0.7 else ("MEDIUM" if score > 0.4 else "LOW")
+
+            entry_span.add_event("fraud.model.scored", {"fraud.score": score, "fraud.risk_tier": risk_tier})
 
             entry_span.set_attribute("fraud.score",         score)
             entry_span.set_attribute("fraud.decision",      decision)
@@ -367,6 +402,7 @@ def svc_fraud_detection(payment_id: str, customer: dict, amount_usd: float,
             fraud_scores.record(score, attributes={"customer.tier": customer["tier"]})
 
             if decision == "block":
+                entry_span.add_event("fraud.transaction.blocked", {"fraud.score": score, "fraud.block_reason": "score_exceeded_threshold"})
                 fraud_blocks.add(1, attributes={"fraud.risk_tier": risk_tier})
                 entry_span.record_exception(ValueError(f"Transaction blocked: fraud score {score}"), attributes={"exception.escaped": True})
                 entry_span.set_status(StatusCode.ERROR, f"Transaction blocked: fraud score {score}")
@@ -410,6 +446,7 @@ def svc_payment_processor(payment_id: str, amount_usd: float, method: str,
                         "payment.method": method, "payment.provider": "stripe",
                         "payment.currency": "usd"}
         ) as stripe_span:
+            stripe_span.add_event("payment.auth.initiated", {"payment.gateway": "stripe", "payment.amount_usd": amount_usd})
             time.sleep(random.uniform(0.08, 0.25))
 
             if force_decline:
@@ -432,6 +469,7 @@ def svc_payment_processor(payment_id: str, amount_usd: float, method: str,
                 )
                 return False, None, error_code, inject_traceparent(stripe_span)
 
+            stripe_span.add_event("payment.auth.completed", {"payment.auth_code": f"AUTH-{uuid.uuid4().hex[:8].upper()}"})
             charge_id = f"ch_{uuid.uuid4().hex[:24]}"
             stripe_span.set_attribute("payment.charge_id",  charge_id)
             stripe_span.set_attribute("payment.status",     "succeeded")
@@ -541,7 +579,7 @@ def svc_payment(order_id: str, customer: dict, amount_usd: float, method: str,
 
 
 def svc_notification(order_id: str, customer: dict, total_usd: float,
-                      parent_tp: str) -> bool:
+                      parent_tp: str, order_traceparent: str = None) -> bool:
     """Send order confirmation via email and push notification."""
     parent_ctx = extract_context(parent_tp)
     t0 = time.time()
@@ -555,9 +593,19 @@ def svc_notification(order_id: str, customer: dict, total_usd: float,
     ) as exit_span:
         tp = inject_traceparent(exit_span)
 
+        # Build span links to the order span if an order traceparent was provided
+        notify_links = []
+        if order_traceparent:
+            order_ctx = extract_context(order_traceparent)
+            from opentelemetry import trace as _trace
+            order_span_ctx = _trace.get_current_span(order_ctx).get_span_context()
+            if order_span_ctx and order_span_ctx.is_valid:
+                notify_links.append(Link(context=order_span_ctx))
+
         with notify.tracer.start_as_current_span(
             "notification.send_order_confirmation", kind=SpanKind.SERVER,
             context=extract_context(tp),
+            links=notify_links,
             attributes={"http.method": "POST", "http.route": "/api/v1/send",
                         "order.id": order_id, "notification.channel": "email+push",
                         "notification.template": "order_confirmation_v2",
@@ -646,9 +694,10 @@ def svc_order_service(order_id: str, customer: dict, items: list, warehouse: str
             order_created.add(1, attributes={"customer.tier": customer["tier"],
                                               "order.warehouse_id": warehouse})
 
-            # Trigger notification
+            # Trigger notification — pass order span traceparent as a link
+            order_tp = inject_traceparent(entry_span)
             notif_ok = svc_notification(order_id, customer, total_usd,
-                                         inject_traceparent(entry_span))
+                                         order_tp, order_traceparent=order_tp)
 
             dur_ms = (time.time() - t0) * 1000
             orders.logger.info(
@@ -677,99 +726,116 @@ def run_checkout_scenario(scenario_type: str, customer: dict, items: list):
     print(f"\n  [{scenario_type}] order={order_id} customer={customer['id']} "
           f"tier={customer['tier']} method={method}")
 
-    with checkout.tracer.start_as_current_span(
-        "checkout.request", kind=SpanKind.SERVER,
-        attributes={"http.method": "POST", "http.route": "/api/v1/checkout",
-                    "order.id": order_id, "customer.id": customer["id"],
-                    "customer.tier": customer["tier"],
-                    "payment.method": method,
-                    "checkout.items_count": len(items),
-                    "scenario": scenario_type}
-    ) as root_span:
-        tp_root = inject_traceparent(root_span)
+    # Set W3C baggage for customer.tier and request.priority
+    baggage_ctx = baggage.set_baggage("customer.tier", customer["tier"])
+    baggage_ctx = baggage.set_baggage(
+        "request.priority",
+        "HIGH" if customer["tier"] == "enterprise" else "NORMAL",
+        context=baggage_ctx
+    )
 
-        try:
-            # 1. Product catalog lookup
-            enriched_items, tp = svc_product_catalog(order_id, items, tp_root)
+    # Track active checkouts
+    global _active_checkouts
+    with _active_checkouts_lock:
+        _active_checkouts += 1
 
-            # 2. Inventory check
-            reservation_id, warehouse, tp = svc_inventory(
-                order_id, enriched_items, tp_root, force_stockout=force_stockout)
+    try:
+        with checkout.tracer.start_as_current_span(
+            "checkout.request", kind=SpanKind.SERVER,
+            attributes={"http.method": "POST", "http.route": "/api/v1/checkout",
+                        "order.id": order_id, "customer.id": customer["id"],
+                        "customer.tier": customer["tier"],
+                        "payment.method": method,
+                        "checkout.items_count": len(items),
+                        "scenario": scenario_type}
+        ) as root_span:
+            tp_root = inject_traceparent(root_span)
 
-            # 3. Pricing engine
-            total_usd, discount_usd, tp = svc_pricing_engine(
-                order_id, customer, enriched_items, tp_root,
-                force_timeout=force_pricing_to)
+            try:
+                # 1. Product catalog lookup
+                enriched_items, tp = svc_product_catalog(order_id, items, tp_root)
 
-            root_span.set_attribute("order.total_usd",    total_usd)
-            root_span.set_attribute("order.discount_usd", discount_usd)
+                # 2. Inventory check
+                reservation_id, warehouse, tp = svc_inventory(
+                    order_id, enriched_items, tp_root, force_stockout=force_stockout)
 
-            # 4. Payment (includes fraud + processor)
-            pay_ok, payment_id, pay_error, charge_id = svc_payment(
-                order_id, customer, total_usd, method, tp_root,
-                force_fraud=force_fraud, force_decline=force_decline)
+                # 3. Pricing engine
+                total_usd, discount_usd, tp = svc_pricing_engine(
+                    order_id, customer, enriched_items, tp_root,
+                    force_timeout=force_pricing_to)
 
-            if not pay_ok:
-                root_span.record_exception(RuntimeError(f"Payment failed: {pay_error}"), attributes={"exception.escaped": True})
-                root_span.set_status(StatusCode.ERROR, f"Payment failed: {pay_error}")
-                co_errors.add(1, attributes={"error.type": pay_error})
-                co_requests.add(1, attributes={"result": "payment_failed",
+                root_span.set_attribute("order.total_usd",    total_usd)
+                root_span.set_attribute("order.discount_usd", discount_usd)
+
+                # 4. Payment (includes fraud + processor)
+                pay_ok, payment_id, pay_error, charge_id = svc_payment(
+                    order_id, customer, total_usd, method, tp_root,
+                    force_fraud=force_fraud, force_decline=force_decline)
+
+                if not pay_ok:
+                    root_span.record_exception(RuntimeError(f"Payment failed: {pay_error}"), attributes={"exception.escaped": True})
+                    root_span.set_status(StatusCode.ERROR, f"Payment failed: {pay_error}")
+                    co_errors.add(1, attributes={"error.type": pay_error})
+                    co_requests.add(1, attributes={"result": "payment_failed",
+                                                    "customer.tier": customer["tier"]})
+                    co_latency.record((time.time() - t_start) * 1000,
+                                      attributes={"result": "payment_failed"})
+                    tag = "🚫" if "fraud" in pay_error else "❌"
+                    print(f"    {tag} Payment failed: {pay_error}")
+                    checkout.logger.warning(
+                        f"checkout failed: {pay_error}",
+                        extra={"order.id": order_id, "payment.error": pay_error,
+                               "customer.id": customer["id"]}
+                    )
+                    return False
+
+                # 5. Create order + notify
+                order_ok, tp = svc_order_service(
+                    order_id, customer, enriched_items, warehouse,
+                    payment_id, charge_id, total_usd, tp_root,
+                    force_db_error=force_db_err)
+
+                root_span.set_attribute("order.status", "confirmed")
+                root_span.set_attribute("order.id",     order_id)
+                dur_ms = (time.time() - t_start) * 1000
+                co_requests.add(1, attributes={"result": "success",
                                                 "customer.tier": customer["tier"]})
-                co_latency.record((time.time() - t_start) * 1000,
-                                  attributes={"result": "payment_failed"})
-                tag = "🚫" if "fraud" in pay_error else "❌"
-                print(f"    {tag} Payment failed: {pay_error}")
-                checkout.logger.warning(
-                    f"checkout failed: {pay_error}",
-                    extra={"order.id": order_id, "payment.error": pay_error,
+                co_latency.record(dur_ms, attributes={"result": "success"})
+                co_value.record(total_usd, attributes={"customer.tier": customer["tier"]})
+                checkout.logger.info(
+                    f"checkout completed: {order_id} ${total_usd}",
+                    extra={"order.id": order_id, "order.total_usd": total_usd,
+                           "payment.id": payment_id, "charge.id": charge_id,
+                           "customer.id": customer["id"], "checkout.duration_ms": dur_ms}
+                )
+                print(f"    ✅ Checkout complete: {order_id} ${total_usd:.2f} ({dur_ms:.0f}ms)")
+                return True
+
+            except Exception as e:
+                root_span.record_exception(e)
+                root_span.set_status(StatusCode.ERROR, str(e))
+                dur_ms = (time.time() - t_start) * 1000
+                err_type = type(e).__name__
+                co_errors.add(1, attributes={"error.type": err_type})
+                co_requests.add(1, attributes={"result": "error", "customer.tier": customer["tier"]})
+                co_latency.record(dur_ms, attributes={"result": "error"})
+                checkout.logger.error(
+                    f"checkout exception: {e}",
+                    extra={"order.id": order_id, "error.type": err_type,
                            "customer.id": customer["id"]}
                 )
+                if "stockout" in str(e).lower() or "InsufficientStock" in str(e):
+                    print(f"    ⚠️  Out of stock: {e}")
+                elif "DB" in str(e) or "connection" in str(e).lower():
+                    print(f"    ❌ CRITICAL DB error: {e}")
+                elif "Timeout" in str(e):
+                    print(f"    ⚠️  Service timeout: {e}")
+                else:
+                    print(f"    ❌ Error: {e}")
                 return False
-
-            # 5. Create order + notify
-            order_ok, tp = svc_order_service(
-                order_id, customer, enriched_items, warehouse,
-                payment_id, charge_id, total_usd, tp_root,
-                force_db_error=force_db_err)
-
-            root_span.set_attribute("order.status", "confirmed")
-            root_span.set_attribute("order.id",     order_id)
-            dur_ms = (time.time() - t_start) * 1000
-            co_requests.add(1, attributes={"result": "success",
-                                            "customer.tier": customer["tier"]})
-            co_latency.record(dur_ms, attributes={"result": "success"})
-            co_value.record(total_usd, attributes={"customer.tier": customer["tier"]})
-            checkout.logger.info(
-                f"checkout completed: {order_id} ${total_usd}",
-                extra={"order.id": order_id, "order.total_usd": total_usd,
-                       "payment.id": payment_id, "charge.id": charge_id,
-                       "customer.id": customer["id"], "checkout.duration_ms": dur_ms}
-            )
-            print(f"    ✅ Checkout complete: {order_id} ${total_usd:.2f} ({dur_ms:.0f}ms)")
-            return True
-
-        except Exception as e:
-            root_span.record_exception(e)
-            root_span.set_status(StatusCode.ERROR, str(e))
-            dur_ms = (time.time() - t_start) * 1000
-            err_type = type(e).__name__
-            co_errors.add(1, attributes={"error.type": err_type})
-            co_requests.add(1, attributes={"result": "error", "customer.tier": customer["tier"]})
-            co_latency.record(dur_ms, attributes={"result": "error"})
-            checkout.logger.error(
-                f"checkout exception: {e}",
-                extra={"order.id": order_id, "error.type": err_type,
-                       "customer.id": customer["id"]}
-            )
-            if "stockout" in str(e).lower() or "InsufficientStock" in str(e):
-                print(f"    ⚠️  Out of stock: {e}")
-            elif "DB" in str(e) or "connection" in str(e).lower():
-                print(f"    ❌ CRITICAL DB error: {e}")
-            elif "Timeout" in str(e):
-                print(f"    ⚠️  Service timeout: {e}")
-            else:
-                print(f"    ❌ Error: {e}")
-            return False
+    finally:
+        with _active_checkouts_lock:
+            _active_checkouts -= 1
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

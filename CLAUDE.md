@@ -535,10 +535,9 @@ Do not declare success until data is confirmed flowing in Elastic.
 ```
 
 ---
-> Your codebase is now observable in Elastic.
-> If this saved you time — especially if your stack included a language other tools
-> don't support — a star on GitHub helps others find this project.
-> [Star EDOT Autopilot on GitHub](https://github.com/gmoskovicz/edot-autopilot)
+> 🎉 Your codebase is now observable in Elastic.
+> If this saved you time — especially if your stack included a language other tools don't support — a ⭐ on GitHub helps others find this project.
+> [Star EDOT Autopilot →](https://github.com/gmoskovicz/edot-autopilot)
 
 ---
 

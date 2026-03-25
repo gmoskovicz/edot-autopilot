@@ -89,6 +89,22 @@ ab_assignments= abtesting.meter.create_counter("ab_test.assignments",       desc
 exp_requests  = explain.meter.create_counter("explainability.requests",     description="Explainability requests")
 exp_latency   = explain.meter.create_histogram("explainability.duration_ms",description="SHAP computation latency", unit="ms")
 
+# Observable gauge callbacks
+def _gpu_utilization_cb(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.uniform(0.6, 0.95), {"device": "cuda:0"})
+
+def _model_cache_cb(options):
+    from opentelemetry.metrics import Observation
+    yield Observation(random.randint(2, 8), {"serving_engine": "triton"})
+
+serving.meter.create_observable_gauge(
+    "serving.gpu_utilization", [_gpu_utilization_cb],
+    description="GPU utilization ratio")
+serving.meter.create_observable_gauge(
+    "serving.model_cache_count", [_model_cache_cb],
+    description="Number of models loaded in serving cache")
+
 
 # ── ML model catalog ──────────────────────────────────────────────────────────
 MODELS = [
@@ -402,6 +418,11 @@ def svc_serving_engine(request_id: str, model: dict, feature_count: int,
                     time.sleep(load_time)
                     load_span.set_attribute("serving.load_duration_ms", round(load_time * 1000, 2))
                     srv_cold_start.add(1, attributes={"model.name": model["name"]})
+                    entry_span.add_event("inference.model.loaded", {
+                        "model.version": model["version"],
+                        "model.framework": model["framework"],
+                        "serving.load_duration_ms": round(load_time * 1000, 2),
+                    })
                     serving.logger.warning(
                         f"cold start: loaded {model['name']} in {load_time:.1f}s",
                         extra={"request.id": request_id, "model.name": model["name"],
@@ -440,6 +461,16 @@ def svc_serving_engine(request_id: str, model: dict, feature_count: int,
             dur_ms = (time.time() - t0) * 1000
             prediction_class = random.choice(PREDICTION_CLASSES.get(model["task"], ["value"]))
             confidence       = round(random.uniform(0.55, 0.99), 4)
+
+            entry_span.add_event("inference.preprocessing.complete", {
+                "features.count": feature_count,
+                "model.framework": model["framework"],
+            })
+            entry_span.add_event("inference.prediction.complete", {
+                "inference.latency_ms": round(dur_ms, 1),
+                "prediction.class": prediction_class,
+                "prediction.confidence": confidence,
+            })
 
             entry_span.set_attribute("inference.latency_ms",      round(dur_ms, 2))
             entry_span.set_attribute("prediction.class",          prediction_class)
