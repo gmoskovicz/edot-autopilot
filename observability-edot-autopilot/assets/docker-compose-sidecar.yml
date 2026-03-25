@@ -1,0 +1,57 @@
+# Docker Compose — Telemetry Sidecar Pattern (Tier D)
+#
+# The sidecar shares the network namespace with the legacy container.
+# Legacy processes can reach it at http://127.0.0.1:9411 without any
+# network configuration.
+#
+# Usage:
+#   cp .env.otel.example .env.otel
+#   # fill in ELASTIC_OTLP_ENDPOINT and ELASTIC_API_KEY
+#   docker compose -f docker-compose-sidecar.yml up
+
+services:
+  legacy-app:
+    image: your-legacy-app:latest          # replace with your image
+    depends_on:
+      otel-sidecar:
+        condition: service_healthy
+    environment:
+      OTEL_SIDECAR_URL: "http://127.0.0.1:9411"
+    env_file: [.env.otel]
+    # The sidecar shares the same network namespace so 127.0.0.1:9411 resolves
+    network_mode: "service:otel-sidecar"
+
+  otel-sidecar:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        RUN pip install --no-cache-dir \
+            opentelemetry-sdk \
+            opentelemetry-exporter-otlp-proto-http
+        COPY scripts/otel-sidecar.py /otel-sidecar.py
+        CMD ["python", "/otel-sidecar.py"]
+    env_file: [.env.otel]
+    environment:
+      OTEL_SERVICE_NAME:           "${LEGACY_SERVICE_NAME:-legacy-service}"
+      OTEL_DEPLOYMENT_ENVIRONMENT: "${ENVIRONMENT:-production}"
+      SIDECAR_PORT:                "${SIDECAR_PORT:-9411}"
+    restart: unless-stopped
+    healthcheck:
+      test: >
+        python3 -c "
+        import urllib.request, json
+        r = urllib.request.urlopen(
+          urllib.request.Request(
+            'http://127.0.0.1:${SIDECAR_PORT:-9411}',
+            data=b'{\"action\":\"health\"}',
+            headers={'Content-Type':'application/json'},
+            method='POST'
+          ), timeout=2
+        )
+        assert json.loads(r.read()).get('ok')
+        "
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
