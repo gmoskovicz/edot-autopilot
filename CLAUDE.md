@@ -107,6 +107,18 @@ Frameworks with zero-config auto-instrumentation:
 
 Action: Apply EDOT SDK with `edot-bootstrap` / `-javaagent` / `require()`. Done.
 
+**Exact packages to install:**
+
+| Language | Install command | Auto-instrument command |
+|----------|----------------|------------------------|
+| Python | `pip install opentelemetry-distro opentelemetry-exporter-otlp` then `opentelemetry-bootstrap -a install` | `opentelemetry-instrument python app.py` |
+| Node.js | `npm install @opentelemetry/sdk-node @opentelemetry/auto-instrumentations-node @opentelemetry/exporter-trace-otlp-http` | require at startup or `--require ./tracing.js` |
+| Java | Download `elastic-otel-javaagent.jar` | `java -javaagent:elastic-otel-javaagent.jar -jar app.jar` |
+| .NET 6+ | `dotnet add package Elastic.Apm` + `AddElasticApm()` in Program.cs | built into SDK |
+| Go | `go get go.opentelemetry.io/otel go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc go.opentelemetry.io/contrib/instrumentation/...` | manual init + per-framework contrib package |
+| Ruby | `gem install opentelemetry-sdk opentelemetry-exporter-otlp opentelemetry-instrumentation-all` | `OpenTelemetry::SDK.configure { |c| c.use_all }` |
+| PHP 8+ | `composer require open-telemetry/sdk open-telemetry/exporter-otlp open-telemetry/opentelemetry-auto-laravel` | env-based auto-instrumentation |
+
 ---
 
 ### Tier B — Partial Support (framework not covered, language is)
