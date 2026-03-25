@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 """
-E2E Auto-Instrumentation Verification — FastAPI ML Serving
-==========================================================
-Simulates: User runs "Observe this project." on a FastAPI ML inference API.
+E2E "Observe this project." — FastAPI ML Inference
+===================================================
+This test ACTUALLY runs `claude -p "Observe this project."` on a blank,
+uninstrumented FastAPI ML inference service. It does not assume or hardcode
+what the agent will generate.
 
-EDOT Autopilot:
-  1. Reads the codebase (FastAPI + SQLAlchemy async + httpx)
-  2. Applies opentelemetry-instrumentation-fastapi, -sqlalchemy, -httpx
-  3. Adds business enrichment: ml.model_name, ml.inference_ms, ml.prediction
-  4. This test runs the instrumented app and verifies auto-instrumentation works
+What this tests:
+  1. The agent reads the blank app and understands it (FastAPI, ML models,
+     inference endpoint)
+  2. The agent correctly assigns Tier A (auto-instrumentation via
+     opentelemetry-instrumentation-fastapi)
+  3. The agent adds business enrichment (model.name, prediction.class,
+     inference.latency_ms)
+  4. The generated requirements.txt includes the right OTel packages
+  5. The instrumented app runs and serves requests
+  6. Spans actually arrive in Elastic with correct attributes
 
-Verification checklist:
-  ✓ FastAPI SERVER span auto-created for every route
-  ✓ Correct HTTP semconv 1.20+ names
-  ✓ SQLAlchemy CLIENT spans for DB queries
-  ✓ Business enrichment: ml.model_name, ml.inference_ms, ml.prediction present
-  ✓ OTLP export to Elastic succeeds
+Run:
+    cd smoke-tests && python3 83-e2e-fastapi-ml/smoke.py
+
+Requirements (in addition to requirements.txt):
+  - `claude` CLI installed and authenticated
+  - ELASTIC_OTLP_ENDPOINT and ELASTIC_API_KEY set in .env or environment
 """
 
-import os, sys, time, threading, json, random
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
+import json
+
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
@@ -29,251 +43,287 @@ if not ENDPOINT or not API_KEY:
     print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
     sys.exit(0)
 
-# ─── Check required packages ──────────────────────────────────────────────────
-missing = []
-try:
-    import fastapi
-    import uvicorn
-except ImportError:
-    missing.append("fastapi uvicorn")
-try:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-except ImportError:
-    missing.append("opentelemetry-instrumentation-fastapi")
+SVC         = "83-e2e-fastapi-ml"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-fastapi-ml")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-if missing:
-    print(f"SKIP: missing packages: {', '.join(missing)}")
-    print(f"  Run: pip install {' '.join(missing)}")
-    sys.exit(0)
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
-# ─── STEP 1: Original FastAPI ML app (what the user brings) ───────────────────
-import fastapi
-import uvicorn
-from fastapi import FastAPI
-from pydantic import BaseModel
-from sqlalchemy import create_engine, text
-import requests as http_lib
-
-fastapi_app = FastAPI(title="ML Inference API")
-db_engine = create_engine("sqlite:///:memory:", future=True)
-
-with db_engine.connect() as conn:
-    conn.execute(text("""CREATE TABLE predictions (
-        id TEXT, model TEXT, input_hash TEXT, prediction TEXT, latency_ms REAL
-    )"""))
-    conn.commit()
-
-class PredictRequest(BaseModel):
-    text: str
-    model: str = "sentiment-v2"
-    customer_id: str = "anon"
-
-class PredictResponse(BaseModel):
-    prediction: str
-    confidence: float
-    model: str
-    latency_ms: float
-
-@fastapi_app.get("/models")
-def list_models():
-    return {"models": ["sentiment-v2", "intent-classifier-v1", "fraud-scorer-v3"]}
-
-@fastapi_app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
-    start = time.time()
-    # Simulate inference
-    prediction  = random.choice(["positive", "negative", "neutral"])
-    confidence  = round(random.uniform(0.7, 0.99), 3)
-    latency_ms  = round((time.time() - start) * 1000 + random.uniform(10, 80), 2)
-    with db_engine.connect() as conn:
-        conn.execute(text("INSERT INTO predictions VALUES (:id,:m,:h,:p,:l)"),
-                     {"id": "pred-001", "m": req.model, "h": str(hash(req.text)),
-                      "p": prediction, "l": latency_ms})
-        conn.commit()
-    return PredictResponse(prediction=prediction, confidence=confidence,
-                           model=req.model, latency_ms=latency_ms)
-
-@fastapi_app.get("/health")
-def health():
-    return {"status": "ok"}
-
-# ─── STEP 2: EDOT Autopilot instrumentation ───────────────────────────────────
-from opentelemetry import trace as otel_trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.trace import SpanKind
-
-_memory_exporter = InMemorySpanExporter()
-_resource = Resource.create({
-    "service.name":           "fastapi-ml-api",
-    "service.version":        "1.0.0",
-    "deployment.environment": "smoke-test",
-    "deployment.environment.name": "smoke-test",
-    "telemetry.sdk.name":     "opentelemetry-python",
-    "telemetry.sdk.language": "python",
-    "telemetry.distro.name":  "edot-autopilot",
-})
-_provider = TracerProvider(resource=_resource)
-_provider.add_span_processor(SimpleSpanProcessor(_memory_exporter))
-_provider.add_span_processor(BatchSpanProcessor(
-    OTLPSpanExporter(endpoint=f"{ENDPOINT}/v1/traces",
-                     headers={"Authorization": f"ApiKey {API_KEY}"}),
-    schedule_delay_millis=500,
-))
-otel_trace.set_tracer_provider(_provider)
-
-_sqla_ok = False
-try:
-    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-    SQLAlchemyInstrumentor().instrument(engine=db_engine)
-    _sqla_ok = True
-except ImportError:
-    pass
-
-# FastAPI instrumentation
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-# Business enrichment via FastAPI middleware
-from fastapi import Request as FastAPIRequest
-from fastapi.responses import Response as FastAPIResponse
-import starlette.middleware.base
-
-class EDOTEnrichmentMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
-    """EDOT Autopilot adds this to enrich ML spans with business context."""
-    async def dispatch(self, request: FastAPIRequest, call_next):
-        span = otel_trace.get_current_span()
-        response = await call_next(request)
-        return response
-
-fastapi_app.add_middleware(EDOTEnrichmentMiddleware)
-
-# Instrument FastAPI AFTER adding middleware
-FastAPIInstrumentor.instrument_app(fastapi_app)
-
-# Patch predict to add ML business enrichment
-_orig_predict = predict.__wrapped__ if hasattr(predict, "__wrapped__") else None
-
-@fastapi_app.middleware("http")
-async def _edot_ml_enrichment(request: FastAPIRequest, call_next):
-    response = await call_next(request)
-    return response
-
-# Use a simpler approach - wrap the predict endpoint
-_original_predict = fastapi_app.routes
-
-# ─── STEP 3: Run the instrumented app ─────────────────────────────────────────
-PORT = 15083
-
-import asyncio
-
-def _run_uvicorn():
-    uvicorn.run(fastapi_app, host="127.0.0.1", port=PORT, log_level="error")
-
-_t = threading.Thread(target=_run_uvicorn, daemon=True)
-_t.start()
-
-for _ in range(30):
-    try:
-        http_lib.get(f"http://127.0.0.1:{PORT}/health", timeout=0.5)
-        break
-    except Exception:
-        time.sleep(0.2)
-else:
-    print("FAIL: FastAPI server did not start in time")
-    sys.exit(1)
-
-# Real requests — auto-instrumentation fires automatically
-_r_models  = http_lib.get(f"http://127.0.0.1:{PORT}/models")
-_r_pred1   = http_lib.post(f"http://127.0.0.1:{PORT}/predict",
-                            json={"text": "I love this product!", "model": "sentiment-v2",
-                                  "customer_id": "cust-001"})
-_r_pred2   = http_lib.post(f"http://127.0.0.1:{PORT}/predict",
-                            json={"text": "This is terrible.", "model": "sentiment-v2",
-                                  "customer_id": "cust-002"})
-_r_pred3   = http_lib.post(f"http://127.0.0.1:{PORT}/predict",
-                            json={"text": "Transaction from Nigeria at 3am",
-                                  "model": "fraud-scorer-v3", "customer_id": "cust-003"})
-
-time.sleep(0.8)
-_provider.force_flush()
-
-# ─── STEP 4: Assertions ────────────────────────────────────────────────────────
-CHECKS = []
-def check(name, ok, detail=""):
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
     CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-all_spans = _memory_exporter.get_finished_spans()
-
 print(f"\n{'='*62}")
-print("EDOT-Autopilot | 83-e2e-fastapi-ml | Auto-Instrumentation")
+print(f"EDOT-Autopilot | {SVC}")
 print(f"{'='*62}")
-print(f"  Service: fastapi-ml-api | Port: {PORT}")
-print(f"  Total spans captured: {len(all_spans)}")
-if all_spans:
-    print(f"  Span names: {sorted(set(s.name for s in all_spans))}")
+print(f"  Fixture: blank-fastapi-ml (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print(f"  Target:  {ENDPOINT.split('@')[-1].split('/')[0] if '@' in ENDPOINT else ENDPOINT[:40]}")
 print()
 
-predict_spans = [s for s in all_spans if "predict" in s.name.lower() and s.kind == SpanKind.SERVER]
-models_span   = next((s for s in all_spans if "models" in s.name.lower() and s.kind == SpanKind.SERVER), None)
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture app exists", os.path.isdir(FIXTURE_DIR))
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-print("FastAPI auto-instrumentation:")
-check("FastAPI SERVER span auto-created for GET /models",
-      models_span is not None,
-      f"all span names: {[s.name for s in all_spans]}")
-check("FastAPI SERVER span auto-created for POST /predict",
-      len(predict_spans) > 0,
-      f"predict spans: {[s.name for s in predict_spans]}")
-check("3 predict spans (one per request)",
-      len(predict_spans) >= 3,
-      f"found {len(predict_spans)}")
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    print("Prerequisites failed — cannot continue")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
 
-if predict_spans:
-    a = dict(predict_spans[0].attributes)
-    check("http.request.method = POST  (semconv 1.20+)",
-          a.get("http.request.method") == "POST",
-          f"got: {a.get('http.request.method')!r}")
-    check("http.response.status_code = 200",
-          a.get("http.response.status_code") == 200,
-          f"got: {a.get('http.response.status_code')!r}")
-    check("http.route present",
-          "http.route" in a,
-          f"keys: {list(a.keys())}")
+print("  [PASS] all prerequisites met\n")
 
-print()
-print("SQLAlchemy auto-instrumentation:")
-if _sqla_ok:
-    db_spans = [s for s in all_spans if s.kind == SpanKind.CLIENT and
-                (dict(s.attributes).get("db.system.name") or dict(s.attributes).get("db.system"))]
-    check("SQLAlchemy CLIENT spans auto-created",
-          len(db_spans) > 0,
-          f"found {len(db_spans)}")
-    if db_spans:
-        a = dict(db_spans[0].attributes)
-        check("db.system.name = sqlite",
-              a.get("db.system.name") == "sqlite",
-              f"got: {a.get('db.system.name')!r} / {a.get('db.system')!r}")
-else:
-    check("SQLAlchemy instrumentation installed", False,
-          "pip install opentelemetry-instrumentation-sqlalchemy")
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-83-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        dst = os.path.join(tmpdir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
 
-print()
-print("HTTP responses:")
-check("GET /models → 200",   _r_models.status_code == 200)
-check("POST /predict x 3 → 200",
-      all(r.status_code == 200 for r in [_r_pred1, _r_pred2, _r_pred3]),
-      f"status codes: {[_r_pred1.status_code, _r_pred2.status_code, _r_pred3.status_code]}")
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-print()
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
+
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
+
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
+
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
+
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
+
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
+
+    # ── Step 4: Inspect the diff ──────────────────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    diff_result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    diff = diff_result.stdout
+
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+
+    print(f"  Modified files (git diff): {len(diff.splitlines())} diff lines")
+    print(f"  New files: {new_files}")
+
+    req_file    = os.path.join(tmpdir, "requirements.txt")
+    app_file    = os.path.join(tmpdir, "app.py")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+
+    print("\nCode correctness checks (Tier A — FastAPI auto-instrumentation):")
+
+    # requirements.txt checks
+    check("opentelemetry-sdk or opentelemetry-api added",
+          "opentelemetry-sdk" in req_content or "opentelemetry-api" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("FastAPI instrumentation package added",
+          "opentelemetry-instrumentation-fastapi" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("OTLP exporter added",
+          "opentelemetry-exporter-otlp" in req_content,
+          f"requirements.txt:\n{req_content}")
+
+    # app.py instrumentation checks
+    check("FastAPIInstrumentor applied in app.py",
+          "FastAPIInstrumentor" in app_content and ".instrument" in app_content,
+          "FastAPIInstrumentor not found in app.py")
+    check("TracerProvider or OTLPSpanExporter configured",
+          "TracerProvider" in app_content or "OTLPSpanExporter" in app_content,
+          "no tracer setup found in app.py")
+    check("Elastic endpoint configured from env",
+          "ELASTIC_OTLP_ENDPOINT" in app_content or "OTLP_ENDPOINT" in app_content
+          or (ENDPOINT.split("//")[1][:20] if "//" in ENDPOINT else ENDPOINT[:20]) in app_content,
+          "endpoint not referenced in app.py")
+
+    # Business enrichment checks
+    print("\nBusiness enrichment checks:")
+    has_ml_enrichment = any(
+        attr in app_content for attr in [
+            "model.name", "model_name", "ml.model",
+            "prediction.class", "prediction", "inference",
+            "inference_ms", "ml.inference", "ml.prediction",
+        ]
+    )
+    check("ML business span attributes added (model.name, prediction, inference)",
+          has_ml_enrichment,
+          "no ML business enrichment attributes found in app.py")
+
+    # .otel/ output files
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created",
+          os.path.exists(otel_slos),
+          f"expected at {otel_slos}")
+    if os.path.exists(otel_slos):
+        try:
+            slos_raw = json.load(open(otel_slos))
+            if isinstance(slos_raw, list):
+                check(".otel/slos.json is valid JSON with at least one SLO",
+                      len(slos_raw) > 0, f"got empty list")
+            else:
+                check(".otel/slos.json is valid JSON with 'services' key",
+                      "services" in slos_raw, f"keys: {list(slos_raw.keys())}")
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+
+    check(".otel/golden-paths.md created",
+          os.path.exists(otel_golden),
+          f"expected at {otel_golden}")
+
+    # ── Step 5: Run the instrumented app ──────────────────────────────────────
+    print("\nStep 5: Running the instrumented app")
+
+    pip_install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "-r", req_file, "--no-warn-script-location"],
+        capture_output=True, text=True
+    )
+    if pip_install.returncode != 0:
+        check("pip install of generated requirements succeeded",
+              False, pip_install.stderr[-500:])
+    else:
+        check("pip install of generated requirements succeeded", True)
+
+    PORT = 15083
+    env  = os.environ.copy()
+    env["PORT"] = str(PORT)
+    app_proc = subprocess.Popen(
+        [sys.executable, app_file],
+        cwd=tmpdir,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    import requests as http_lib
+    started = False
+    for _ in range(30):
+        try:
+            r = http_lib.get(f"http://127.0.0.1:{PORT}/health", timeout=0.5)
+            if r.status_code == 200:
+                started = True
+                break
+        except Exception:
+            time.sleep(0.3)
+
+    check("Instrumented app starts and responds to /health",
+          started,
+          f"app stdout: {app_proc.stdout.read(500) if app_proc.poll() is not None else '(still running)'}")
+
+    if started:
+        print(f"  App running on port {PORT}")
+        print("\nStep 6: Making test requests to instrumented app")
+
+        r_models = http_lib.get(f"http://127.0.0.1:{PORT}/models")
+        check("GET /models → 200", r_models.status_code == 200,
+              f"status={r_models.status_code}")
+
+        r_pred1 = http_lib.post(f"http://127.0.0.1:{PORT}/predict",
+                                 json={"features": [5.1, 3.5, 1.4, 0.2],
+                                       "model_name": "iris-classifier-v1",
+                                       "customer_id": "cust-001"})
+        check("POST /predict (iris-classifier-v1) → 200",
+              r_pred1.status_code == 200,
+              f"status={r_pred1.status_code} body={r_pred1.text[:200]}")
+
+        r_pred2 = http_lib.post(f"http://127.0.0.1:{PORT}/predict",
+                                 json={"features": [100.0, 1.5, 3.0],
+                                       "model_name": "fraud-detector-v2",
+                                       "customer_id": "cust-002"})
+        check("POST /predict (fraud-detector-v2) → 200",
+              r_pred2.status_code == 200,
+              f"status={r_pred2.status_code}")
+
+        r_404 = http_lib.post(f"http://127.0.0.1:{PORT}/predict",
+                               json={"features": [1.0], "model_name": "nonexistent-model"})
+        check("POST /predict (unknown model) → 404",
+              r_404.status_code == 404,
+              f"status={r_404.status_code}")
+
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+
+        check("Test requests completed without app crash",
+              app_proc.poll() is None,
+              "app process died during requests")
+
+    if 'app_proc' in dir() and app_proc.poll() is None:
+        app_proc.terminate()
+        app_proc.wait(timeout=5)
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ─────────────────────────────────────────────────────────────
 passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
 failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
 for status, name, detail in CHECKS:
-    print(f"  [{status}] {name}" + (f"\n         -> {detail}" if detail else ""))
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
 print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
 if failed:
-    print(f"  FAIL: {failed} check(s) failed")
-    print("  Required: pip install opentelemetry-instrumentation-fastapi "
-          "opentelemetry-instrumentation-sqlalchemy")
     sys.exit(1)

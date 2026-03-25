@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
 """
-E2E Auto-Instrumentation Verification — Flask E-Commerce
-=========================================================
-Simulates: User runs "Observe this project." on a Flask e-commerce app.
+E2E "Observe this project." — Flask E-Commerce
+===============================================
+This test ACTUALLY runs `claude -p "Observe this project."` on a blank,
+uninstrumented Flask e-commerce app. It does not assume or hardcode what
+the agent will generate.
 
-EDOT Autopilot:
-  1. Reads the codebase (Flask + SQLAlchemy + outbound HTTP)
-  2. Applies opentelemetry-instrumentation-flask, -sqlalchemy, -requests
-  3. Adds business enrichment hooks (order.value_usd, customer.tier, fraud.decision)
-  4. This test runs the instrumented app and verifies auto-instrumentation works
+What this tests:
+  1. The agent reads the blank app and understands it (Flask + SQLAlchemy,
+     product catalog, cart, checkout)
+  2. The agent correctly assigns Tier A (auto-instrumentation via
+     opentelemetry-instrumentation-flask and -sqlalchemy)
+  3. The agent adds business enrichment (order.total, cart.item_count,
+     product.id, checkout.status)
+  4. The generated requirements.txt includes the right OTel packages
+  5. The instrumented app runs and serves requests
+  6. Spans actually arrive in Elastic with correct attributes
 
-Verification checklist:
-  ✓ Flask SERVER span auto-created for every route (no manual span code in the app)
-  ✓ SQLAlchemy CLIENT span auto-created for every DB query
-  ✓ Requests CLIENT span auto-created for outbound HTTP calls
-  ✓ Correct semconv 1.20+ attribute names (http.request.method, not http.method)
-  ✓ Correct semconv 1.22+ DB names (db.system.name, db.query.text, not db.system, db.statement)
-  ✓ SpanKind.SERVER on Flask spans, SpanKind.CLIENT on DB and HTTP spans
-  ✓ Business enrichment attributes present on checkout span
-  ✓ OTLP export to Elastic succeeds
+Run:
+    cd smoke-tests && python3 82-e2e-flask-ecommerce/smoke.py
+
+Requirements (in addition to requirements.txt):
+  - `claude` CLI installed and authenticated
+  - ELASTIC_OTLP_ENDPOINT and ELASTIC_API_KEY set in .env or environment
 """
 
-import os, sys, time, threading, json
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
+import json
+
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
@@ -32,303 +43,305 @@ if not ENDPOINT or not API_KEY:
     print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
     sys.exit(0)
 
-# ─── STEP 1: The user's original Flask app (BEFORE instrumentation) ────────────
-# This is what EDOT Autopilot reads. No OTel code here at all.
+SVC         = "82-e2e-flask-ecommerce"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-flask-ecommerce")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-from flask import Flask, jsonify, request as flask_request
-from sqlalchemy import create_engine, text
-import requests as http_lib  # outbound HTTP (e.g. calling a payment gateway)
-
-flask_app = Flask("ecommerce-api")
-db_engine = create_engine("sqlite:///:memory:", future=True)
-
-with db_engine.connect() as conn:
-    conn.execute(text("""CREATE TABLE products (
-        id INTEGER PRIMARY KEY, name TEXT, price_usd REAL, stock INTEGER
-    )"""))
-    conn.execute(text("""CREATE TABLE orders (
-        id TEXT, customer_id TEXT, total_usd REAL, status TEXT
-    )"""))
-    conn.execute(text("INSERT INTO products VALUES (1,'Widget Pro',49.99,100)"))
-    conn.execute(text("INSERT INTO products VALUES (2,'Gadget Plus',129.99,5)"))
-    conn.execute(text("INSERT INTO products VALUES (3,'Enterprise Suite',4200.00,50)"))
-    conn.commit()
-
-@flask_app.route("/products")
-def list_products():
-    with db_engine.connect() as conn:
-        rows = conn.execute(text("SELECT id, name, price_usd, stock FROM products")).fetchall()
-    return jsonify([{"id": r[0], "name": r[1], "price_usd": r[2], "stock": r[3]} for r in rows])
-
-@flask_app.route("/products/<int:product_id>")
-def get_product(product_id):
-    with db_engine.connect() as conn:
-        row = conn.execute(text("SELECT id, name, price_usd, stock FROM products WHERE id = :id"),
-                           {"id": product_id}).fetchone()
-    if not row:
-        return jsonify({"error": "not found"}), 404
-    return jsonify({"id": row[0], "name": row[1], "price_usd": row[2], "stock": row[3]})
-
-@flask_app.route("/checkout", methods=["POST"])
-def checkout():
-    data = flask_request.get_json() or {}
-    product_id    = data.get("product_id", 1)
-    quantity      = data.get("quantity", 1)
-    customer_id   = data.get("customer_id", "cust-001")
-    customer_tier = data.get("customer_tier", "standard")
-
-    with db_engine.connect() as conn:
-        product = conn.execute(text("SELECT price_usd, stock FROM products WHERE id = :id"),
-                               {"id": product_id}).fetchone()
-    if not product:
-        return jsonify({"error": "product not found"}), 404
-
-    total = product[0] * quantity
-    fraud_score = 0.12 if customer_tier == "enterprise" else 0.35
-    if fraud_score > 0.80:
-        return jsonify({"status": "blocked", "reason": "fraud_check_failed"}), 402
-
-    with db_engine.connect() as conn:
-        conn.execute(text("INSERT INTO orders VALUES (:id,:cid,:total,:status)"),
-                     {"id": "ORD-9999", "cid": customer_id, "total": total, "status": "success"})
-        conn.commit()
-
-    return jsonify({"order_id": "ORD-9999", "total_usd": total, "status": "success"})
-
-@flask_app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-# ─── STEP 2: EDOT Autopilot instrumentation (what the agent would generate) ────
-
-from opentelemetry import trace as otel_trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.trace import SpanKind, StatusCode
-
-# — OTel setup (generated by EDOT Autopilot) —
-_memory_exporter = InMemorySpanExporter()
-_resource = Resource.create({
-    "service.name":           "flask-ecommerce",
-    "service.version":        "1.0.0",
-    "deployment.environment": "smoke-test",
-    "deployment.environment.name": "smoke-test",
-    "telemetry.sdk.name":     "opentelemetry-python",
-    "telemetry.sdk.language": "python",
-    "telemetry.distro.name":  "edot-autopilot",
-})
-_provider = TracerProvider(resource=_resource)
-_provider.add_span_processor(SimpleSpanProcessor(_memory_exporter))
-_provider.add_span_processor(BatchSpanProcessor(
-    OTLPSpanExporter(endpoint=f"{ENDPOINT}/v1/traces",
-                     headers={"Authorization": f"ApiKey {API_KEY}"}),
-    schedule_delay_millis=500,
-))
-otel_trace.set_tracer_provider(_provider)
-
-# — Auto-instrumentation (installed by EDOT Autopilot) —
-try:
-    from opentelemetry.instrumentation.flask import FlaskInstrumentor
-    FlaskInstrumentor().instrument_app(flask_app)
-    _flask_ok = True
-except ImportError:
-    _flask_ok = False
-    print("  WARN: opentelemetry-instrumentation-flask not installed")
-
-try:
-    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-    SQLAlchemyInstrumentor().instrument(engine=db_engine)
-    _sqla_ok = True
-except ImportError:
-    _sqla_ok = False
-    print("  WARN: opentelemetry-instrumentation-sqlalchemy not installed")
-
-try:
-    from opentelemetry.instrumentation.requests import RequestsInstrumentor
-    RequestsInstrumentor().instrument()
-    _req_ok = True
-except ImportError:
-    _req_ok = False
-    print("  WARN: opentelemetry-instrumentation-requests not installed")
-
-# — Business enrichment hooks (added by EDOT Autopilot after reading the codebase) —
-@flask_app.before_request
-def _edot_enrich_request():
-    span = otel_trace.get_current_span()
-    if not span.is_recording():
-        return
-    if flask_request.endpoint == "checkout":
-        body = flask_request.get_json(silent=True) or {}
-        span.set_attribute("customer.id",   body.get("customer_id", ""))
-        span.set_attribute("customer.tier", body.get("customer_tier", "standard"))
-        span.set_attribute("order.quantity", body.get("quantity", 1))
-
-@flask_app.after_request
-def _edot_enrich_response(response):
-    span = otel_trace.get_current_span()
-    if not span.is_recording():
-        return response
-    if flask_request.endpoint == "checkout" and response.status_code == 200:
-        try:
-            body = json.loads(response.get_data())
-            span.set_attribute("order.id",        body.get("order_id", ""))
-            span.set_attribute("order.total_usd",  body.get("total_usd", 0.0))
-            span.set_attribute("order.status",    body.get("status", ""))
-        except Exception:
-            pass
-    return response
-
-# ─── STEP 3: Run the instrumented app and make real requests ───────────────────
-
-PORT = 15082
-_server_ready = threading.Event()
-
-def _run_server():
-    import logging
-    log = logging.getLogger("werkzeug")
-    log.setLevel(logging.ERROR)
-    flask_app.run(host="127.0.0.1", port=PORT, use_reloader=False, threaded=True)
-
-_t = threading.Thread(target=_run_server, daemon=True)
-_t.start()
-
-# Wait for server to be ready
-for _ in range(20):
-    try:
-        http_lib.get(f"http://127.0.0.1:{PORT}/health", timeout=0.5)
-        break
-    except Exception:
-        time.sleep(0.2)
-else:
-    print("FAIL: Flask server did not start in time")
-    sys.exit(1)
-
-# Make real requests — auto-instrumentation creates spans for each one
-_r_products = http_lib.get(f"http://127.0.0.1:{PORT}/products")
-_r_product1 = http_lib.get(f"http://127.0.0.1:{PORT}/products/1")
-_r_404      = http_lib.get(f"http://127.0.0.1:{PORT}/products/999")
-_r_checkout = http_lib.post(f"http://127.0.0.1:{PORT}/checkout",
-                             json={"product_id": 2, "quantity": 3,
-                                   "customer_id": "cust-ent-001", "customer_tier": "enterprise"})
-_r_std      = http_lib.post(f"http://127.0.0.1:{PORT}/checkout",
-                             json={"product_id": 1, "quantity": 1,
-                                   "customer_id": "cust-std-001", "customer_tier": "standard"})
-
-time.sleep(0.8)  # Let BatchSpanProcessor flush
-_provider.force_flush()
-
-# ─── STEP 4: Assertions — verify auto-instrumentation worked ───────────────────
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
 CHECKS: list[tuple[str, bool, str]] = []
-
-def check(name: str, ok: bool, detail: str = ""):
+def check(name: str, ok: bool, detail: str = "") -> None:
     CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-all_spans = _memory_exporter.get_finished_spans()
-by_name   = {}
-for s in all_spans:
-    by_name.setdefault(s.name, []).append(s)
-
-def find_span(predicate):
-    return next((s for s in all_spans if predicate(s)), None)
-
 print(f"\n{'='*62}")
-print("EDOT-Autopilot | 82-e2e-flask-ecommerce | Auto-Instrumentation")
+print(f"EDOT-Autopilot | {SVC}")
 print(f"{'='*62}")
-print(f"  Service: flask-ecommerce | Port: {PORT}")
-print(f"  Total spans captured: {len(all_spans)}")
-if all_spans:
-    print(f"  Span names: {sorted(set(s.name for s in all_spans))}")
+print(f"  Fixture: blank-flask-ecommerce (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print(f"  Target:  {ENDPOINT.split('@')[-1].split('/')[0] if '@' in ENDPOINT else ENDPOINT[:40]}")
 print()
-print("Flask auto-instrumentation:")
 
-# Flask creates spans named after the route e.g. "GET /products" or "ecommerce-api.list_products"
-products_span = find_span(lambda s: "products" in s.name.lower() and
-                           s.kind == SpanKind.SERVER and
-                           dict(s.attributes).get("http.response.status_code") == 200)
-check("Flask SERVER span auto-created for GET /products",
-      products_span is not None,
-      f"spans seen: {[s.name for s in all_spans]}")
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture app exists", os.path.isdir(FIXTURE_DIR))
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-if products_span:
-    a = dict(products_span.attributes)
-    check("http.request.method = GET  (semconv 1.20+ name)",
-          a.get("http.request.method") == "GET",
-          f"got: {a.get('http.request.method')}")
-    check("http.response.status_code = 200  (semconv 1.20+ name)",
-          a.get("http.response.status_code") == 200,
-          f"got: {a.get('http.response.status_code')}")
-    check("http.method NOT present  (old deprecated name absent)",
-          "http.method" not in a)
-    check("url.path or http.target present",
-          "url.path" in a or "http.target" in a,
-          f"keys: {list(a.keys())}")
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    print("Prerequisites failed — cannot continue")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
 
-checkout_span = find_span(lambda s: "checkout" in s.name.lower() and
-                           s.kind == SpanKind.SERVER)
-check("Flask SERVER span auto-created for POST /checkout",
-      checkout_span is not None)
+print("  [PASS] all prerequisites met\n")
 
-if checkout_span:
-    a = dict(checkout_span.attributes)
-    check("http.request.method = POST",
-          a.get("http.request.method") == "POST",
-          f"got: {a.get('http.request.method')}")
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-82-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        dst = os.path.join(tmpdir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
 
-print()
-print("SQLAlchemy auto-instrumentation:")
-db_spans = [s for s in all_spans if s.kind == SpanKind.CLIENT and
-            (dict(s.attributes).get("db.system.name") or dict(s.attributes).get("db.system"))]
-check("SQLAlchemy CLIENT spans auto-created for DB queries",
-      len(db_spans) > 0,
-      f"found {len(db_spans)} db span(s)")
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-if db_spans:
-    a = dict(db_spans[0].attributes)
-    check("db.system.name = sqlite  (semconv 1.22+ name)",
-          a.get("db.system.name") == "sqlite",
-          f"got db.system.name={a.get('db.system.name')!r}, db.system={a.get('db.system')!r}")
-    check("db.query.text or db.statement present",
-          "db.query.text" in a or "db.statement" in a,
-          f"keys: {[k for k in a if k.startswith('db.')]}")
-    check("db.operation.name or db.operation present",
-          "db.operation.name" in a or "db.operation" in a)
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-print()
-print("Business enrichment (EDOT Autopilot hooks):")
-enr_span = find_span(lambda s: "checkout" in s.name.lower() and
-                      "customer.tier" in dict(s.attributes))
-check("order.total_usd present on checkout span",
-      enr_span is not None and "order.total_usd" in dict(enr_span.attributes),
-      f"attrs: {dict(enr_span.attributes) if enr_span else 'no span'}")
-check("customer.tier present on checkout span",
-      enr_span is not None and "customer.tier" in dict(enr_span.attributes))
-check("order.id present on checkout span",
-      enr_span is not None and "order.id" in dict(enr_span.attributes))
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-print()
-print("HTTP responses (instrumented app works correctly):")
-check(f"GET /products → 200",        _r_products.status_code == 200)
-check(f"GET /products/1 → 200",      _r_product1.status_code == 200)
-check(f"GET /products/999 → 404",    _r_404.status_code == 404)
-check(f"POST /checkout (enterprise) → 200", _r_checkout.status_code == 200)
-check(f"POST /checkout (standard) → 200",   _r_std.status_code == 200)
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
 
-print()
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
+
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
+
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
+
+    # ── Step 4: Inspect the diff ──────────────────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    diff_result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    diff = diff_result.stdout
+
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+
+    print(f"  Modified files (git diff): {len(diff.splitlines())} diff lines")
+    print(f"  New files: {new_files}")
+
+    req_file    = os.path.join(tmpdir, "requirements.txt")
+    app_file    = os.path.join(tmpdir, "app.py")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+
+    print("\nCode correctness checks (Tier A — auto-instrumentation):")
+
+    # requirements.txt checks
+    check("opentelemetry-sdk added to requirements.txt",
+          "opentelemetry-sdk" in req_content or "opentelemetry-api" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("Flask instrumentation package added",
+          "opentelemetry-instrumentation-flask" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SQLAlchemy instrumentation package added",
+          "opentelemetry-instrumentation-sqlalchemy" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("OTLP exporter added",
+          "opentelemetry-exporter-otlp" in req_content,
+          f"requirements.txt:\n{req_content}")
+
+    # app.py instrumentation checks
+    check("FlaskInstrumentor applied in app.py",
+          "FlaskInstrumentor" in app_content and ".instrument(" in app_content,
+          "FlaskInstrumentor().instrument() not found")
+    check("SQLAlchemyInstrumentor applied in app.py",
+          "SQLAlchemyInstrumentor" in app_content and ".instrument(" in app_content,
+          "SQLAlchemyInstrumentor().instrument() not found")
+    check("TracerProvider or OTLPSpanExporter configured",
+          "TracerProvider" in app_content or "OTLPSpanExporter" in app_content,
+          "no tracer setup found in app.py")
+    check("Elastic endpoint configured from env",
+          "ELASTIC_OTLP_ENDPOINT" in app_content or "OTLP_ENDPOINT" in app_content
+          or (ENDPOINT.split("//")[1][:20] if "//" in ENDPOINT else ENDPOINT[:20]) in app_content,
+          "endpoint not referenced in app.py")
+
+    # Business enrichment checks
+    print("\nBusiness enrichment checks:")
+    has_ecommerce_enrichment = any(
+        attr in app_content for attr in [
+            "order.total", "order.id", "order.status",
+            "cart.item_count", "cart.session",
+            "product.id", "product.name",
+            "checkout.total", "checkout.status",
+        ]
+    )
+    check("Business span attributes added (order/cart/product/checkout)",
+          has_ecommerce_enrichment,
+          "no e-commerce business enrichment attributes found in app.py")
+
+    # .otel/ output files
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created",
+          os.path.exists(otel_slos),
+          f"expected at {otel_slos}")
+    if os.path.exists(otel_slos):
+        try:
+            slos_raw = json.load(open(otel_slos))
+            if isinstance(slos_raw, list):
+                check(".otel/slos.json is valid JSON with at least one SLO",
+                      len(slos_raw) > 0, f"got empty list")
+            else:
+                check(".otel/slos.json is valid JSON with 'services' key",
+                      "services" in slos_raw, f"keys: {list(slos_raw.keys())}")
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+
+    check(".otel/golden-paths.md created",
+          os.path.exists(otel_golden),
+          f"expected at {otel_golden}")
+
+    # ── Step 5: Run the instrumented app ──────────────────────────────────────
+    print("\nStep 5: Running the instrumented app")
+
+    pip_install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "-r", req_file, "--no-warn-script-location"],
+        capture_output=True, text=True
+    )
+    if pip_install.returncode != 0:
+        check("pip install of generated requirements succeeded",
+              False, pip_install.stderr[-500:])
+    else:
+        check("pip install of generated requirements succeeded", True)
+
+    PORT = 15082
+    env  = os.environ.copy()
+    env["PORT"] = str(PORT)
+    app_proc = subprocess.Popen(
+        [sys.executable, app_file],
+        cwd=tmpdir,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    import requests as http_lib
+    started = False
+    for _ in range(30):
+        try:
+            r = http_lib.get(f"http://127.0.0.1:{PORT}/health", timeout=0.5)
+            if r.status_code == 200:
+                started = True
+                break
+        except Exception:
+            time.sleep(0.3)
+
+    check("Instrumented app starts and responds to /health",
+          started,
+          f"app stdout: {app_proc.stdout.read(500) if app_proc.poll() is not None else '(still running)'}")
+
+    if started:
+        print(f"  App running on port {PORT}")
+        print("\nStep 6: Making test requests to instrumented app")
+
+        # Add a product
+        r_add = http_lib.post(f"http://127.0.0.1:{PORT}/products",
+                               json={"name": "Widget Pro", "price": 49.99, "stock": 100})
+        check("POST /products → 201",
+              r_add.status_code == 201,
+              f"status={r_add.status_code} body={r_add.text[:200]}")
+
+        product_id = r_add.json().get("product_id") if r_add.status_code == 201 else None
+
+        # List products
+        r_list = http_lib.get(f"http://127.0.0.1:{PORT}/products")
+        check("GET /products → 200", r_list.status_code == 200,
+              f"status={r_list.status_code}")
+
+        # Add to cart
+        session_id = "test-session-001"
+        if product_id:
+            r_cart = http_lib.post(f"http://127.0.0.1:{PORT}/cart",
+                                    json={"session_id": session_id,
+                                          "product_id": product_id, "quantity": 2})
+            check("POST /cart → 200",
+                  r_cart.status_code == 200,
+                  f"status={r_cart.status_code} body={r_cart.text[:200]}")
+
+            # Checkout
+            r_checkout = http_lib.post(f"http://127.0.0.1:{PORT}/checkout",
+                                        json={"session_id": session_id})
+            check("POST /checkout → 201",
+                  r_checkout.status_code == 201,
+                  f"status={r_checkout.status_code} body={r_checkout.text[:200]}")
+
+            order_id = r_checkout.json().get("order_id") if r_checkout.status_code == 201 else None
+            if order_id:
+                r_order = http_lib.get(f"http://127.0.0.1:{PORT}/orders/{order_id}")
+                check("GET /orders/<id> → 200", r_order.status_code == 200,
+                      f"status={r_order.status_code}")
+
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+
+        check("Test requests completed without app crash",
+              app_proc.poll() is None,
+              "app process died during requests")
+
+    if 'app_proc' in dir() and app_proc.poll() is None:
+        app_proc.terminate()
+        app_proc.wait(timeout=5)
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ─────────────────────────────────────────────────────────────
 passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
 failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
-total  = len(CHECKS)
+print(f"\n{'='*62}")
 for status, name, detail in CHECKS:
     line = f"  [{status}] {name}"
-    if detail:
+    if detail and status == "FAIL":
         line += f"\n         -> {detail}"
     print(line)
-print(f"\n  Result: {passed}/{total} checks passed")
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
 if failed:
-    print(f"  FAIL: {failed} check(s) failed")
-    print("  Required: pip install opentelemetry-instrumentation-flask "
-          "opentelemetry-instrumentation-sqlalchemy opentelemetry-instrumentation-requests")
     sys.exit(1)

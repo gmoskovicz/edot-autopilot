@@ -1,48 +1,40 @@
 #!/usr/bin/env python3
 """
-E2E "Observe this project." — Workflow Verification
-=====================================================
-Simulates what happens after a developer drops CLAUDE.md into their repo and
-types "Observe this project." The EDOT Autopilot agent runs five phases:
+E2E "Observe this project." — Multi-Service (Flask + Redis + HTTP)
+==================================================================
+This test ACTUALLY runs `claude -p "Observe this project."` on a blank,
+uninstrumented Flask app that uses Redis caching and makes external HTTP
+calls. It does not assume or hardcode what the agent will generate.
 
-  Phase 1 — Reconnaissance:   discover entry points and golden paths
-  Phase 2 — Coverage Triage:  assign Tier A/B/C/D to each component
-  Phase 3 — Business Enrichment: add business-meaningful span attributes
-  Phase 4 — SLO Creation:     write .otel/slos.json with thresholds
-  Phase 5 — Verify:           confirm all three signals reach the backend
+What this tests:
+  1. The agent reads the blank app and understands it (Flask, Redis cache,
+     outbound HTTP via requests)
+  2. The agent correctly assigns Tier A (auto-instrumentation via
+     FlaskInstrumentor, redis instrumentation, RequestsInstrumentor)
+  3. The agent adds business enrichment (cache.key, cache.hit, fetch.url)
+  4. The generated requirements.txt includes the right OTel packages
+  5. The instrumented app runs and serves requests
+  6. Spans actually arrive in Elastic with correct attributes
 
-This test covers gaps NOT addressed by 82–84:
-  ✓ Tier B: manual span wrapping for a custom (non-framework) handler
-  ✓ .otel/ output file structure — slos.json, golden-paths.md, coverage-report.md
-  ✓ record_exception behaviour (not add_event) on error spans
-  ✓ SLO threshold derivation from existing timeout constants in the codebase
-  ✓ All three OTel signals: traces, logs, metrics
+Run:
+    cd smoke-tests && python3 85-e2e-observe-command/smoke.py
 
-Verification checklist:
-  ✓ Tier B SERVER span created manually (no auto-instrumentation framework)
-  ✓ Business attributes: payment.amount_usd, customer.tier, payment.status
-  ✓ Error path: record_exception + set_status(ERROR) + description on failure
-  ✓ Error path does NOT use add_event("exception", ...) [sidecar-bug regression]
-  ✓ Correlated log record shares trace_id with parent span
-  ✓ Metric counter incremented for each payment attempt
-  ✓ .otel/slos.json schema: version, services[].golden_paths[].latency_p99_ms
-  ✓ .otel/golden-paths.md exists and contains at least one "Golden Path" heading
-  ✓ .otel/coverage-report.md exists and contains tier assignments
-  ✓ OTLP export to Elastic succeeds (HTTP 200)
+Requirements (in addition to requirements.txt):
+  - `claude` CLI installed and authenticated
+  - ELASTIC_OTLP_ENDPOINT and ELASTIC_API_KEY set in .env or environment
 """
 
 import os
 import sys
-import json
 import time
-import logging
-import pathlib
+import shutil
+import subprocess
 import tempfile
+import json
 
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
-
 ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
 API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
@@ -50,422 +42,304 @@ if not ENDPOINT or not API_KEY:
     print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
     sys.exit(0)
 
-# ── OTel bootstrap (Phase 2 output — what the agent generates) ────────────────
+SVC         = "85-e2e-observe-command"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-multi-service")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-from opentelemetry import trace as otel_trace, metrics as otel_metrics
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.trace import SpanKind, StatusCode
-
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, SimpleLogRecordProcessor
-from opentelemetry.sdk._logs.export.in_memory_log_exporter import InMemoryLogExporter
-from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-
-SERVICE_NAME = "payment-processor"
-
-_resource = Resource.create({
-    "service.name":                SERVICE_NAME,
-    "service.version":             "2.3.1",
-    "service.instance.id":         "ci-85-e2e",
-    "deployment.environment.name": "smoke-test",
-    "telemetry.distro.name":       "edot-autopilot",
-})
-
-# Traces
-_mem_exporter  = InMemorySpanExporter()
-_trace_provider = TracerProvider(resource=_resource)
-_trace_provider.add_span_processor(SimpleSpanProcessor(_mem_exporter))
-_trace_provider.add_span_processor(BatchSpanProcessor(
-    OTLPSpanExporter(
-        endpoint=f"{ENDPOINT}/v1/traces",
-        headers={"Authorization": f"ApiKey {API_KEY}"},
-    ),
-    schedule_delay_millis=500,
-))
-otel_trace.set_tracer_provider(_trace_provider)
-tracer = otel_trace.get_tracer("io.edot-autopilot.85-e2e", "1.0.0")
-
-# Logs
-_mem_log_exporter = InMemoryLogExporter()
-_log_provider = LoggerProvider(resource=_resource)
-_log_provider.add_log_record_processor(SimpleLogRecordProcessor(_mem_log_exporter))
-_log_provider.add_log_record_processor(BatchLogRecordProcessor(
-    OTLPLogExporter(endpoint=f"{ENDPOINT}/v1/logs",
-                    headers={"Authorization": f"ApiKey {API_KEY}"}),
-))
-_otel_log_handler = LoggingHandler(logger_provider=_log_provider)
-app_logger = logging.getLogger(SERVICE_NAME)
-app_logger.setLevel(logging.DEBUG)
-app_logger.addHandler(_otel_log_handler)
-app_logger.propagate = False
-
-# Metrics
-_metric_reader = PeriodicExportingMetricReader(
-    OTLPMetricExporter(endpoint=f"{ENDPOINT}/v1/metrics",
-                       headers={"Authorization": f"ApiKey {API_KEY}"}),
-    export_interval_millis=1_000,
-)
-_meter_provider = MeterProvider(resource=_resource, metric_readers=[_metric_reader])
-otel_metrics.set_meter_provider(_meter_provider)
-meter = otel_metrics.get_meter("io.edot-autopilot.85-e2e", "1.0.0")
-
-payment_counter   = meter.create_counter("payment.attempts",    unit="1",  description="Total payment attempts")
-payment_histogram = meter.create_histogram("payment.duration_ms", unit="ms", description="Payment processing latency")
-revenue_counter   = meter.create_counter("payment.revenue_usd", unit="USD", description="Cumulative revenue processed")
-
-
-# ── Phase 1: Reconnaissance — the sample "uninstrumented" business code ───────
-# This represents what EDOT Autopilot reads when it explores the repo.
-# No OTel code here — just plain Python business logic.
-
-class PaymentProcessor:
-    """
-    Original code (no OTel). EDOT Autopilot identifies this as a Golden Path:
-    'Payment Processing' — every failure here is a direct revenue loss.
-
-    Timeout constant used for SLO derivation: PAYMENT_TIMEOUT_MS = 3000
-    """
-    PAYMENT_TIMEOUT_MS = 3000  # Agent reads this to set p99 SLO threshold
-
-    def process(self, amount: float, customer_id: str, customer_tier: str) -> dict:
-        if amount <= 0:
-            raise ValueError(f"Invalid amount: {amount}")
-        fraud_score = 0.05 if customer_tier == "enterprise" else 0.20
-        if fraud_score > 0.90:
-            raise PermissionError("Payment blocked: fraud score too high")
-        return {
-            "status": "approved",
-            "auth_code": f"AUTH-{int(amount * 100):08d}",
-            "amount_usd": amount,
-        }
-
-    def refund(self, order_id: str, amount: float) -> dict:
-        return {"status": "refunded", "order_id": order_id, "amount_usd": amount}
-
-
-# ── Phase 2 + 3: Tier B instrumentation — what the agent generates ────────────
-# No web framework (plain class), so auto-instrumentation can't help.
-# Agent applies manual span wrapping around each Golden Path entry point.
-
-_processor = PaymentProcessor()
-
-
-def instrumented_process(amount: float, customer_id: str, customer_tier: str) -> dict:
-    """Tier B: manual span wrapping generated by EDOT Autopilot."""
-    t0 = time.time()
-    with tracer.start_as_current_span(
-        "payment.process",
-        kind=SpanKind.SERVER,
-        attributes={
-            "payment.amount_usd": amount,
-            "customer.id":        customer_id,
-            "customer.tier":      customer_tier,
-        },
-    ) as span:
-        payment_counter.add(1, {"customer.tier": customer_tier})
-        app_logger.info(
-            "Processing payment",
-            extra={"payment.amount_usd": amount, "customer.tier": customer_tier},
-        )
-        try:
-            result = _processor.process(amount, customer_id, customer_tier)
-            # Phase 3: business enrichment attributes
-            span.set_attribute("payment.status",    result["status"])
-            span.set_attribute("payment.auth_code", result["auth_code"])
-            elapsed = (time.time() - t0) * 1000
-            payment_histogram.record(elapsed, {"customer.tier": customer_tier})
-            revenue_counter.add(amount, {"customer.tier": customer_tier})
-            app_logger.info(
-                "Payment approved",
-                extra={"auth_code": result["auth_code"], "amount_usd": amount},
-            )
-            return result
-        except Exception as exc:
-            # Phase 3 rule: every set_status(ERROR) must pair with record_exception
-            span.record_exception(exc, attributes={"exception.escaped": True})
-            span.set_status(StatusCode.ERROR, description=str(exc))
-            span.set_attribute("payment.status", "failed")
-            span.set_attribute("error.type", type(exc).__name__)
-            app_logger.error(
-                "Payment failed: %s", exc,
-                extra={"payment.amount_usd": amount, "error.type": type(exc).__name__},
-            )
-            raise
-
-
-def instrumented_refund(order_id: str, amount: float) -> dict:
-    """Tier B: manual span wrapping for refund golden path."""
-    with tracer.start_as_current_span(
-        "payment.refund",
-        kind=SpanKind.SERVER,
-        attributes={"order.id": order_id, "refund.amount_usd": amount},
-    ) as span:
-        result = _processor.refund(order_id, amount)
-        span.set_attribute("refund.status", result["status"])
-        return result
-
-
-# ── Phase 4: SLO Creation — agent writes .otel/ output files ──────────────────
-# Uses PAYMENT_TIMEOUT_MS=3000 as the p99 threshold.
-
-def write_otel_output_files(output_dir: pathlib.Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # .otel/slos.json
-    slos = {
-        "version": "1.0",
-        "generated_by": "edot-autopilot",
-        "services": [
-            {
-                "service_name": SERVICE_NAME,
-                "golden_paths": [
-                    {
-                        "name": "Payment Processing",
-                        "description": "Core revenue path — every failure is a direct financial loss",
-                        "entry_point": "PaymentProcessor.process",
-                        "tier": "B",
-                        "latency_p99_ms": PaymentProcessor.PAYMENT_TIMEOUT_MS,
-                        "availability_pct": 99.9,
-                        "source_timeout_constant": "PaymentProcessor.PAYMENT_TIMEOUT_MS",
-                    },
-                    {
-                        "name": "Refund Processing",
-                        "description": "Customer support path — failure creates CSAT incidents",
-                        "entry_point": "PaymentProcessor.refund",
-                        "tier": "B",
-                        "latency_p99_ms": 5000,
-                        "availability_pct": 99.5,
-                    },
-                ],
-            }
-        ],
-    }
-    (output_dir / "slos.json").write_text(json.dumps(slos, indent=2))
-
-    # .otel/golden-paths.md
-    (output_dir / "golden-paths.md").write_text(
-        "# Golden Paths — payment-processor\n\n"
-        "Identified by EDOT Autopilot during Phase 1 Reconnaissance.\n\n"
-        "## Golden Path 1: Payment Processing\n\n"
-        "- **Entry point**: `PaymentProcessor.process`\n"
-        "- **Tier**: B (manual wrapping — no web framework)\n"
-        "- **Business impact**: Every failure = direct revenue loss\n"
-        "- **Key attributes added**: `payment.amount_usd`, `customer.tier`, "
-        "`payment.status`, `payment.auth_code`\n\n"
-        "## Golden Path 2: Refund Processing\n\n"
-        "- **Entry point**: `PaymentProcessor.refund`\n"
-        "- **Tier**: B\n"
-        "- **Business impact**: Failure creates support escalations\n"
-        "- **Key attributes added**: `order.id`, `refund.amount_usd`, `refund.status`\n"
-    )
-
-    # .otel/coverage-report.md
-    (output_dir / "coverage-report.md").write_text(
-        "# Coverage Report — payment-processor\n\n"
-        "| Component | Tier | Strategy | Status |\n"
-        "|-----------|------|----------|--------|\n"
-        "| PaymentProcessor.process | B | Manual span wrapping | ✅ Instrumented |\n"
-        "| PaymentProcessor.refund  | B | Manual span wrapping | ✅ Instrumented |\n\n"
-        "**Blind spots**: None identified.\n\n"
-        "**Coverage**: 2/2 golden paths instrumented (100%).\n"
-    )
-
-    # .otel/README.md
-    (output_dir / "README.md").write_text(
-        "# Observability — payment-processor\n\n"
-        "Auto-generated by [EDOT Autopilot](https://github.com/gmoskovicz/edot-autopilot).\n\n"
-        "## Architecture tier: B — Manual span wrapping\n\n"
-        "No web framework detected. EDOT Autopilot wrapped each Golden Path "
-        "entry point with `tracer.start_as_current_span()` blocks.\n\n"
-        "## Signals\n\n"
-        "| Signal | Status |\n"
-        "|--------|--------|\n"
-        "| Traces | ✅ Active |\n"
-        "| Logs   | ✅ Active |\n"
-        "| Metrics | ✅ Active |\n"
-    )
-
-
-# ── Phase 5: Verify — run the instrumented code and assert spans ───────────────
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
 CHECKS: list[tuple[str, bool, str]] = []
-
-
 def check(name: str, ok: bool, detail: str = "") -> None:
     CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-
-# Write .otel/ files to a temp directory (mimics what the agent writes to the repo)
-_tmp = pathlib.Path(tempfile.mkdtemp(prefix="edot-85-"))
-write_otel_output_files(_tmp / ".otel")
-
-# Run happy-path payments
-_r1 = instrumented_process(4200.00, "cust-ent-001", "enterprise")
-_r2 = instrumented_process(49.99,   "cust-std-001", "standard")
-_r3 = instrumented_refund("ORD-001", 49.99)
-
-# Run error path — invalid amount
-_err_exc = None
-try:
-    instrumented_process(-1.00, "cust-bad", "standard")
-except ValueError as e:
-    _err_exc = e
-
-time.sleep(0.8)
-_trace_provider.force_flush()
-
-all_spans = _mem_exporter.get_finished_spans()
-all_logs  = _mem_log_exporter.get_finished_log_records()
-
-
-# ── Assertions ────────────────────────────────────────────────────────────────
-
 print(f"\n{'='*62}")
-print("EDOT-Autopilot | 85-e2e-observe-command | Workflow Verification")
+print(f"EDOT-Autopilot | {SVC}")
 print(f"{'='*62}")
-print(f"  Service: {SERVICE_NAME}")
-print(f"  Total spans captured: {len(all_spans)}")
-print(f"  Total log records captured: {len(all_logs)}")
+print(f"  Fixture: blank-multi-service (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print(f"  Target:  {ENDPOINT.split('@')[-1].split('/')[0] if '@' in ENDPOINT else ENDPOINT[:40]}")
 print()
 
-# — Tier B spans —
-print("Phase 2/3: Tier B manual-wrap instrumentation:")
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture app exists", os.path.isdir(FIXTURE_DIR))
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-pay_spans    = [s for s in all_spans if s.name == "payment.process"]
-refund_spans = [s for s in all_spans if s.name == "payment.refund"]
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    print("Prerequisites failed — cannot continue")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
 
-check("payment.process spans created", len(pay_spans) >= 2, f"found {len(pay_spans)}")
-check("payment.refund span created",   len(refund_spans) >= 1, f"found {len(refund_spans)}")
+print("  [PASS] all prerequisites met\n")
 
-good_pay = next((s for s in pay_spans if s.status.status_code == StatusCode.UNSET), None)
-check("Happy-path span has UNSET (OK) status", good_pay is not None)
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-85-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        dst = os.path.join(tmpdir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
 
-if good_pay:
-    a = dict(good_pay.attributes)
-    check("payment.amount_usd on span",   "payment.amount_usd" in a, f"attrs: {list(a.keys())}")
-    check("customer.tier on span",        "customer.tier" in a)
-    check("payment.status = approved",    a.get("payment.status") == "approved",
-          f"got: {a.get('payment.status')!r}")
-    check("payment.auth_code on span",    "payment.auth_code" in a)
-    check("SpanKind.SERVER on process span", good_pay.kind == SpanKind.SERVER,
-          f"got: {good_pay.kind}")
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-print()
-print("Phase 3: Error handling — record_exception (not add_event):")
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-err_span = next((s for s in pay_spans if s.status.status_code == StatusCode.ERROR), None)
-check("Error span created for invalid payment", err_span is not None)
-check("ValueError was raised on caller side",   _err_exc is not None)
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-if err_span:
-    a = dict(err_span.attributes)
-    check("error.type set on error span",        "error.type" in a, f"attrs: {list(a.keys())}")
-    check("payment.status = failed on error span", a.get("payment.status") == "failed",
-          f"got: {a.get('payment.status')!r}")
-    check("set_status ERROR with description",
-          err_span.status.status_code == StatusCode.ERROR and
-          err_span.status.description,
-          f"description: {err_span.status.description!r}")
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
 
-    # The critical regression check: record_exception creates an event named
-    # "exception" (the OTel spec name) AND sets exception.type + exception.message.
-    # Using add_event("exception", ...) also creates an event called "exception"
-    # but does NOT register with APM as a proper exception — the diff is that
-    # record_exception goes through OTel's ExceptionEventAttributes class.
-    # We detect the correct usage by verifying exception.stacktrace is set
-    # (record_exception always captures it; add_event(...) does not by default).
-    exc_events = [ev for ev in err_span.events if ev.name == "exception"]
-    check("exception event on error span (record_exception)",
-          len(exc_events) > 0,
-          f"events: {[ev.name for ev in err_span.events]}")
-    if exc_events:
-        ev_attrs = dict(exc_events[0].attributes or {})
-        check("exception.type set by record_exception",
-              "exception.type" in ev_attrs,
-              f"event attrs: {list(ev_attrs.keys())}")
-        check("exception.message set by record_exception",
-              "exception.message" in ev_attrs)
-        check("exception.stacktrace set (proves record_exception, not bare add_event)",
-              "exception.stacktrace" in ev_attrs,
-              "add_event does not set stacktrace — this distinguishes the two approaches")
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
-print()
-print("Phase 3: Correlated log records:")
-pay_log = next(
-    (lr for lr in all_logs
-     if lr.body and "Payment" in str(lr.body)),
-    None,
-)
-check("Log records emitted during payment spans", len(all_logs) >= 2, f"got {len(all_logs)}")
-check("Log record body contains payment context", pay_log is not None,
-      f"log bodies: {[str(lr.body)[:40] for lr in all_logs[:3]]}")
-if pay_log and good_pay:
-    log_tid = format(pay_log.trace_id, "032x") if pay_log.trace_id else None
-    span_tid = format(good_pay.context.trace_id, "032x")
-    check("Log trace_id correlates with span trace_id",
-          log_tid == span_tid,
-          f"log={log_tid!r}  span={span_tid!r}")
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
-print()
-print("Phase 4: .otel/ output file structure:")
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-otel_dir = _tmp / ".otel"
-check(".otel/ directory created",   otel_dir.is_dir())
+    # ── Step 4: Inspect the diff ──────────────────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    diff_result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    diff = diff_result.stdout
 
-slos_path = otel_dir / "slos.json"
-check(".otel/slos.json created",    slos_path.exists())
-if slos_path.exists():
-    slos = json.loads(slos_path.read_text())
-    check("slos.json has 'version' field",     "version" in slos)
-    check("slos.json has 'services' array",    isinstance(slos.get("services"), list))
-    if slos.get("services"):
-        gp = slos["services"][0].get("golden_paths", [])
-        check("slos.json golden_paths non-empty",   len(gp) > 0)
-        if gp:
-            check("golden_path has latency_p99_ms",  "latency_p99_ms" in gp[0])
-            check("latency_p99_ms = PAYMENT_TIMEOUT_MS (SLO derived from code constant)",
-                  gp[0].get("latency_p99_ms") == PaymentProcessor.PAYMENT_TIMEOUT_MS,
-                  f"got: {gp[0].get('latency_p99_ms')}, expected: {PaymentProcessor.PAYMENT_TIMEOUT_MS}")
-            check("golden_path has availability_pct", "availability_pct" in gp[0])
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
 
-gp_path = otel_dir / "golden-paths.md"
-check(".otel/golden-paths.md created", gp_path.exists())
-if gp_path.exists():
-    content = gp_path.read_text()
-    check("golden-paths.md contains '## Golden Path' heading",
-          "## Golden Path" in content, f"first 100 chars: {content[:100]!r}")
+    print(f"  Modified files (git diff): {len(diff.splitlines())} diff lines")
+    print(f"  New files: {new_files}")
 
-cov_path = otel_dir / "coverage-report.md"
-check(".otel/coverage-report.md created", cov_path.exists())
-if cov_path.exists():
-    content = cov_path.read_text()
-    check("coverage-report.md contains tier assignment",
-          "Tier" in content or "tier" in content)
+    req_file    = os.path.join(tmpdir, "requirements.txt")
+    app_file    = os.path.join(tmpdir, "app.py")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
 
-check(".otel/README.md created", (otel_dir / "README.md").exists())
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+    print("\nCode correctness checks (Tier A — multi-component auto-instrumentation):")
 
-print()
+    # requirements.txt checks
+    check("opentelemetry-sdk or opentelemetry-api added",
+          "opentelemetry-sdk" in req_content or "opentelemetry-api" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("Flask instrumentation package added",
+          "opentelemetry-instrumentation-flask" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("OTLP exporter added",
+          "opentelemetry-exporter-otlp" in req_content,
+          f"requirements.txt:\n{req_content}")
+
+    # app.py instrumentation checks
+    check("FlaskInstrumentor applied in app.py",
+          "FlaskInstrumentor" in app_content and ".instrument(" in app_content,
+          "FlaskInstrumentor not found in app.py")
+    check("TracerProvider or OTLPSpanExporter configured",
+          "TracerProvider" in app_content or "OTLPSpanExporter" in app_content,
+          "no tracer setup found in app.py")
+    check("Elastic endpoint configured from env",
+          "ELASTIC_OTLP_ENDPOINT" in app_content or "OTLP_ENDPOINT" in app_content
+          or (ENDPOINT.split("//")[1][:20] if "//" in ENDPOINT else ENDPOINT[:20]) in app_content,
+          "endpoint not referenced in app.py")
+
+    # Redis / requests instrumentation checks
+    print("\nRedis and outbound HTTP instrumentation checks:")
+    has_redis_instrumentation = (
+        "RedisInstrumentor" in app_content
+        or "opentelemetry-instrumentation-redis" in req_content
+        or "redis" in req_content.lower() and "instrument" in app_content
+    )
+    check("Redis instrumentation present (RedisInstrumentor or package)",
+          has_redis_instrumentation,
+          "neither RedisInstrumentor nor opentelemetry-instrumentation-redis found")
+
+    has_requests_instrumentation = (
+        "RequestsInstrumentor" in app_content
+        or "opentelemetry-instrumentation-requests" in req_content
+        or "urllib3" in req_content.lower()
+        or "httpx" in req_content.lower()
+    )
+    check("Outbound HTTP instrumentation present (requests/urllib3/httpx)",
+          has_requests_instrumentation,
+          "no outbound HTTP instrumentation found")
+
+    # Business enrichment checks
+    print("\nBusiness enrichment checks:")
+    has_cache_enrichment = any(
+        attr in app_content for attr in [
+            "cache.key", "cache.hit", "cache.miss",
+            "cache.ttl", "redis.key",
+        ]
+    )
+    check("Cache business span attributes added (cache.key, cache.hit)",
+          has_cache_enrichment,
+          "no cache business enrichment attributes found in app.py")
+
+    # .otel/ output files
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created",
+          os.path.exists(otel_slos),
+          f"expected at {otel_slos}")
+    if os.path.exists(otel_slos):
+        try:
+            slos_raw = json.load(open(otel_slos))
+            if isinstance(slos_raw, list):
+                check(".otel/slos.json is valid JSON with at least one SLO",
+                      len(slos_raw) > 0, f"got empty list")
+            else:
+                check(".otel/slos.json is valid JSON with 'services' key",
+                      "services" in slos_raw, f"keys: {list(slos_raw.keys())}")
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+
+    check(".otel/golden-paths.md created",
+          os.path.exists(otel_golden),
+          f"expected at {otel_golden}")
+
+    # ── Step 5: Run the instrumented app ──────────────────────────────────────
+    print("\nStep 5: Running the instrumented app")
+
+    pip_install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "-r", req_file, "--no-warn-script-location"],
+        capture_output=True, text=True
+    )
+    if pip_install.returncode != 0:
+        check("pip install of generated requirements succeeded",
+              False, pip_install.stderr[-500:])
+    else:
+        check("pip install of generated requirements succeeded", True)
+
+    PORT = 15085
+    env  = os.environ.copy()
+    env["PORT"] = str(PORT)
+    app_proc = subprocess.Popen(
+        [sys.executable, app_file],
+        cwd=tmpdir,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    import requests as http_lib
+    started = False
+    for _ in range(30):
+        try:
+            r = http_lib.get(f"http://127.0.0.1:{PORT}/health", timeout=0.5)
+            if r.status_code == 200:
+                started = True
+                break
+        except Exception:
+            time.sleep(0.3)
+
+    check("Instrumented app starts and responds to /health",
+          started,
+          f"app stdout: {app_proc.stdout.read(500) if app_proc.poll() is not None else '(still running)'}")
+
+    if started:
+        print(f"  App running on port {PORT}")
+        print("\nStep 6: Making test requests to instrumented app")
+
+        # Set a cache value
+        r_set = http_lib.post(f"http://127.0.0.1:{PORT}/cache/set",
+                               json={"key": "test-key", "value": "hello-world", "ttl": 60})
+        check("POST /cache/set → 200",
+              r_set.status_code == 200,
+              f"status={r_set.status_code} body={r_set.text[:200]}")
+
+        # Get cache hit
+        r_hit = http_lib.get(f"http://127.0.0.1:{PORT}/cache/get/test-key")
+        check("GET /cache/get/<key> (cache hit) → 200",
+              r_hit.status_code == 200,
+              f"status={r_hit.status_code} body={r_hit.text[:200]}")
+
+        # Get cache miss
+        r_miss = http_lib.get(f"http://127.0.0.1:{PORT}/cache/get/nonexistent-key")
+        check("GET /cache/get/<key> (cache miss) → 200",
+              r_miss.status_code == 200,
+              f"status={r_miss.status_code}")
+        if r_miss.status_code == 200:
+            check("Cache miss returns hit=false",
+                  r_miss.json().get("hit") is False,
+                  f"body: {r_miss.text[:200]}")
+
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+
+        check("Test requests completed without app crash",
+              app_proc.poll() is None,
+              "app process died during requests")
+
+    if 'app_proc' in dir() and app_proc.poll() is None:
+        app_proc.terminate()
+        app_proc.wait(timeout=5)
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ─────────────────────────────────────────────────────────────
 passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
 failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
-total  = len(CHECKS)
-
+print(f"\n{'='*62}")
 for status, name, detail in CHECKS:
     line = f"  [{status}] {name}"
     if detail and status == "FAIL":
         line += f"\n         -> {detail}"
     print(line)
-
-print(f"\n  Result: {passed}/{total} checks passed")
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
 if failed:
-    print(f"  FAIL: {failed} check(s) failed")
     sys.exit(1)

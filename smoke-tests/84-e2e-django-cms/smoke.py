@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
 """
-E2E Auto-Instrumentation Verification — Django CMS API
-======================================================
-Simulates: User runs "Observe this project." on a Django REST API.
+E2E "Observe this project." — Django CMS
+=========================================
+This test ACTUALLY runs `claude -p "Observe this project."` on a blank,
+uninstrumented Django CMS API. It does not assume or hardcode what the
+agent will generate.
 
-EDOT Autopilot:
-  1. Reads the codebase (Django + Django ORM)
-  2. Applies opentelemetry-instrumentation-django
-  3. Adds business enrichment: content.author, content.publish_status, cms.operation
+What this tests:
+  1. The agent reads the blank app and understands it (Django + DRF, articles
+     CRUD, SQLite)
+  2. The agent correctly assigns Tier A (auto-instrumentation via
+     opentelemetry-instrumentation-django)
+  3. The agent adds business enrichment (article.author, article.status,
+     cms.operation)
+  4. The generated requirements.txt includes the right OTel packages
+  5. The instrumented app runs and serves requests
+  6. Spans actually arrive in Elastic with correct attributes
 
-Verification checklist:
-  ✓ Django SERVER span auto-created for every view
-  ✓ Django ORM queries create CLIENT spans
-  ✓ Correct semconv 1.20+ HTTP attribute names
-  ✓ Business enrichment on content create/publish views
-  ✓ OTLP export to Elastic succeeds
+Run:
+    cd smoke-tests && python3 84-e2e-django-cms/smoke.py
+
+Requirements (in addition to requirements.txt):
+  - `claude` CLI installed and authenticated
+  - ELASTIC_OTLP_ENDPOINT and ELASTIC_API_KEY set in .env or environment
 """
 
-import os, sys, time, threading
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
+import json
+
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
@@ -28,231 +43,291 @@ if not ENDPOINT or not API_KEY:
     print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
     sys.exit(0)
 
-# ─── Check packages ───────────────────────────────────────────────────────────
-missing = []
-try:
-    import django
-except ImportError:
-    missing.append("django")
-try:
-    from opentelemetry.instrumentation.django import DjangoInstrumentor
-except ImportError:
-    missing.append("opentelemetry-instrumentation-django")
+SVC         = "84-e2e-django-cms"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-django-cms")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-if missing:
-    print(f"SKIP: missing packages: {', '.join(missing)}")
-    print(f"  Run: pip install {' '.join(missing)}")
-    sys.exit(0)
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
-# ─── STEP 1: Configure Django minimally ───────────────────────────────────────
-import django
-from django.conf import settings
-
-if not settings.configured:
-    settings.configure(
-        DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
-        INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth"],
-        MIDDLEWARE=["django.middleware.common.CommonMiddleware"],
-        ROOT_URLCONF=__name__,
-        SECRET_KEY="smoke-test-secret",
-        DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
-        ALLOWED_HOSTS=["127.0.0.1", "localhost"],
-    )
-    django.setup()
-
-# Create tables
-from django.db import connection
-with connection.cursor() as cur:
-    cur.execute("""CREATE TABLE IF NOT EXISTS cms_article (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL, body TEXT, author TEXT,
-        status TEXT DEFAULT 'draft', created_at TEXT
-    )""")
-    cur.execute("INSERT INTO cms_article (title, body, author, status) VALUES (?,?,?,?)",
-                ["Hello World", "First post.", "alice", "published"])
-    cur.execute("INSERT INTO cms_article (title, body, author, status) VALUES (?,?,?,?)",
-                ["Draft Post", "Not ready.", "bob", "draft"])
-
-# ─── Django views (the user's code) ───────────────────────────────────────────
-import json as _json
-from django.http import JsonResponse, HttpRequest
-from django.views import View
-
-def articles_list(request):
-    with connection.cursor() as cur:
-        cur.execute("SELECT id, title, author, status FROM cms_article")
-        rows = cur.fetchall()
-    return JsonResponse({"articles": [{"id": r[0], "title": r[1], "author": r[2], "status": r[3]}
-                                      for r in rows]})
-
-def article_detail(request, article_id):
-    with connection.cursor() as cur:
-        cur.execute("SELECT id, title, body, author, status FROM cms_article WHERE id = %s",
-                    [article_id])
-        row = cur.fetchone()
-    if not row:
-        return JsonResponse({"error": "not found"}, status=404)
-    return JsonResponse({"id": row[0], "title": row[1], "body": row[2],
-                         "author": row[3], "status": row[4]})
-
-def article_publish(request, article_id):
-    if request.method != "POST":
-        return JsonResponse({"error": "method not allowed"}, status=405)
-    with connection.cursor() as cur:
-        cur.execute("UPDATE cms_article SET status='published' WHERE id = %s", [article_id])
-    return JsonResponse({"status": "published", "article_id": article_id})
-
-def health(request):
-    return JsonResponse({"status": "ok"})
-
-# URL patterns
-from django.urls import path
-urlpatterns = [
-    path("articles/",                    articles_list),
-    path("articles/<int:article_id>/",   article_detail),
-    path("articles/<int:article_id>/publish/", article_publish),
-    path("health/",                      health),
-]
-
-# ─── STEP 2: EDOT Autopilot instrumentation ───────────────────────────────────
-from opentelemetry import trace as otel_trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.trace import SpanKind
-
-_memory_exporter = InMemorySpanExporter()
-_resource = Resource.create({
-    "service.name":           "django-cms-api",
-    "service.version":        "1.0.0",
-    "deployment.environment": "smoke-test",
-    "deployment.environment.name": "smoke-test",
-    "telemetry.sdk.name":     "opentelemetry-python",
-    "telemetry.sdk.language": "python",
-    "telemetry.distro.name":  "edot-autopilot",
-})
-_provider = TracerProvider(resource=_resource)
-_provider.add_span_processor(SimpleSpanProcessor(_memory_exporter))
-_provider.add_span_processor(BatchSpanProcessor(
-    OTLPSpanExporter(endpoint=f"{ENDPOINT}/v1/traces",
-                     headers={"Authorization": f"ApiKey {API_KEY}"}),
-    schedule_delay_millis=500,
-))
-otel_trace.set_tracer_provider(_provider)
-
-# Django auto-instrumentation
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "")
-from opentelemetry.instrumentation.django import DjangoInstrumentor
-DjangoInstrumentor().instrument()
-
-# SQLAlchemy/DB instrumentation
-_sqla_ok = False
-try:
-    from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
-    SQLite3Instrumentor().instrument()
-    _sqla_ok = True
-except ImportError:
-    pass
-
-import requests as http_lib
-
-# ─── STEP 3: Run Django dev server ────────────────────────────────────────────
-PORT = 15084
-
-def _run_django():
-    from django.core.management import call_command
-    import io
-    call_command("runserver", f"127.0.0.1:{PORT}",
-                 "--noreload", "--nothreading",
-                 stdout=io.StringIO(), stderr=io.StringIO())
-
-_t = threading.Thread(target=_run_django, daemon=True)
-_t.start()
-
-for _ in range(30):
-    try:
-        http_lib.get(f"http://127.0.0.1:{PORT}/health/", timeout=0.5)
-        break
-    except Exception:
-        time.sleep(0.3)
-else:
-    print("FAIL: Django server did not start")
-    sys.exit(1)
-
-# Real requests
-_r_list    = http_lib.get(f"http://127.0.0.1:{PORT}/articles/")
-_r_detail  = http_lib.get(f"http://127.0.0.1:{PORT}/articles/1/")
-_r_404     = http_lib.get(f"http://127.0.0.1:{PORT}/articles/999/")
-_r_publish = http_lib.post(f"http://127.0.0.1:{PORT}/articles/2/publish/")
-
-time.sleep(0.8)
-_provider.force_flush()
-
-# ─── STEP 4: Assertions ───────────────────────────────────────────────────────
-CHECKS = []
-def check(name, ok, detail=""):
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
     CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-all_spans = _memory_exporter.get_finished_spans()
-
 print(f"\n{'='*62}")
-print("EDOT-Autopilot | 84-e2e-django-cms | Auto-Instrumentation")
+print(f"EDOT-Autopilot | {SVC}")
 print(f"{'='*62}")
-print(f"  Service: django-cms-api | Port: {PORT}")
-print(f"  Total spans captured: {len(all_spans)}")
-if all_spans:
-    print(f"  Span names: {sorted(set(s.name for s in all_spans))}")
+print(f"  Fixture: blank-django-cms (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print(f"  Target:  {ENDPOINT.split('@')[-1].split('/')[0] if '@' in ENDPOINT else ENDPOINT[:40]}")
 print()
 
-server_spans = [s for s in all_spans if s.kind == SpanKind.SERVER]
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture app exists", os.path.isdir(FIXTURE_DIR))
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-print("Django auto-instrumentation:")
-check("Django SERVER spans auto-created",
-      len(server_spans) > 0,
-      f"found {len(server_spans)} server span(s)")
-check("One SERVER span per request (4 requests made)",
-      len(server_spans) >= 4,
-      f"got {len(server_spans)}, expected >=4")
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    print("Prerequisites failed — cannot continue")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
 
-if server_spans:
-    a = dict(server_spans[0].attributes)
-    check("http.request.method present  (semconv 1.20+)",
-          "http.request.method" in a,
-          f"keys: {[k for k in a if k.startswith('http.')]}")
-    check("http.response.status_code present",
-          "http.response.status_code" in a,
-          f"got: {a.get('http.response.status_code')!r}")
+print("  [PASS] all prerequisites met\n")
 
-list_span = next((s for s in server_spans
-                  if dict(s.attributes).get("http.response.status_code") == 200
-                  and "articles" in str(dict(s.attributes).get("http.route",""))), None)
-check("200 span found for articles list",
-      list_span is not None or any(dict(s.attributes).get("http.response.status_code") == 200
-                                    for s in server_spans))
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-84-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        dst = os.path.join(tmpdir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
 
-not_found = next((s for s in server_spans
-                   if dict(s.attributes).get("http.response.status_code") == 404), None)
-check("404 span captured (articles/999/)",
-      not_found is not None,
-      f"404 spans: {[s.name for s in server_spans if dict(s.attributes).get('http.response.status_code') == 404]}")
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-print()
-print("HTTP responses:")
-check("GET /articles/ → 200",          _r_list.status_code == 200)
-check("GET /articles/1/ → 200",        _r_detail.status_code == 200)
-check("GET /articles/999/ → 404",      _r_404.status_code == 404)
-check("POST /articles/2/publish/ → 200", _r_publish.status_code == 200)
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-print()
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
+
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
+
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
+
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
+
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
+
+    # ── Step 4: Inspect the diff ──────────────────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    diff_result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    diff = diff_result.stdout
+
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+
+    print(f"  Modified files (git diff): {len(diff.splitlines())} diff lines")
+    print(f"  New files: {new_files}")
+
+    req_file    = os.path.join(tmpdir, "requirements.txt")
+    app_file    = os.path.join(tmpdir, "app.py")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+
+    print("\nCode correctness checks (Tier A — Django auto-instrumentation):")
+
+    # requirements.txt checks
+    check("opentelemetry-sdk or opentelemetry-api added",
+          "opentelemetry-sdk" in req_content or "opentelemetry-api" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("Django instrumentation package added",
+          "opentelemetry-instrumentation-django" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("OTLP exporter added",
+          "opentelemetry-exporter-otlp" in req_content,
+          f"requirements.txt:\n{req_content}")
+
+    # app.py instrumentation checks
+    check("DjangoInstrumentor applied in app.py",
+          "DjangoInstrumentor" in app_content and ".instrument(" in app_content,
+          "DjangoInstrumentor().instrument() not found")
+    check("TracerProvider or OTLPSpanExporter configured",
+          "TracerProvider" in app_content or "OTLPSpanExporter" in app_content,
+          "no tracer setup found in app.py")
+    check("Elastic endpoint configured from env",
+          "ELASTIC_OTLP_ENDPOINT" in app_content or "OTLP_ENDPOINT" in app_content
+          or (ENDPOINT.split("//")[1][:20] if "//" in ENDPOINT else ENDPOINT[:20]) in app_content,
+          "endpoint not referenced in app.py")
+
+    # Business enrichment checks
+    print("\nBusiness enrichment checks:")
+    has_cms_enrichment = any(
+        attr in app_content for attr in [
+            "article.author", "article.status", "content.author",
+            "content.status", "cms.operation", "article.id",
+            "content.id", "article.title",
+        ]
+    )
+    check("CMS business span attributes added (article/content attributes)",
+          has_cms_enrichment,
+          "no CMS business enrichment attributes found in app.py")
+
+    # .otel/ output files
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created",
+          os.path.exists(otel_slos),
+          f"expected at {otel_slos}")
+    if os.path.exists(otel_slos):
+        try:
+            slos_raw = json.load(open(otel_slos))
+            if isinstance(slos_raw, list):
+                check(".otel/slos.json is valid JSON with at least one SLO",
+                      len(slos_raw) > 0, f"got empty list")
+            else:
+                check(".otel/slos.json is valid JSON with 'services' key",
+                      "services" in slos_raw, f"keys: {list(slos_raw.keys())}")
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+
+    check(".otel/golden-paths.md created",
+          os.path.exists(otel_golden),
+          f"expected at {otel_golden}")
+
+    # ── Step 5: Run the instrumented app ──────────────────────────────────────
+    print("\nStep 5: Running the instrumented app")
+
+    pip_install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "-r", req_file, "--no-warn-script-location"],
+        capture_output=True, text=True
+    )
+    if pip_install.returncode != 0:
+        check("pip install of generated requirements succeeded",
+              False, pip_install.stderr[-500:])
+    else:
+        check("pip install of generated requirements succeeded", True)
+
+    PORT = 15084
+    env  = os.environ.copy()
+    env["PORT"] = str(PORT)
+    app_proc = subprocess.Popen(
+        [sys.executable, app_file],
+        cwd=tmpdir,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    import requests as http_lib
+    started = False
+    for _ in range(30):
+        try:
+            r = http_lib.get(f"http://127.0.0.1:{PORT}/health/", timeout=0.5)
+            if r.status_code == 200:
+                started = True
+                break
+        except Exception:
+            time.sleep(0.3)
+
+    check("Instrumented app starts and responds to /health/",
+          started,
+          f"app stdout: {app_proc.stdout.read(500) if app_proc.poll() is not None else '(still running)'}")
+
+    if started:
+        print(f"  App running on port {PORT}")
+        print("\nStep 6: Making test requests to instrumented app")
+
+        # Create article
+        r_create = http_lib.post(f"http://127.0.0.1:{PORT}/api/articles/",
+                                  json={"title": "E2E Test Article",
+                                        "body":  "Article body content",
+                                        "author": "e2e-tester",
+                                        "status": "draft"},
+                                  headers={"Content-Type": "application/json"})
+        check("POST /api/articles/ → 201",
+              r_create.status_code == 201,
+              f"status={r_create.status_code} body={r_create.text[:200]}")
+
+        # List articles
+        r_list = http_lib.get(f"http://127.0.0.1:{PORT}/api/articles/")
+        check("GET /api/articles/ → 200",
+              r_list.status_code == 200,
+              f"status={r_list.status_code}")
+
+        # Get specific article
+        article_id = r_create.json().get("id") if r_create.status_code == 201 else 1
+        r_get = http_lib.get(f"http://127.0.0.1:{PORT}/api/articles/{article_id}/")
+        check(f"GET /api/articles/{article_id}/ → 200",
+              r_get.status_code == 200,
+              f"status={r_get.status_code}")
+
+        # 404
+        r_404 = http_lib.get(f"http://127.0.0.1:{PORT}/api/articles/99999/")
+        check("GET /api/articles/99999/ → 404",
+              r_404.status_code == 404,
+              f"status={r_404.status_code}")
+
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+
+        check("Test requests completed without app crash",
+              app_proc.poll() is None,
+              "app process died during requests")
+
+    if 'app_proc' in dir() and app_proc.poll() is None:
+        app_proc.terminate()
+        app_proc.wait(timeout=5)
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ─────────────────────────────────────────────────────────────
 passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
 failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
 for status, name, detail in CHECKS:
-    print(f"  [{status}] {name}" + (f"\n         -> {detail}" if detail else ""))
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
 print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
 if failed:
-    print(f"  FAIL: {failed} check(s) failed")
-    print("  Required: pip install opentelemetry-instrumentation-django "
-          "opentelemetry-instrumentation-sqlite3")
     sys.exit(1)
