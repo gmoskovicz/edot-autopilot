@@ -17,7 +17,7 @@ import logging
 
 from opentelemetry import trace, metrics
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 
@@ -48,8 +48,10 @@ class O11yBootstrap:
 
         # ── Traces ────────────────────────────────────────────────────────
         self._trace_provider = TracerProvider(resource=resource)
-        self._trace_provider.add_span_processor(SimpleSpanProcessor(
-            OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", headers=headers)
+        self._trace_provider.add_span_processor(BatchSpanProcessor(
+            OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", headers=headers),
+            max_export_batch_size=64,
+            schedule_delay_millis=1_000,
         ))
         trace.set_tracer_provider(self._trace_provider)
         self.tracer = self._trace_provider.get_tracer("io.edot-autopilot", "1.0.0")
@@ -74,7 +76,8 @@ class O11yBootstrap:
             resource=resource,
             metric_readers=[PeriodicExportingMetricReader(
                 OTLPMetricExporter(endpoint=f"{endpoint}/v1/metrics", headers=headers),
-                export_interval_millis=5_000,
+                export_interval_millis=30_000,   # 30s — prevents rate-limit 401s when
+                export_timeout_millis=10_000,    # many services run in the same process
             )],
         )
         metrics.set_meter_provider(self._meter_provider)

@@ -190,6 +190,7 @@ def svc_billing(operation_id: str, tenant: dict, plan: str, action: str,
                 err = Exception(f"StripeSubscriptionError: {error_code}")
                 entry_span.record_exception(err)
                 entry_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.record_exception(RuntimeError("billing_failed"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "billing_failed")
                 bil_failures.add(1, attributes={"billing.error_code": error_code})
                 billing.logger.error(
@@ -344,6 +345,7 @@ def svc_provisioner(operation_id: str, tenant: dict, plan: str, subscription_id:
             except Exception as e:
                 entry_span.record_exception(e)
                 entry_span.set_status(StatusCode.ERROR, str(e))
+                exit_span.record_exception(RuntimeError("resource_allocation_failed"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "resource_allocation_failed")
                 prov_failures.add(1, attributes={"error.type": type(e).__name__})
                 raise
@@ -364,6 +366,7 @@ def svc_provisioner(operation_id: str, tenant: dict, plan: str, subscription_id:
                     tf_span.set_status(StatusCode.ERROR, str(err))
                     entry_span.record_exception(err)
                     entry_span.set_status(StatusCode.ERROR, str(err))
+                    exit_span.record_exception(ConnectionRefusedError("kube-apiserver not responding (circuit breaker open)"), attributes={"exception.escaped": True})
                     exit_span.set_status(StatusCode.ERROR, "k8s_api_unreachable")
 
                     # Trigger rollback

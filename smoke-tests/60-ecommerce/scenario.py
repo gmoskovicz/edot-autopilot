@@ -368,6 +368,7 @@ def svc_fraud_detection(payment_id: str, customer: dict, amount_usd: float,
 
             if decision == "block":
                 fraud_blocks.add(1, attributes={"fraud.risk_tier": risk_tier})
+                entry_span.record_exception(ValueError(f"Transaction blocked: fraud score {score}"), attributes={"exception.escaped": True})
                 entry_span.set_status(StatusCode.ERROR, f"Transaction blocked: fraud score {score}")
                 fraud.logger.warning(
                     f"fraud block: score={score} risk={risk_tier} customer={customer['id']}",
@@ -420,6 +421,7 @@ def svc_payment_processor(payment_id: str, amount_usd: float, method: str,
                 stripe_span.set_status(StatusCode.ERROR, str(err))
                 stripe_span.set_attribute("payment.status",     "failed")
                 stripe_span.set_attribute("payment.error_code", error_code)
+                exit_span.record_exception(err, attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, str(err))
 
                 dur_ms = (time.time() - t0) * 1000
@@ -487,9 +489,11 @@ def svc_payment(order_id: str, customer: dict, amount_usd: float, method: str,
                 inject_traceparent(entry_span), force_fraud=force_fraud
             )
             if fraud_decision == "block":
+                entry_span.record_exception(RuntimeError(f"Payment blocked by fraud detection: score={fraud_score}"), attributes={"exception.escaped": True})
                 entry_span.set_status(StatusCode.ERROR, f"Payment blocked by fraud detection: score={fraud_score}")
                 entry_span.set_attribute("payment.status",      "fraud_blocked")
                 entry_span.set_attribute("fraud.score",         fraud_score)
+                exit_span.record_exception(RuntimeError("fraud_blocked"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "fraud_blocked")
                 dur_ms = (time.time() - t0) * 1000
                 pay_latency.record(dur_ms, attributes={"payment.status": "fraud_blocked"})
@@ -506,9 +510,11 @@ def svc_payment(order_id: str, customer: dict, amount_usd: float, method: str,
                 inject_traceparent(entry_span), force_decline=force_decline
             )
             if not charge_ok:
+                entry_span.record_exception(ValueError(f"Card declined: {error_code}"), attributes={"exception.escaped": True})
                 entry_span.set_status(StatusCode.ERROR, f"Card declined: {error_code}")
                 entry_span.set_attribute("payment.status",      "declined")
                 entry_span.set_attribute("payment.error_code",  error_code)
+                exit_span.record_exception(ValueError("card_declined"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "card_declined")
                 dur_ms = (time.time() - t0) * 1000
                 pay_latency.record(dur_ms, attributes={"payment.status": "declined"})
@@ -608,6 +614,7 @@ def svc_order_service(order_id: str, customer: dict, items: list, warehouse: str
                 err = Exception("ConnectionRefusedError: postgres-primary:5432 connection refused — all replicas exhausted")
                 entry_span.record_exception(err)
                 entry_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.record_exception(ConnectionRefusedError("postgres-primary:5432 connection refused — all replicas exhausted"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "db_connection_refused")
                 order_errors.add(1, attributes={"error.type": "db_connection_refused"})
                 orders.logger.error(
@@ -703,6 +710,7 @@ def run_checkout_scenario(scenario_type: str, customer: dict, items: list):
                 force_fraud=force_fraud, force_decline=force_decline)
 
             if not pay_ok:
+                root_span.record_exception(RuntimeError(f"Payment failed: {pay_error}"), attributes={"exception.escaped": True})
                 root_span.set_status(StatusCode.ERROR, f"Payment failed: {pay_error}")
                 co_errors.add(1, attributes={"error.type": pay_error})
                 co_requests.add(1, attributes={"result": "payment_failed",

@@ -80,10 +80,12 @@ for order in orders:
             time.sleep(0.05)
             if order["fraud"] > 0.85:
                 pay.set_attribute("payment.declined", True)
+                pay.record_exception(ValueError("payment skipped — fraud block"), attributes={"exception.escaped": True})
                 pay.set_status(StatusCode.ERROR, "payment skipped — fraud block")
         pay_ms = (time.time() - pay_start) * 1000
 
         if order["fraud"] > 0.85:
+            span.record_exception(ValueError("Fraud block"), attributes={"exception.escaped": True})
             span.set_status(StatusCode.ERROR, "Fraud block")
 
         # Metrics — recorded inside span so trace context is attached automatically

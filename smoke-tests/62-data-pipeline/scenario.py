@@ -238,6 +238,7 @@ def svc_schema_validator(batch_id: str, event_type: str, records: list,
                 err = Exception(first_error)
                 entry_span.record_exception(err)
                 entry_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.record_exception(ValueError("schema_validation_failed"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "schema_validation_failed")
                 schema.logger.error(
                     f"schema validation failed: {invalid_count}/{len(records)} records invalid",
@@ -306,6 +307,7 @@ def svc_dedup(batch_id: str, event_type: str, records: list,
                 err = Exception(f"DuplicateEventError: {dup_count} duplicate event_ids detected in batch {batch_id}")
                 entry_span.record_exception(err)
                 entry_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.record_exception(ValueError("duplicate_rejected"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "duplicate_rejected")
                 dedup.logger.warning(
                     f"duplicates detected: {dup_count}/{len(records)} records rejected",
@@ -357,6 +359,7 @@ def svc_transform(batch_id: str, event_type: str, source: str, records: list,
                 )
                 entry_span.record_exception(err)
                 entry_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.record_exception(RuntimeError("transform_failed"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "transform_failed")
                 trn_errors.add(1, attributes={"event.type": event_type, "error.type": "UnicodeDecodeError"})
                 transform.logger.error(

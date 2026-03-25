@@ -170,6 +170,7 @@ def svc_user_directory(request_id: str, user: dict, parent_tp: str,
             dir_latency.record(dur_ms, attributes={"directory.backend": "ldap+postgresql"})
 
             if status == "LOCKED":
+                entry_span.record_exception(PermissionError("Account locked"), attributes={"exception.escaped": True})
                 entry_span.set_status(StatusCode.ERROR, "Account locked")
                 directory.logger.warning(
                     f"user lookup: account locked for {user['email']}",
@@ -224,6 +225,7 @@ def svc_mfa(request_id: str, user: dict, parent_tp: str,
                 err = Exception(f"MFATimeoutError: challenge {challenge_id} expired after 300s")
                 entry_span.record_exception(err)
                 entry_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.record_exception(TimeoutError(f"MFA challenge {challenge_id} timed out"), attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, "mfa_timeout")
                 mfa_timeouts.add(1, attributes={"auth.mfa_type": user["mfa_type"]})
                 mfa.logger.warning(
@@ -459,7 +461,9 @@ def run_auth_flow(scenario: str, user: dict, auth_method: str,
                     request_id, user, tp_auth, force_locked=force_locked)
 
                 if user_status == "LOCKED":
+                    auth_span.record_exception(PermissionError("Account locked"), attributes={"exception.escaped": True})
                     auth_span.set_status(StatusCode.ERROR, "Account locked")
+                    root_span.record_exception(PermissionError("Account locked"), attributes={"exception.escaped": True})
                     root_span.set_status(StatusCode.ERROR, "Account locked")
                     auth_failures.add(1, attributes={"auth.failure_reason": "account_locked"})
                     svc_audit(request_id, user, "login_failed", ip, ip_country, is_vpn,
@@ -481,7 +485,9 @@ def run_auth_flow(scenario: str, user: dict, auth_method: str,
                 time.sleep(random.uniform(0.03, 0.08))
 
                 if force_wrong_pw:
+                    auth_span.record_exception(PermissionError("Invalid credentials"), attributes={"exception.escaped": True})
                     auth_span.set_status(StatusCode.ERROR, "Invalid credentials")
+                    root_span.record_exception(PermissionError("Invalid credentials"), attributes={"exception.escaped": True})
                     root_span.set_status(StatusCode.ERROR, "Invalid credentials")
                     auth_failures.add(1, attributes={"auth.failure_reason": "invalid_password"})
                     svc_audit(request_id, user, "login_failed", ip, ip_country, is_vpn,

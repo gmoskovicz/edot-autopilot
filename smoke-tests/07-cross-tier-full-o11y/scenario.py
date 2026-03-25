@@ -179,6 +179,7 @@ def run_tier_a(customer: dict, scenario: str) -> tuple:
         # Simulate customer validation
         time.sleep(0.02)
         if customer.get("blocked"):
+            span.record_exception(PermissionError("Customer account suspended"), attributes={"exception.escaped": True})
             span.set_status(StatusCode.ERROR, "Customer account suspended")
             tier_a.logger.error(
                 "activation rejected: customer account suspended",
@@ -208,6 +209,7 @@ def run_tier_a_complete(activation_id, traceparent_from_a, success, scenario, cu
         }
     ) as span:
         if not success:
+            span.record_exception(RuntimeError("Activation failed"), attributes={"exception.escaped": True})
             span.set_status(StatusCode.ERROR, "Activation failed")
 
         a_activations.add(1, attributes={"result": "success" if success else "failed",
@@ -269,6 +271,7 @@ def run_tier_b(activation_id, customer, parent_traceparent) -> tuple:
                        "billing.plan_cost_usd": plan_cost},
             )
         else:
+            span.record_exception(ValueError("Insufficient credit"), attributes={"exception.escaped": True})
             span.set_status(StatusCode.ERROR, "Insufficient credit")
             tier_b.logger.warning(
                 f"credit check denied: limit=${credit_limit} < cost=${plan_cost}",
@@ -308,6 +311,7 @@ def run_tier_c(activation_id, customer, parent_traceparent, force_decline=False)
         # Simulate decline for scenario 2
         if force_decline:
             charge_id = None
+            span.record_exception(ValueError("card_declined: insufficient funds"), attributes={"exception.escaped": True})
             span.set_status(StatusCode.ERROR, "card_declined: insufficient funds")
             span.set_attribute("payment.error_code", "card_declined")
             span.set_attribute("payment.status",     "failed")
