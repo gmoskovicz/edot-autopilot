@@ -1,0 +1,127 @@
+services:
+  # ── Tier D: OTEL Sidecar (shared by all Tier D tests) ─────────────────────
+  otel-sidecar:
+    build:
+      context: ../otel-sidecar
+    environment:
+      OTEL_SERVICE_NAME: smoke-tier-d-sidecar
+      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
+      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
+      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+      SIDECAR_HOST: 0.0.0.0
+      SIDECAR_PORT: "9411"
+    ports:
+      - "9411:9411"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+        "import urllib.request,json; r=urllib.request.urlopen(urllib.request.Request('http://localhost:9411',b'{\"action\":\"health\"}',{'Content-Type':'application/json'})); print(json.loads(r.read()))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Tier A: Python ────────────────────────────────────────────────────────
+  smoke-tier-a-python:
+    image: python:3.12-slim
+    working_dir: /smoke
+    volumes:
+      - .:/smoke
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 01-tier-a-python/smoke.py"
+    environment:
+      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
+      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
+      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+
+  # ── Tier A: Node.js ───────────────────────────────────────────────────────
+  smoke-tier-a-nodejs:
+    image: node:20-slim
+    working_dir: /smoke/02-tier-a-nodejs
+    volumes:
+      - .:/smoke
+    command: >
+      sh -c "npm install --silent && node smoke.js"
+    environment:
+      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
+      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
+      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+
+  # ── Tier B: Manual wrap ───────────────────────────────────────────────────
+  smoke-tier-b:
+    image: python:3.12-slim
+    working_dir: /smoke
+    volumes:
+      - .:/smoke
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 03-tier-b-manual-wrap/smoke.py"
+    environment:
+      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
+      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
+      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+
+  # ── Tier C: Monkey-patch ─────────────────────────────────────────────────
+  smoke-tier-c:
+    image: python:3.12-slim
+    working_dir: /smoke
+    volumes:
+      - .:/smoke
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 04-tier-c-monkey-patch/smoke.py"
+    environment:
+      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
+      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
+      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+
+  # ── Tier D: Bash via sidecar ─────────────────────────────────────────────
+  smoke-tier-d-bash:
+    image: ubuntu:22.04
+    working_dir: /smoke
+    volumes:
+      - .:/smoke
+    command: >
+      sh -c "apt-get update -qq && apt-get install -y -qq curl python3 &&
+             bash 05-tier-d-sidecar/smoke-bash.sh"
+    environment:
+      OTEL_SIDECAR_URL: http://otel-sidecar:9411
+    depends_on:
+      otel-sidecar:
+        condition: service_healthy
+
+  # ── Tier D: Perl via sidecar ─────────────────────────────────────────────
+  smoke-tier-d-perl:
+    image: perl:5.38
+    working_dir: /smoke
+    volumes:
+      - .:/smoke
+    command: >
+      sh -c "cpanm --quiet LWP::UserAgent JSON &&
+             perl 05-tier-d-sidecar/smoke-perl.pl"
+    environment:
+      OTEL_SIDECAR_URL: http://otel-sidecar:9411
+    depends_on:
+      otel-sidecar:
+        condition: service_healthy
+
+  # ── Verify ────────────────────────────────────────────────────────────────
+  verify:
+    image: python:3.12-slim
+    working_dir: /smoke
+    volumes:
+      - .:/smoke
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             sleep 5 && python3 06-verify/check_spans.py"
+    environment:
+      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
+      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-}
+      ELASTIC_ES_READ_API_KEY: ${ELASTIC_ES_READ_API_KEY:-}
+    depends_on:
+      - smoke-tier-a-python
+      - smoke-tier-a-nodejs
+      - smoke-tier-b
+      - smoke-tier-c
+      - smoke-tier-d-bash
+      - smoke-tier-d-perl

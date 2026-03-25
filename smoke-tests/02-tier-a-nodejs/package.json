@@ -1,0 +1,15 @@
+{
+  "name": "smoke-tier-a-nodejs",
+  "version": "1.0.0",
+  "description": "Smoke test: Tier A Node.js",
+  "main": "smoke.js",
+  "scripts": {
+    "test": "node smoke.js"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-node": "^1.25.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.52.0",
+    "@opentelemetry/resources": "^1.25.0"
+  }
+}
