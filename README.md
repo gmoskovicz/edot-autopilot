@@ -4,7 +4,7 @@
 [![Elastic EDOT](https://img.shields.io/badge/Elastic-EDOT-005571?logo=elastic)](https://www.elastic.co/docs/reference/opentelemetry)
 [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-agentskills.io-8A2BE2)](https://agentskills.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Languages](https://img.shields.io/badge/languages-50%2B-brightgreen)](smoke-tests/README.md)
+[![Languages](https://img.shields.io/badge/languages-65%2B-brightgreen)](smoke-tests/README.md)
 
 OpenTelemetry auto-instrumentation for any language — modern or legacy — powered by Elastic EDOT, with full support for runtimes that have no OTel SDK.
 
@@ -53,9 +53,10 @@ The agent reads the codebase, assigns each component to the right instrumentatio
 | File | Purpose |
 |------|---------|
 | `SKILL.md` | Agent-agnostic instructions (5 phases, under 500 lines) |
+| `references/semconv-conventions.md` | **OTel semconv cheatsheet** — correct attribute names, SpanKind rules, metric naming, CWV, exception handling. Agents read this to generate correct code first-time. |
 | `references/tier-guide.md` | Full code for Tier A–C across Python, Java, Node.js, Go, .NET |
 | `references/sidecar-callers.md` | Copy-paste snippets: COBOL, Perl, Bash, PowerShell, Classic ASP, PHP 5, Ruby |
-| `references/enrichment-patterns.md` | Business span attributes, span events, span links, observable gauges |
+| `references/enrichment-patterns.md` | Business span attributes, span events, span links, observable gauges, Core Web Vitals |
 | `scripts/o11y_bootstrap.py` | Python 3-signal helper (traces + logs + metrics in one call) |
 | `scripts/otel-sidecar.py` | HTTP-to-OTLP bridge for legacy runtimes |
 | `assets/docker-compose-sidecar.yml` | Tier D Docker deployment with healthcheck |
@@ -100,9 +101,12 @@ No other tool has a graceful degradation strategy that covers every runtime ever
 
 ---
 
-## Smoke test suite — 75 tests, 50+ technologies
+## Smoke test suite — 81 tests, 65+ technologies
 
 All tests confirmed green against a live Elastic Cloud Serverless deployment.
+All instrumentation follows **OTel semantic conventions 1.22+** — stable attribute names
+(`http.request.method`, `db.query.text`, `db.system.name`), correct `SpanKind`,
+`service.peer.name` on every CLIENT span, and INP (not FID) for Core Web Vitals.
 
 ### Tier A — Native OTel SDK (7)
 Python · Node.js · Java · Go · Ruby · .NET C# · PHP
@@ -135,19 +139,55 @@ meaningful combination, each producing distinct connection patterns in the Kiban
 | 7 | C→A→D | Stripe webhook — payment event updates API, SMS confirms |
 | 8 | A→B | Credit denied — trace stops at Tier B |
 
-### Mobile platforms (6)
-React Native (iOS + Android) · Flutter (iOS + Android) · iOS Swift · Android Kotlin ·
-Xamarin / .NET MAUI (iOS + Android) · Ionic / Capacitor (iOS + Android + PWA)
+### Mobile platforms (6 frameworks, 13 runtime variants)
 
-### Web frontend / Browser RUM (5)
-React SPA · Next.js (SSR + client hydration) · Vue.js + Pinia · Angular · SvelteKit
+Each test emits all three signals with correct mobile OTel resource attributes
+(`device.model.name`, `device.manufacturer`, `os.type`, `os.version`, `os.build_id`,
+`app.version`, `telemetry.sdk.name`) and hashed `device.id` per OTel privacy guidance.
 
-### Backend web frameworks (5)
-NestJS (REST + GraphQL + CQRS) · Gin (Go) · Ruby on Rails + Sidekiq · FastAPI (async) · HTMX
+| Test | Framework | Platforms | Key scenarios |
+|------|-----------|-----------|---------------|
+| `65` | **React Native** | iOS · Android | Cold start, screen navigation, add-to-cart, HTTP fetch + retry, push deep-link, JS crash |
+| `66` | **Flutter / Dart** | iOS · Android | Cold start + frame drops, dashboard API, face ID + fingerprint biometric, fund transfer, offline sync + cache fallback, background crash |
+| `67` | **iOS Swift** | iOS · iPadOS | HealthKit sync, GPS workout + heart rate, WatchKit message, StoreKit IAP, APNS silent push, background fetch |
+| `68` | **Android Kotlin** | Android | Cold start + Jetpack Compose, biometric + Retrofit, NFC contactless payment, ANR → coroutine offload, Crashlytics bridge |
+| `69` | **Xamarin / .NET MAUI** | iOS · Android | MSAL OAuth2, tab navigation, SharePoint delta sync + SQLite, camera + Azure Cognitive OCR, FCM/APNs push, TLS certificate pinning |
+| `70` | **Ionic / Capacitor** | iOS · Android · PWA | Geolocation, offline search + IndexedDB cache, passport MRZ OCR, push + deep-link, Stripe in-app payment, Web Share API |
+
+**Metrics per platform:** crash counter, screen render histogram, network request duration histogram, session counter.
+
+### Web frontend / Browser RUM (5 frameworks)
+
+Each test emits Core Web Vitals as OTel metrics with histogram bucket boundaries aligned
+to Google's Good/Needs Improvement/Poor thresholds. Uses **INP** (Interaction to Next Paint)
+— FID was deprecated by Chrome in March 2024.
+
+| Test | Framework + Backend | Key scenarios |
+|------|---------------------|---------------|
+| `71` | **React SPA** + Express | Document load + LCP/INP/CLS/TTFB/FCP, product browse + fetch, cart interaction, form validation, lazy chunk load, SPA route change |
+| `72` | **Next.js 14** SSR + client + API routes | SSR page render, server action, Stripe webhook, ISR revalidation, middleware auth redirect, edge geo-routing |
+| `73` | **Vue 3 + Pinia** + Laravel | App mount + CWV, router guard navigation, Pinia store action, WebSocket live events, component error boundary, async composable |
+| `74` | **Angular 17** + Spring Boot | Bootstrap + CWV, lazy module routing + guards, HTTP interceptor chain, Angular Universal SSR, reactive form + async validator, Signals + OnPush |
+| `75` | **SvelteKit** + PostgreSQL | Server load function, form action + validation, handle hook, streaming RSS endpoint, SSE live feed, client-side navigation |
+
+**CWV metrics:** `webvitals.lcp`, `webvitals.inp`, `webvitals.cls`, `webvitals.ttfb`, `webvitals.fcp` — all with explicit histogram bucket views.
+
+### Backend web frameworks (5 frameworks)
+
+| Test | Framework + Stack | Key scenarios |
+|------|-------------------|---------------|
+| `76` | **NestJS** (Node.js) — REST + GraphQL + TCP microservices + CQRS + WebSocket | REST with JwtAuthGuard, GraphQL query + DataLoader batching, TCP microservice pattern, CQRS command bus + event bus, WebSocket gateway, interceptor chain (logging + cache) |
+| `77` | **Gin** (Go) — PostgreSQL + Redis | Middleware chain (CORS/rate-limit/JWT), paginated list + Redis cache-aside, GORM transaction + rollback, concurrent goroutine fan-out (`sync.WaitGroup`), input validation, graceful SIGTERM shutdown |
+| `78` | **Rails 7** + Sidekiq — PostgreSQL + S3 + Elasticsearch | ActionController with before_action, N+1 detection + span event, ActiveJob enqueue → Sidekiq consume, CarrierWave upload → S3, ActionCable subscribe + broadcast, multi-key cache read/write |
+| `79` | **FastAPI** (async Python) — Celery + PostgreSQL | Sync ML inference, async Celery task + webhook callback, WebSocket streaming inference, Pydantic v2 validation error, async SQLAlchemy select, lifespan startup (model load + warmup) |
+| `80` | **HTMX** + Flask — PostgreSQL | `hx-get` fragment swap, `hx-post` form + validation, `hx-trigger` polling queue status, WebSocket upgrade + HTML push, `hx-boost` page navigation, out-of-band toast swap |
 
 ### Mobile multi-service scenario (1)
-9-service mobile e-commerce: React Native client → Express BFF → FastAPI catalog → Go inventory →
-Rails profile → Spring payment → fraud detection → Stripe processor → push notifications
+9 cooperating services — React Native client → Express API gateway → FastAPI catalog →
+Go (Gin) inventory → Rails user profile → Spring Boot payment → FastAPI fraud detection →
+Express payment processor → Express push notifications + FastAPI analytics ingest.
+20 scenarios covering the happy path, fraud block, card decline, stockout, catalog timeout,
+profile 503 + guest fallback, push token expiry, and OOM crash.
 
 ### Multi-service architecture scenarios (5)
 Complex distributed systems with realistic error mixes, full service maps, span events,
@@ -314,7 +354,11 @@ edot-autopilot/
 │
 ├── observability-edot-autopilot/     # AI skill package (agentskills.io spec)
 │   ├── SKILL.md                      #   Agent-agnostic instructions for all coding assistants
-│   ├── references/                   #   Tier guide, sidecar callers, enrichment patterns
+│   ├── references/
+│   │   ├── semconv-conventions.md    #   OTel semconv cheatsheet — agents read this first
+│   │   ├── tier-guide.md             #   Full code for Tier A–C (Python, Java, Node, Go, .NET)
+│   │   ├── sidecar-callers.md        #   COBOL, Perl, Bash, PowerShell, Classic ASP snippets
+│   │   └── enrichment-patterns.md   #   Span events, observable gauges, span links, CWV
 │   ├── scripts/                      #   o11y_bootstrap.py + otel-sidecar.py
 │   └── assets/                       #   Docker Compose + .env template
 │
@@ -328,7 +372,7 @@ edot-autopilot/
 │   ├── Dockerfile
 │   └── README.md
 │
-├── smoke-tests/                      # 75 smoke tests — all 4 tiers, 50+ technologies
+├── smoke-tests/                      # 81 smoke tests — all 4 tiers, 65+ technologies
 │   ├── run-all.sh                    #   Run everything locally
 │   ├── docker-compose.yml            #   Full suite with Docker profiles
 │   ├── o11y_bootstrap.py             #   Shared helper: tracer + logger + meter
@@ -388,6 +432,15 @@ Use `span.set_attribute("order.value_usd", 249.99)` for any data with business m
 
 ### Which AI coding assistants does this work with?
 Claude Code, Cursor, GitHub Copilot, Gemini CLI, Windsurf, Roo, Cline, Codex — any agent that supports the [agentskills.io](https://agentskills.io) open skill specification. Install with `npx skills add gmoskovicz/edot-autopilot/observability-edot-autopilot`. For Claude Code specifically, you can also drop [`CLAUDE.md`](CLAUDE.md) directly into your repo root.
+
+### How do I instrument a React Native / Flutter / mobile app with OpenTelemetry?
+Mobile apps require platform-specific OTel resource attributes (`device.model.name`, `device.manufacturer`, `os.type`, `os.version`, `os.build_id`, `app.version`, `telemetry.sdk.name`) plus session and network context. The smoke tests in `65–70` demonstrate full 3-signal instrumentation for React Native, Flutter, iOS Swift, Android Kotlin, .NET MAUI, and Ionic/Capacitor — each with crash reporting, biometric auth flows, and push notification correlation. Use the `extra_resource_attrs` parameter in `o11y_bootstrap.py` to inject platform attributes at the OTel Resource level (semantically correct per spec). Note: `device.id` carries GDPR implications — the examples SHA-256 hash it.
+
+### How do I instrument browser RUM and Core Web Vitals with OpenTelemetry?
+The smoke tests in `71–75` cover React SPA, Next.js, Vue, Angular, and SvelteKit. Each emits Core Web Vitals as OTel histograms with bucket boundaries aligned to Google's Good/Needs Improvement/Poor thresholds. Use **INP** (Interaction to Next Paint) — Chrome deprecated FID in March 2024. Metrics: `webvitals.lcp`, `webvitals.inp`, `webvitals.cls`, `webvitals.ttfb`, `webvitals.fcp`. Set `browser.name`, `browser.version`, `browser.platform`, `browser.mobile`, and `user_agent.original` as resource attributes for proper segmentation in Kibana.
+
+### How do I use the correct OTel semantic convention attribute names?
+OTel stabilized new HTTP and database attribute names in semconv 1.20–1.22. Many examples online still use the deprecated names. Quick rules: `http.method` → `http.request.method`, `http.status_code` → `http.response.status_code`, `http.url` → `url.full`, `db.system` → `db.system.name`, `db.statement` → `db.query.text`, `db.operation` → `db.operation.name`. OTel counters never include `_total` (the Prometheus exporter adds it on export). Always set `service.peer.name` on CLIENT spans — Elastic APM service maps require it to draw edges between services. The full cheatsheet is at [`observability-edot-autopilot/references/semconv-conventions.md`](observability-edot-autopilot/references/semconv-conventions.md).
 
 ---
 
