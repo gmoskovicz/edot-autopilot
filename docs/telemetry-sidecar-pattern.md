@@ -379,4 +379,90 @@ docker-compose logs -f otel-sidecar
 
 ---
 
+## Sampling
+
+By default the sidecar emits every span it receives (100% sampling). This is the right default for getting started. For production high-volume workloads, you have two options:
+
+### Option 1 — Reduce sidecar sampling via OTel SDK (head-based)
+
+The sidecar's `TracerProvider` respects `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`. To sample 10% of traces:
+
+```bash
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.1
+```
+
+`parentbased_traceidratio` means: if an upstream service already made a sampling decision (via `traceparent`), respect it; otherwise sample at the given ratio. This keeps distributed traces consistent — you won't get orphaned child spans.
+
+**When to reduce:** COBOL batch jobs processing 10,000+ records per run, Perl CGI scripts serving high-traffic pages, any Tier D process emitting more than ~100 spans/second.
+
+### Option 2 — OTel Collector with tail-based sampling (advanced)
+
+For more control — keeping 100% of error traces while sampling successes — interpose an [OTel Collector](https://opentelemetry.io/docs/collector/) between the sidecar and Elastic:
+
+```
+[Legacy Process] → [sidecar:9411] → [OTel Collector:4318] → [Elastic Cloud]
+```
+
+Configure the Collector with the [tail sampling processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor):
+
+```yaml
+# otel-collector-config.yaml (excerpt)
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: sample-successes
+        type: probabilistic
+        probabilistic: { sampling_percentage: 10 }
+
+exporters:
+  otlphttp:
+    endpoint: https://<your-deployment>.ingest.<region>.gcp.elastic.cloud:443
+    headers:
+      Authorization: "ApiKey <your-base64-api-key>"
+```
+
+Point the sidecar at the Collector instead of Elastic directly:
+
+```bash
+ELASTIC_OTLP_ENDPOINT=http://localhost:4318
+```
+
+The Collector also enables: PII redaction, attribute filtering, fan-out to multiple backends, and metric aggregation before export.
+
+---
+
+## OpenTelemetry Collector as alternative export path
+
+The sidecar exports directly to Elastic via OTLP/HTTP — no Collector required. This is the simplest architecture and works for most use cases.
+
+A Collector makes sense when you need:
+
+| Need | Collector feature |
+|---|---|
+| Sample errors at 100%, successes at 10% | Tail-based sampling processor |
+| Strip PII before it reaches Elastic | Transform processor / attribute filter |
+| Send to Elastic + Jaeger + Prometheus simultaneously | Multiple exporters |
+| Aggregate metrics before export (reduce cardinality) | Metrics transform processor |
+| Buffer spans during Elastic outages | Persistent queue exporter |
+
+Elastic supports both paths: direct OTLP ingest and Collector-proxied ingest are functionally equivalent from the Kibana side.
+
+---
+
+- [OpenTelemetry for Legacy Runtimes — overview and tier model](./opentelemetry-legacy-runtimes.md)
+- [OpenTelemetry for COBOL](./opentelemetry-cobol.md)
+- [OpenTelemetry for Perl](./opentelemetry-perl.md)
+- [OpenTelemetry for Bash / Shell Scripts](./opentelemetry-bash-shell-scripts.md)
+- [OpenTelemetry for PowerShell](./opentelemetry-powershell.md)
+- [OpenTelemetry for Classic ASP / VBScript](./opentelemetry-classic-asp-vbscript.md)
+- [Business Span Enrichment](./business-span-enrichment.md)
+- [otel-sidecar.py source](../otel-sidecar/otel-sidecar.py)
+
+---
+
 > Found this useful? [Star the repo](https://github.com/gmoskovicz/edot-autopilot) — it helps other developers dealing with legacy runtime observability find this solution.

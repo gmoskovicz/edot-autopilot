@@ -7,8 +7,8 @@ to Elastic APM. COBOL, Perl, Bash, PowerShell, SAP ABAP, IBM RPG, Flutter — an
 
 API:
   POST /
-    {"action": "event",             "name": "...", "attributes": {}}
-    {"action": "start_span",        "name": "...", "attributes": {}, "span_id": "optional", "traceparent": "optional"}
+    {"action": "event",             "name": "...", "attributes": {}, "kind": "server|client|producer|consumer|internal"}
+    {"action": "start_span",        "name": "...", "attributes": {}, "span_id": "optional", "traceparent": "optional", "tracestate": "optional", "kind": "server|client|producer|consumer|internal"}
     {"action": "end_span",          "span_id": "...", "attributes": {}, "error": "optional message"}
     {"action": "log",               "body": "...", "severity": "INFO", "attributes": {}, "traceparent": "optional"}
     {"action": "metric_counter",    "name": "...", "value": 1, "attributes": {}, "traceparent": "optional"}
@@ -20,7 +20,7 @@ Environment variables:
   OTEL_SERVICE_NAME           (required)
   ELASTIC_OTLP_ENDPOINT       (required) — e.g. https://xxx.ingest.us-central1.gcp.elastic.cloud:443
   ELASTIC_API_KEY             (required)
-  OTEL_DEPLOYMENT_ENVIRONMENT (default: production)
+  OTEL_DEPLOYMENT_ENVIRONMENT (default: production) — sets deployment.environment.name
   SERVICE_VERSION             (default: unknown)
   SIDECAR_PORT                (default: 9411)
   SIDECAR_HOST                (default: 127.0.0.1)
@@ -40,6 +40,8 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from opentelemetry.context import attach, detach
+from opentelemetry.baggage.propagation import W3CBaggagePropagator
+from opentelemetry.propagators.composite import CompositePropagator
 
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
@@ -55,9 +57,10 @@ log = logging.getLogger("otel-sidecar")
 # ── Bootstrap OTel providers ──────────────────────────────────────────────────
 
 resource = Resource.create({
-    "service.name":           os.environ["OTEL_SERVICE_NAME"],
-    "service.version":        os.environ.get("SERVICE_VERSION", "unknown"),
-    "deployment.environment": os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "production"),
+    "service.name":                os.environ["OTEL_SERVICE_NAME"],
+    "service.version":             os.environ.get("SERVICE_VERSION", "unknown"),
+    "service.instance.id":         str(uuid.uuid4()),
+    "deployment.environment.name": os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "production"),
 })
 
 otlp_endpoint = os.environ["ELASTIC_OTLP_ENDPOINT"].rstrip("/")
@@ -69,7 +72,7 @@ trace_exporter = OTLPSpanExporter(endpoint=f"{otlp_endpoint}/v1/traces", headers
 trace_provider = TracerProvider(resource=resource)
 trace_provider.add_span_processor(BatchSpanProcessor(trace_exporter))
 trace.set_tracer_provider(trace_provider)
-tracer = trace.get_tracer("otel-sidecar")
+tracer = trace.get_tracer("io.edot-autopilot.sidecar", "1.0.0")
 
 # Logs
 log_exporter = OTLPLogExporter(endpoint=f"{otlp_endpoint}/v1/logs", headers=headers)
@@ -87,7 +90,7 @@ metric_exporter = OTLPMetricExporter(endpoint=f"{otlp_endpoint}/v1/metrics", hea
 metric_reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=10_000)
 meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
 metrics.set_meter_provider(meter_provider)
-meter = metrics.get_meter("otel-sidecar")
+meter = metrics.get_meter("io.edot-autopilot.sidecar", "1.0.0")
 
 # Instrument registry — prevents duplicate creation errors
 _instruments: dict = {}
@@ -95,7 +98,10 @@ _instruments: dict = {}
 # span_id → (span_object, otel_context_token)
 _spans: dict = {}
 
-propagator = TraceContextTextMapPropagator()
+# Gauge value store: (name, frozenset(attrs.items())) → float
+_gauge_values: dict = {}
+
+propagator = CompositePropagator([TraceContextTextMapPropagator(), W3CBaggagePropagator()])
 
 _SEVERITY_MAP = {
     "TRACE": logging.DEBUG - 4,
@@ -105,6 +111,14 @@ _SEVERITY_MAP = {
     "WARNING": logging.WARNING,
     "ERROR": logging.ERROR,
     "FATAL": logging.CRITICAL,
+}
+
+_KIND_MAP = {
+    "server":   trace.SpanKind.SERVER,
+    "client":   trace.SpanKind.CLIENT,
+    "producer": trace.SpanKind.PRODUCER,
+    "consumer": trace.SpanKind.CONSUMER,
+    "internal": trace.SpanKind.INTERNAL,
 }
 
 
@@ -118,7 +132,11 @@ def _get_or_create_counter(name: str):
 def _get_or_create_gauge(name: str):
     key = ("gauge", name)
     if key not in _instruments:
-        _instruments[key] = meter.create_observable_gauge(name)
+        def _callback(options):
+            for (gname, frozen_attrs), value in list(_gauge_values.items()):
+                if gname == name:
+                    yield metrics.Observation(value, dict(frozen_attrs))
+        _instruments[key] = meter.create_observable_gauge(name, callbacks=[_callback])
     return _instruments[key]
 
 
@@ -150,19 +168,31 @@ class SidecarHandler(BaseHTTPRequestHandler):
             span_id = body.get("span_id") or str(uuid.uuid4())
             ctx_token = None
 
+            carrier = {}
             if tp := body.get("traceparent"):
-                parent_ctx = propagator.extract({"traceparent": tp})
+                carrier["traceparent"] = tp
+            if ts := body.get("tracestate"):
+                carrier["tracestate"] = ts
+            if carrier:
+                parent_ctx = propagator.extract(carrier)
                 ctx_token = attach(parent_ctx)
+
+            kind = _KIND_MAP.get(body.get("kind", "internal"), trace.SpanKind.INTERNAL)
 
             span = tracer.start_span(
                 body.get("name", "unnamed"),
+                kind=kind,
                 attributes=body.get("attributes", {}),
             )
             _spans[span_id] = (span, ctx_token)
             sc = span.get_span_context()
             traceparent = f"00-{sc.trace_id:032x}-{sc.span_id:016x}-01"
+            tracestate = str(sc.trace_state) if sc.trace_state else ""
             log.info("start_span name=%s span_id=%s", body.get("name"), span_id)
-            self._respond(200, {"ok": True, "span_id": span_id, "traceparent": traceparent})
+            reply = {"ok": True, "span_id": span_id, "traceparent": traceparent}
+            if tracestate:
+                reply["tracestate"] = tracestate
+            self._respond(200, reply)
             return
 
         if action == "end_span":
@@ -175,7 +205,13 @@ class SidecarHandler(BaseHTTPRequestHandler):
             for k, v in body.get("attributes", {}).items():
                 span.set_attribute(k, v)
             if err := body.get("error"):
-                span.set_status(trace.StatusCode.ERROR, err)
+                span.set_attribute("error.type", "unknown")
+                span.add_event("exception", {
+                    "exception.message": err,
+                    "exception.type": "unknown",
+                    "exception.escaped": True,
+                })
+                span.set_status(trace.StatusCode.ERROR)
             span.end()
             if ctx_token is not None:
                 detach(ctx_token)
@@ -226,17 +262,11 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return
 
         if action == "metric_gauge":
-            # Gauges via up-down counter (observable gauges need callbacks)
-            # Use histogram with a single observation as a gauge proxy
             name = body.get("name", "sidecar.gauge")
             value = float(body.get("value", 0))
             attrs = body.get("attributes", {})
-            key = ("updown", name)
-            if key not in _instruments:
-                _instruments[key] = meter.create_up_down_counter(name)
-            # Emit as up-down counter difference — reset not possible in OTel,
-            # so we just record the value as an increment for smoke purposes
-            _instruments[key].add(value, attributes=attrs)
+            _gauge_values[(name, frozenset(attrs.items()))] = value
+            _get_or_create_gauge(name)
             log.info("metric_gauge name=%s value=%s", name, value)
             self._respond(200, {"ok": True})
             return
@@ -244,9 +274,16 @@ class SidecarHandler(BaseHTTPRequestHandler):
         # Default: fire-and-forget event span
         attrs = body.get("attributes", {})
         name  = body.get("name", "unnamed.event")
-        with tracer.start_as_current_span(name, attributes=attrs) as span:
+        kind  = _KIND_MAP.get(body.get("kind", "internal"), trace.SpanKind.INTERNAL)
+        with tracer.start_as_current_span(name, kind=kind, attributes=attrs) as span:
             if err := body.get("error"):
-                span.set_status(trace.StatusCode.ERROR, err)
+                span.set_attribute("error.type", "unknown")
+                span.add_event("exception", {
+                    "exception.message": err,
+                    "exception.type": "unknown",
+                    "exception.escaped": True,
+                })
+                span.set_status(trace.StatusCode.ERROR)
         log.info("event name=%s", name)
         self._respond(200, {"ok": True})
 

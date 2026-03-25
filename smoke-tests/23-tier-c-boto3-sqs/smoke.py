@@ -71,40 +71,40 @@ _orig_del  = _MockSQSClient.delete_message
 def _instrumented_send(self, **kwargs):
     t0 = time.time()
     queue = kwargs.get("QueueUrl", "").split("/")[-1]
-    with tracer.start_as_current_span("aws.sqs.send_message", kind=SpanKind.CLIENT,
-        attributes={"aws.sqs.queue": queue, "aws.service": "sqs",
-                    "aws.operation": "SendMessage"}) as span:
+    with tracer.start_as_current_span(f"send {queue}", kind=SpanKind.PRODUCER,
+        attributes={"messaging.system": "aws_sqs", "messaging.destination.name": queue,
+                    "messaging.operation.name": "send", "messaging.operation.type": "send"}) as span:
         result = _orig_send(self, **kwargs)
         dur = (time.time() - t0) * 1000
-        span.set_attribute("aws.sqs.message_id", result["MessageId"])
-        sqs_sends.add(1, attributes={"aws.sqs.queue": queue})
-        sqs_latency.record(dur, attributes={"aws.sqs.operation": "send"})
-        logger.info("SQS message sent", extra={"aws.sqs.queue": queue,
-                    "aws.sqs.message_id": result["MessageId"]})
+        span.set_attribute("messaging.message.id", result["MessageId"])
+        sqs_sends.add(1, attributes={"messaging.destination.name": queue})
+        sqs_latency.record(dur, attributes={"messaging.operation.name": "send"})
+        logger.info("SQS message sent", extra={"messaging.destination.name": queue,
+                    "messaging.message.id": result["MessageId"]})
         return result
 
 def _instrumented_recv(self, **kwargs):
     t0 = time.time()
     queue = kwargs.get("QueueUrl", "").split("/")[-1]
-    with tracer.start_as_current_span("aws.sqs.receive_message", kind=SpanKind.CLIENT,
-        attributes={"aws.sqs.queue": queue, "aws.service": "sqs",
-                    "aws.operation": "ReceiveMessage"}) as span:
+    with tracer.start_as_current_span(f"receive {queue}", kind=SpanKind.CLIENT,
+        attributes={"messaging.system": "aws_sqs", "messaging.destination.name": queue,
+                    "messaging.operation.name": "receive", "messaging.operation.type": "receive"}) as span:
         result = _orig_recv(self, **kwargs)
         msgs = result.get("Messages", [])
-        span.set_attribute("aws.sqs.messages_received", len(msgs))
-        sqs_receives.add(len(msgs), attributes={"aws.sqs.queue": queue})
-        sqs_latency.record((time.time() - t0) * 1000, attributes={"aws.sqs.operation": "receive"})
+        span.set_attribute("messaging.batch.message_count", len(msgs))
+        sqs_receives.add(len(msgs), attributes={"messaging.destination.name": queue})
+        sqs_latency.record((time.time() - t0) * 1000, attributes={"messaging.operation.name": "receive"})
         return result
 
 def _instrumented_del(self, **kwargs):
     t0 = time.time()
     queue = kwargs.get("QueueUrl", "").split("/")[-1]
-    with tracer.start_as_current_span("aws.sqs.delete_message", kind=SpanKind.CLIENT,
-        attributes={"aws.sqs.queue": queue, "aws.service": "sqs",
-                    "aws.operation": "DeleteMessage"}) as span:
+    with tracer.start_as_current_span(f"settle {queue}", kind=SpanKind.CLIENT,
+        attributes={"messaging.system": "aws_sqs", "messaging.destination.name": queue,
+                    "messaging.operation.name": "settle", "messaging.operation.type": "settle"}) as span:
         result = _orig_del(self, **kwargs)
-        sqs_deletes.add(1, attributes={"aws.sqs.queue": queue})
-        sqs_latency.record((time.time() - t0) * 1000, attributes={"aws.sqs.operation": "delete"})
+        sqs_deletes.add(1, attributes={"messaging.destination.name": queue})
+        sqs_latency.record((time.time() - t0) * 1000, attributes={"messaging.operation.name": "settle"})
         return result
 
 _MockSQSClient.send_message    = _instrumented_send

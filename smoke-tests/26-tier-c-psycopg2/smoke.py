@@ -80,16 +80,16 @@ _orig_fetchall = _MockCursor.fetchall
 def _inst_execute(self, query, params=None):
     t0 = time.time()
     op = query.strip().split()[0].upper()
-    with tracer.start_as_current_span(f"postgresql.{op.lower()}", kind=SpanKind.CLIENT,
-        attributes={"db.system": "postgresql", "db.operation": op,
-                    "db.statement": query.strip()[:100],
-                    "net.peer.name": "analytics-db"}) as span:
+    with tracer.start_as_current_span(f"{op} reporting", kind=SpanKind.CLIENT,
+        attributes={"db.system.name": "postgresql", "db.operation.name": op,
+                    "db.query.text": query.strip()[:100],
+                    "server.address": "analytics-db", "db.namespace": "reporting"}) as span:
         _orig_execute(self, query, params)
         dur = (time.time() - t0) * 1000
-        span.set_attribute("db.rows_affected", self.rowcount)
-        db_queries.add(1,   attributes={"db.operation": op})
-        db_latency.record(dur,          attributes={"db.operation": op})
-        db_rows.record(self.rowcount,   attributes={"db.operation": op})
+        span.set_attribute("db.response.returned_rows", self.rowcount)
+        db_queries.add(1,   attributes={"db.operation.name": op})
+        db_latency.record(dur,          attributes={"db.operation.name": op})
+        db_rows.record(self.rowcount,   attributes={"db.operation.name": op})
 
 def _inst_fetchall(self):
     rows = _orig_fetchall(self)

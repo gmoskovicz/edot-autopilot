@@ -36,7 +36,7 @@ try:
 
     resource = Resource.create({
         "service.name":           svc_name,
-        "deployment.environment": os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "development"),
+        "deployment.environment.name": os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "development"),
     })
     exporter = OTLPSpanExporter(
         endpoint="{}/v1/traces".format(endpoint),
@@ -45,7 +45,7 @@ try:
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
-    tracer = trace.get_tracer("python27-manual")
+    tracer = trace.get_tracer("io.edot-autopilot.python27", "1.0.0")
 
     USE_OTEL_SDK = True
     print("[python27-tier-b] Using OTel SDK (Approach 1)")
@@ -86,11 +86,12 @@ def instrument_handler(handler_fn, route, method="GET"):
                 try:
                     result = handler_fn(*args, **kwargs)
                     if isinstance(result, dict) and "status_code" in result:
-                        span.set_attribute("http.status_code", result["status_code"])
+                        span.set_attribute("http.response.status_code", result["status_code"])
                     return result
                 except Exception as e:
                     span.record_exception(e)
-                    span.set_status(trace.StatusCode.ERROR, str(e))
+                    span.set_attribute("error.type", type(e).__name__)
+                    span.set_status(trace.StatusCode.ERROR)
                     raise
         else:
             # Sidecar approach

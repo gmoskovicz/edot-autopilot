@@ -32,7 +32,7 @@ def _bootstrap_otel():
 
     resource = Resource.create({
         "service.name":           svc_name,
-        "deployment.environment": os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "development"),
+        "deployment.environment.name": os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "development"),
     })
     exporter = OTLPSpanExporter(
         endpoint=f"{endpoint}/v1/traces",
@@ -43,7 +43,7 @@ def _bootstrap_otel():
     trace.set_tracer_provider(provider)
 
 _bootstrap_otel()
-tracer = trace.get_tracer("stripe-instrumentation")
+tracer = trace.get_tracer("io.edot-autopilot.stripe", "1.0.0")
 
 # ── Monkey-patches ─────────────────────────────────────────────────────────────
 
@@ -55,10 +55,11 @@ def _patched_charge_create(**kwargs):
         kind=SpanKind.CLIENT,
         attributes={
             "payment.provider":    "stripe",
-            "payment.amount":      kwargs.get("amount"),
+            "payment.amount_cents": kwargs.get("amount"),
             "payment.currency":    kwargs.get("currency", "usd"),
             "payment.customer_id": kwargs.get("customer", ""),
             "payment.description": kwargs.get("description", ""),
+            "url.full":            "https://api.stripe.com/v1/charges",
         },
     ) as span:
         try:
@@ -70,7 +71,8 @@ def _patched_charge_create(**kwargs):
         except stripe.StripeError as e:
             span.record_exception(e)
             span.set_attribute("payment.error_code", getattr(e, "code", "unknown"))
-            span.set_status(trace.StatusCode.ERROR, str(e))
+            span.set_attribute("error.type", type(e).__name__)
+            span.set_status(trace.StatusCode.ERROR)
             raise
 
 stripe.Charge.create = _patched_charge_create
@@ -84,9 +86,10 @@ def _patched_pi_create(**kwargs):
         kind=SpanKind.CLIENT,
         attributes={
             "payment.provider":    "stripe",
-            "payment.amount":      kwargs.get("amount"),
+            "payment.amount_cents": kwargs.get("amount"),
             "payment.currency":    kwargs.get("currency", "usd"),
             "payment.customer_id": kwargs.get("customer", ""),
+            "url.full":            "https://api.stripe.com/v1/payment_intents",
         },
     ) as span:
         try:
@@ -96,7 +99,8 @@ def _patched_pi_create(**kwargs):
             return result
         except stripe.StripeError as e:
             span.record_exception(e)
-            span.set_status(trace.StatusCode.ERROR, str(e))
+            span.set_attribute("error.type", type(e).__name__)
+            span.set_status(trace.StatusCode.ERROR)
             raise
 
 stripe.PaymentIntent.create = _patched_pi_create

@@ -119,7 +119,6 @@ Action: Manually wrap entry points with OTel SDK spans.
 # Python — wrapping a custom framework entry point
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
-from opentelemetry.semconv.trace import SpanAttributes
 
 tracer = trace.get_tracer(__name__)
 
@@ -129,17 +128,18 @@ def instrument_handler(handler_fn, route: str, method: str):
             f"{method} {route}",
             kind=SpanKind.SERVER,
             attributes={
-                SpanAttributes.HTTP_METHOD: method,
-                SpanAttributes.HTTP_ROUTE: route,
+                "http.request.method": method,
+                "http.route": route,
             }
         ) as span:
             try:
                 result = handler_fn(*args, **kwargs)
-                span.set_attribute(SpanAttributes.HTTP_STATUS_CODE, result.status_code)
+                span.set_attribute("http.response.status_code", result.status_code)
                 return result
             except Exception as e:
                 span.record_exception(e)
-                span.set_status(trace.StatusCode.ERROR, str(e))
+                span.set_attribute("error.type", type(e).__name__)
+                span.set_status(trace.StatusCode.ERROR)
                 raise
     return wrapped
 ```

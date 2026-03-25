@@ -51,22 +51,23 @@ def instrument_handler(fn, route: str, method: str = "POST"):
         t0 = time.time()
         with tracer.start_as_current_span(
             f"{method} {route}", kind=SpanKind.SERVER,
-            attributes={"http.method": method, "http.route": route},
+            attributes={"http.request.method": method, "http.route": route},
         ) as span:
             try:
                 result = fn(*args, **kwargs)
                 status = result.get("status_code", 200)
-                span.set_attribute("http.status_code", status)
-                request_counter.add(1, attributes={"http.route": route, "http.status": str(status)})
+                span.set_attribute("http.response.status_code", status)
+                request_counter.add(1, attributes={"http.route": route, "http.response.status_code": str(status)})
                 logger.info(
                     f"handler {method} {route} returned {status}",
-                    extra={"http.route": route, "http.method": method,
-                           "http.status_code": status},
+                    extra={"http.route": route, "http.request.method": method,
+                           "http.response.status_code": status},
                 )
                 return result
             except Exception as e:
                 span.record_exception(e)
-                span.set_status(StatusCode.ERROR, str(e))
+                span.set_attribute("error.type", type(e).__name__)
+                span.set_status(StatusCode.ERROR)
                 logger.error(
                     f"handler {method} {route} raised exception: {e}",
                     extra={"http.route": route, "error.type": type(e).__name__},
@@ -75,7 +76,7 @@ def instrument_handler(fn, route: str, method: str = "POST"):
             finally:
                 handler_latency.record(
                     (time.time() - t0) * 1000,
-                    attributes={"http.route": route, "http.method": method},
+                    attributes={"http.route": route, "http.request.method": method},
                 )
     return wrapped
 

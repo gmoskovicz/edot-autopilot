@@ -36,14 +36,14 @@ class O11yBootstrap:
     """Bootstrap all three OTel signals (traces, logs, metrics) for a service."""
 
     def __init__(self, service_name: str, endpoint: str, api_key: str,
-                 env: str = "smoke-test"):
+                 env: str = "smoke-test", version: str = "smoke"):
         endpoint = endpoint.rstrip("/")
         headers = {"Authorization": f"ApiKey {api_key}"}
 
         resource = Resource.create({
-            "service.name":           service_name,
-            "service.version":        "smoke",
-            "deployment.environment": env,
+            "service.name":                service_name,
+            "service.version":             version,
+            "deployment.environment.name": env,
         })
 
         # ── Traces ────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ class O11yBootstrap:
             OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", headers=headers)
         ))
         trace.set_tracer_provider(self._trace_provider)
-        self.tracer = self._trace_provider.get_tracer(service_name)
+        self.tracer = self._trace_provider.get_tracer("io.edot-autopilot", "1.0.0")
 
         # ── Logs ──────────────────────────────────────────────────────────
         self._log_provider = LoggerProvider(resource=resource)
@@ -78,7 +78,7 @@ class O11yBootstrap:
             )],
         )
         metrics.set_meter_provider(self._meter_provider)
-        self.meter = self._meter_provider.get_meter(service_name)
+        self.meter = self._meter_provider.get_meter("io.edot-autopilot", "1.0.0")
 
     def flush(self):
         """Force-flush all three providers before process exit."""
