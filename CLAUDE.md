@@ -423,6 +423,53 @@ would need during an incident.
 - External dependency calls must carry SLA status:
   `dependency.sla_ms`, `dependency.sla_breached` (boolean)
 
+### Error Capture — the rule that makes errors visible in Elastic APM
+
+**`set_status(ERROR, "message")` alone is not enough.**
+It marks the span red, but Elastic APM creates no error document — there is no message,
+no exception type, no stack trace visible in the transaction detail. The on-call engineer
+sees a failure with no explanation.
+
+**Always pair every error path with `record_exception`**, even when no real exception was raised.
+For business rule violations, create a meaningful exception:
+
+```python
+# ❌ Wrong — span is red but error detail is EMPTY in Kibana
+if fraud_score > threshold:
+    span.set_status(StatusCode.ERROR, f"Fraud blocked: score={fraud_score}")
+
+# ✅ Correct — creates an APM error document with type, message, and searchable context
+if fraud_score > threshold:
+    err = ValueError(f"Fraud blocked: score={fraud_score:.2f} exceeds threshold {threshold}")
+    span.record_exception(err, attributes={"exception.escaped": True})
+    span.set_status(StatusCode.ERROR, str(err))
+```
+
+Use specific, meaningful exception types — not generic `Exception`:
+
+| Situation | Exception type |
+|-----------|---------------|
+| Business rule violation (fraud, quota, limit) | `ValueError` |
+| Auth failure, permission denied | `PermissionError` |
+| External service timeout | `TimeoutError` |
+| Connection refused, network unreachable | `ConnectionRefusedError` |
+| Resource not found | `LookupError` |
+| Dependency returned unexpected response | `RuntimeError` |
+
+Set `exception.escaped=True` when the error is fatal for the request (the transaction fails).
+This causes Elastic APM to display it prominently at the top of the transaction detail.
+
+For caught exceptions, the same rule applies:
+```python
+try:
+    result = call_external_service()
+except requests.Timeout as e:
+    span.record_exception(e, attributes={"exception.escaped": True})
+    span.set_attribute("dependency.sla_breached", True)
+    span.set_status(StatusCode.ERROR, str(e))
+    raise  # or handle
+```
+
 **Example — enriching a checkout span:**
 
 ```python
@@ -475,7 +522,10 @@ Do not declare success until data is confirmed flowing in Elastic.
    - Span name reflects business action (not just the HTTP route)
    - Business attributes are present and populated
    - Downstream dependencies appear as child spans
-   - Errors are captured with full context
+   - Errors are captured with full context: navigate to a failed transaction in
+     Kibana APM → Transactions → click a red transaction → the "Errors" tab must
+     show an exception type and message. If the tab is empty, `record_exception`
+     is missing — go back and add it to every `set_status(ERROR)` call.
 5. Confirm logs are flowing:
    FROM logs-*
    | WHERE service.name == "<service-name>"
