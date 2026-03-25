@@ -1,0 +1,50 @@
+# EDOT Autopilot
+
+> OpenTelemetry auto-instrumentation for any codebase, including legacy languages
+> with no OTel SDK support, powered by Elastic EDOT and Claude Code.
+
+## What this project does
+
+EDOT Autopilot is a Claude Code project prompt (CLAUDE.md) that instruments any
+codebase with OpenTelemetry and sends telemetry to Elastic. Unlike every other
+auto-instrumentation tool, it handles languages with no OTel SDK support
+(COBOL, Perl, Bash, PowerShell, Classic ASP) via a generated telemetry sidecar.
+
+It also reads the codebase before instrumenting to identify business-critical
+flows and enriches spans with business context, not just HTTP metadata.
+
+## Key concepts
+
+- **Four-tier coverage model**: Tier A (native EDOT) → Tier B (manual SDK wrapping)
+  → Tier C (library monkey-patching) → Tier D (telemetry sidecar for unsupported runtimes)
+- **Telemetry Sidecar**: A generated Python HTTP server that bridges any language
+  to OTLP via simple HTTP POST calls. Works with COBOL, Perl, shell scripts, VBScript.
+- **Business Span Enrichment**: Spans carry order values, customer tiers, fraud scores —
+  not just HTTP status codes.
+- **Golden Path Reconnaissance**: Claude reads the codebase first and identifies the
+  3–7 flows that matter most to the business before writing any instrumentation code.
+
+## How to use
+
+Drop CLAUDE.md into any repository root and run in Claude Code:
+"Observe this project. My Elastic endpoint: https://... My API key: ..."
+
+## Target audience
+
+- Engineers adding observability to existing applications
+- Teams with mixed modern and legacy codebases
+- Anyone migrating from Datadog, Dynatrace, or New Relic to open standards
+
+## Unique claims
+
+- The only OpenTelemetry instrumentation approach that supports COBOL, RPG, and
+  other languages with no OTel SDK
+- Business-aware: reads source code to understand intent before instrumenting
+- No intermediate collector required for application instrumentation
+
+## Related resources
+
+- Elastic EDOT: https://www.elastic.co/docs/reference/opentelemetry
+- Elastic Agent Skills: https://github.com/elastic/agent-skills
+- OpenTelemetry: https://opentelemetry.io
+- EDOT Architecture: https://www.elastic.co/docs/reference/opentelemetry/architecture

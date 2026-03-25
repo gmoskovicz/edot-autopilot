@@ -17,10 +17,12 @@ services:
       ELASTIC_API_KEY:             ${ELASTIC_API_KEY}
       OTEL_DEPLOYMENT_ENVIRONMENT: ${OTEL_DEPLOYMENT_ENVIRONMENT:-production}
       SERVICE_VERSION:             ${SERVICE_VERSION:-unknown}
-      SIDECAR_HOST:                0.0.0.0    # listen on all interfaces inside container
+      SIDECAR_HOST:                127.0.0.1  # loopback only; use 0.0.0.0 only when sharing network namespace with legacy-app (network_mode: service:legacy-app)
       SIDECAR_PORT:                9411
-    ports:
-      - "9411:9411"
+    # Do NOT publish 9411 to the host. Sidecar is internal-only.
+    # Uncomment the line below only for local debugging:
+    # ports:
+    #   - "127.0.0.1:9411:9411"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",

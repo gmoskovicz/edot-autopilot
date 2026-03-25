@@ -30,8 +30,8 @@ process_order = instrument_handler(_process_order_handler, "/api/orders", "POST"
 ```bash
 pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 
-export ELASTIC_OTLP_ENDPOINT=https://YOUR-DEPLOYMENT.ingest.REGION.gcp.elastic.cloud:443
-export ELASTIC_API_KEY=YOUR-BASE64-API-KEY
+export ELASTIC_OTLP_ENDPOINT=https://<your-deployment>.ingest.<region>.gcp.elastic.cloud:443
+export ELASTIC_API_KEY=<your-base64-api-key>
 export OTEL_SERVICE_NAME=python27-tier-b
 
 python app.py

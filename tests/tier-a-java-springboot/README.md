@@ -30,7 +30,7 @@ curl -X POST http://localhost:8080/orders \
 
 ```bash
 export OTEL_SERVICE_NAME=edot-springboot-tier-a
-export OTEL_EXPORTER_OTLP_ENDPOINT=https://YOUR-DEPLOYMENT.ingest.REGION.gcp.elastic.cloud:443
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://<your-deployment>.ingest.<region>.gcp.elastic.cloud:443
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=ApiKey YOUR_KEY"
 
 # Download agent

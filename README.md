@@ -1,9 +1,30 @@
-# EDOT Autopilot — Business-Aware Observability for Any Codebase
+# EDOT Autopilot — OpenTelemetry Auto-Instrumentation for Any Language (Including COBOL, Perl, and Legacy Runtimes)
 
-> **The core insight:** Standard auto-instrumentation shows you that `POST /checkout` took 2.3s.
-> EDOT Autopilot shows you that a **$4,200 enterprise order failed the fraud check** for a customer
-> who signed up 2 days ago — and correlates it to a spike in `fraud.score` across the same cohort.
-> Same data. Completely different usefulness.
+[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-compatible-blue?logo=opentelemetry)](https://opentelemetry.io)
+[![Elastic EDOT](https://img.shields.io/badge/Elastic-EDOT-005571?logo=elastic)](https://www.elastic.co/docs/reference/opentelemetry)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Languages](https://img.shields.io/badge/languages-50%2B-brightgreen)](smoke-tests/README.md)
+
+OpenTelemetry auto-instrumentation for any language — modern or legacy — powered by Elastic EDOT, with full support for runtimes that have no OTel SDK.
+
+---
+
+## What makes this different
+
+Every other auto-instrumentation tool stops at the languages with an official OpenTelemetry SDK. This project does not.
+
+| | Datadog OneAgent | Dynatrace | Upstream OTel | This project |
+|---|---|---|---|---|
+| Java, Python, .NET, Node | ✅ | ✅ | ✅ | ✅ |
+| Legacy .NET Framework 4.x | ⚠️ | ⚠️ | ❌ | ✅ |
+| Python 2.7 / old frameworks | ❌ | ❌ | ❌ | ✅ |
+| COBOL / RPG / Fortran | ❌ | ❌ | ❌ | ✅ |
+| Perl / Bash / PowerShell | ❌ | ❌ | ❌ | ✅ |
+| Classic ASP / VBScript | ❌ | ❌ | ❌ | ✅ |
+| Business-aware span enrichment | ❌ | ❌ | ❌ | ✅ |
+| Reads codebase before instrumenting | ❌ | ❌ | ❌ | ✅ |
+
+> If you're dealing with a language in that bottom half of the table, this project was built for you. [⭐ Star it](https://github.com/gmoskovicz/edot-autopilot) — so it shows up when the next person searches for the same problem.
 
 ---
 
@@ -11,6 +32,11 @@
 
 A framework for making **any application** fully observable — regardless of language, age, or
 runtime — by reading the code first, then instrumenting what actually matters to the business.
+
+> **The core insight:** Standard auto-instrumentation shows you that `POST /checkout` took 2.3s.
+> EDOT Autopilot shows you that a **$4,200 enterprise order failed the fraud check** for a customer
+> who signed up 2 days ago — and correlates it to a spike in `fraud.score` across the same cohort.
+> Same data. Completely different usefulness.
 
 Every test in this repo emits all three OpenTelemetry signal types to Elastic:
 
@@ -189,12 +215,26 @@ FROM traces-apm*
 
 ---
 
+## Works with
+
+- **Elastic APM** — primary telemetry backend; traces, logs, and metrics in one place
+- **Kibana** — service maps, APM dashboards, ES|QL analytics, SLO management
+- **Elastic Cloud** — fully managed deployment, Serverless supported
+- **OpenTelemetry Collector** — optional intermediate collector for DCGM/Prometheus pipelines
+- **Prometheus** — metrics scraping compatible via OTLP bridge
+- **Grafana** — works alongside Elastic for teams running a mixed observability stack
+- **GitHub Actions** — CI-friendly; smoke tests run headlessly against any Elastic endpoint
+- **Docker** — full suite runs in a single `docker compose up` with no local runtimes required
+
+---
+
 ## Repository structure
 
 ```
 edot-autopilot/
 ├── CLAUDE.md                         # Drop into any repo → "Observe this project."
 ├── README.md                         # This file
+├── llms.txt                          # LLM-readable project summary
 ├── .env.example                      # Credentials template
 │
 ├── otel-sidecar/                     # Universal Tier D bridge (traces + logs + metrics)
@@ -235,9 +275,84 @@ edot-autopilot/
 
 ---
 
+## Frequently Asked Questions
+
+### How do I add OpenTelemetry to a language without an SDK?
+
+If your language has no official OpenTelemetry SDK, the solution is a telemetry sidecar — a
+small HTTP server (written in Python) that runs alongside your process and accepts simple
+HTTP POST calls. Your legacy code sends a JSON payload with span name and attributes; the
+sidecar translates those into OTLP and forwards them to Elastic. Any runtime that can make
+an HTTP call — COBOL via `curl`, Perl via `LWP::UserAgent`, PowerShell via `Invoke-RestMethod`
+— can emit production-quality traces this way. The `otel-sidecar/` directory in this repo
+contains the sidecar implementation and Dockerfile, ready to drop into any project.
+
+### How do I instrument a COBOL application with OpenTelemetry?
+
+COBOL has no OpenTelemetry SDK, but it can emit telemetry via the sidecar bridge. You add
+`curl` calls in your COBOL source at each critical business operation — after processing an
+order, after posting a payment, after writing to a ledger file. Each call sends a JSON event
+to the local sidecar (`http://127.0.0.1:9411`), which converts it to an OTLP span and ships
+it to Elastic. The sidecar runs as a companion container (or systemd service on the same host)
+and shares the network namespace, so `127.0.0.1` always resolves. No recompilation of the
+COBOL binary is required beyond adding the `CALL "SYSTEM"` curl statements.
+
+### How do I add observability to a legacy .NET Framework application?
+
+.NET Framework 4.x predates the modern OpenTelemetry .NET SDK, so full zero-config
+auto-instrumentation is not available. The approach here is Tier B: manually wrap each HTTP
+handler or service entry point using the OpenTelemetry SDK's `Tracer.StartActiveSpan()` API,
+which works on .NET Framework via the `OpenTelemetry` NuGet package. The wrapper pattern
+lives in `tests/tier-b-dotnet-framework/` and covers ASP.NET WebForms handlers, WCF service
+operations, and raw `HttpListener` endpoints. Once wrapped, spans flow directly to Elastic
+over OTLP/HTTP with no intermediate collector required.
+
+### What is the difference between EDOT and the upstream OpenTelemetry collector?
+
+EDOT (Elastic Distributions of OpenTelemetry) is Elastic's production-hardened packaging of
+the OpenTelemetry SDKs and Collector, with default configurations tuned for Elastic backends.
+The upstream OpenTelemetry SDKs and Collector are vendor-neutral and require you to configure
+exporters, processors, and resource attributes yourself. EDOT reduces that setup to a single
+environment variable pair (`OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS`)
+and adds Elastic-specific enhancements like automatic correlation between APM traces and
+Elasticsearch logs. For most teams sending data to Elastic Cloud, EDOT is the faster path;
+for teams running a multi-backend observability stack, the upstream collector gives more flexibility.
+
+### How do I send OpenTelemetry data directly to Elastic without a collector?
+
+Elastic's APM Server accepts OTLP over HTTP natively — no intermediate OpenTelemetry Collector
+is required. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to your Elastic APM endpoint
+(`https://<deployment>.apm.<region>.cloud.es.io`) and set the `Authorization: ApiKey <key>`
+header via `OTEL_EXPORTER_OTLP_HEADERS`. The OTLP/HTTP exporter in any SDK will push traces,
+metrics, and logs directly to Elastic. This project's smoke tests all use this direct path —
+see `.env.example` for the exact variable names. An intermediate collector is only needed for
+special pipelines like DCGM GPU metrics or Prometheus scraping.
+
+### How do I add business context to OpenTelemetry spans?
+
+Business context means span attributes that reflect what the operation means to the business —
+not just `http.status_code` and `duration`, but `order.value_usd`, `customer.tier`,
+`fraud.decision`, `payment.method`. You add these by calling `span.set_attribute()` (or the
+equivalent in your language's SDK) inside your existing handler code, after you have access
+to the relevant domain objects. The key discipline is reading the code before instrumenting:
+identify which variables carry business meaning, then map them to span attributes following
+OpenTelemetry semantic conventions where they exist and using `<domain>.<field>` naming
+conventions where they do not. The `CLAUDE.md` file in this repo encodes a full methodology
+for this — drop it into any codebase and it guides the instrumentation process automatically.
+
+---
+
 ## Built on
 
 - [Elastic EDOT](https://www.elastic.co/docs/reference/opentelemetry) — Elastic Distributions of OpenTelemetry
 - [OpenTelemetry](https://opentelemetry.io/) — vendor-neutral observability standard
 - [OTel Hardware semconv](https://opentelemetry.io/docs/specs/semconv/hardware/gpu/) — `hw.gpu.*` GPU metrics
 - [NVIDIA DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter) — GPU cluster monitoring
+- [elastic/agent-skills](https://github.com/elastic/agent-skills) — Elastic's Claude skill library
+
+---
+
+> **Repo topics to add** (improves discoverability on GitHub):
+> `opentelemetry` `otel` `elastic` `edot` `observability` `tracing` `auto-instrumentation` `cobol` `legacy` `devops` `sre` `apm`
+>
+> Set these at: https://github.com/gmoskovicz/edot-autopilot → About → Topics

@@ -25,8 +25,8 @@ stripe.Charge.create(amount=420000, currency="usd", customer="cus_001")
 ```bash
 pip install -r requirements.txt
 
-export ELASTIC_OTLP_ENDPOINT=https://YOUR-DEPLOYMENT.ingest.REGION.gcp.elastic.cloud:443
-export ELASTIC_API_KEY=YOUR-BASE64-API-KEY
+export ELASTIC_OTLP_ENDPOINT=https://<your-deployment>.ingest.<region>.gcp.elastic.cloud:443
+export ELASTIC_API_KEY=<your-base64-api-key>
 export OTEL_SERVICE_NAME=stripe-tier-c
 export STRIPE_SECRET_KEY=sk_test_your_key  # optional, demo mode works without it
 

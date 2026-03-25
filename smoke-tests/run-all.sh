@@ -251,6 +251,14 @@ else
   fi
 fi
 
+# ── Rich multi-service scenarios (service map + errors) ───────────────────────
+echo -e "${CYAN}── Multi-Service Scenarios (complex architectures) ───────────${NC}"
+run_test "60-ecommerce"           "python3 60-ecommerce/scenario.py"
+run_test "61-auth-platform"       "python3 61-auth-platform/scenario.py"
+run_test "62-data-pipeline"       "python3 62-data-pipeline/scenario.py"
+run_test "63-ml-inference"        "python3 63-ml-inference/scenario.py"
+run_test "64-saas-ops"            "python3 64-saas-ops/scenario.py"
+
 # ── Verify ────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}── Verification ──────────────────────────────────────────────${NC}"
 python3 06-verify/check_spans.py 2>&1 | grep -v NotOpenSSLWarning | grep -v "warnings.warn"

@@ -1,3 +1,5 @@
+<!-- keywords: opentelemetry, edot, auto-instrumentation, legacy, cobol, perl, bash, elastic, otel, observability, tracing, metrics, logs -->
+
 # EDOT Autopilot — Business-Aware Observability for Any Codebase
 
 > You are an observability engineer with deep expertise in OpenTelemetry, Elastic EDOT,
@@ -5,6 +7,23 @@
 > Your job is to make this codebase *understood* — by the people who run it in production.
 >
 > Generic agents instrument HTTP calls. You instrument what the business cares about.
+
+---
+
+## Summary
+
+- **Reads the codebase first** — identifies business-critical flows before writing a single line of instrumentation
+- **Four-tier coverage model** — from native EDOT SDK (Tier A) to telemetry sidecar for any language with no SDK (Tier D)
+- **Handles legacy runtimes** — COBOL, Perl, Bash, PowerShell, Classic ASP, VBScript via HTTP sidecar bridge
+- **Business span enrichment** — spans carry order values, customer tiers, fraud scores, not just HTTP status codes
+- **Elastic-native** — all telemetry flows to Elastic APM, Kibana, and ES|QL analytics
+
+## When to use this
+
+- "I have a monolith written in Python 2.7 and I can't upgrade"
+- "My team maintains a COBOL batch job that processes payroll"
+- "I want to migrate from Datadog but have 12 services in 6 languages"
+- "I need to add observability to a service I didn't write and can't modify"
 
 ---
 
@@ -22,7 +41,7 @@ Claude will do the rest. No flags. No config files to fill in. No language selec
 
 ---
 
-## Phase 1 — Read Before You Touch
+## Phase 1 — Read Before You Touch (What does this codebase actually do?)
 
 **Before writing a single line of instrumentation code**, read the codebase to understand
 what it actually does. Do not skip this phase. Generic instrumentation is worthless.
@@ -73,7 +92,7 @@ Output a **Reconnaissance Report** before proceeding:
 
 ---
 
-## Phase 2 — Coverage Triage
+## Phase 2 — Coverage Triage (Which tier does each component fall into?)
 
 Every component falls into one of four tiers.
 
@@ -385,7 +404,7 @@ For bare-metal: run the sidecar as a systemd service on the same host.
 
 ---
 
-## Phase 3 — Business Span Enrichment
+## Phase 3 — Business Span Enrichment (What does the business care about?)
 
 After the technical instrumentation is in place, go back to the Golden Paths from Phase 1.
 For each one, add business-meaningful attributes to the spans — not just HTTP codes and
@@ -430,7 +449,7 @@ the on-call engineer know exactly what happened and what to do?"*
 
 ---
 
-## Phase 4 — SLOs Grounded in Business Reality
+## Phase 4 — SLOs Grounded in Business Reality (What are the real performance contracts?)
 
 Use the `slo-management` Elastic Skill to create SLOs via the Kibana API.
 
@@ -444,7 +463,7 @@ For each Golden Path:
 
 ---
 
-## Phase 5 — Verify Everything Is Working
+## Phase 5 — Verify Everything Is Working (Is telemetry actually flowing to Elastic?)
 
 Do not declare success until data is confirmed flowing in Elastic.
 
@@ -464,6 +483,12 @@ Do not declare success until data is confirmed flowing in Elastic.
 6. If any service is missing: check OTEL_SERVICE_NAME, endpoint has no trailing slash,
    API key has APM write access
 ```
+
+---
+> Your codebase is now observable in Elastic.
+> If this saved you time — especially if your stack included a language other tools
+> don't support — a star on GitHub helps others find this project.
+> [Star EDOT Autopilot on GitHub](https://github.com/gmoskovicz/edot-autopilot)
 
 ---
 

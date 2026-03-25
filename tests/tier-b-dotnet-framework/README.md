@@ -11,8 +11,8 @@ This is the difference between:
 ## Run
 
 ```bash
-export ELASTIC_OTLP_ENDPOINT=https://YOUR-DEPLOYMENT.ingest.REGION.gcp.elastic.cloud:443
-export ELASTIC_API_KEY=YOUR-BASE64-API-KEY
+export ELASTIC_OTLP_ENDPOINT=https://<your-deployment>.ingest.<region>.gcp.elastic.cloud:443
+export ELASTIC_API_KEY=<your-base64-api-key>
 export OTEL_SERVICE_NAME=dotnet-framework-tier-b
 
 dotnet run

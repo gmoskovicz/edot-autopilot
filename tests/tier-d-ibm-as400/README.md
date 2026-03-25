@@ -81,7 +81,7 @@ CALL QSYS2.QSHELL(
 # PASE shell on IBM i
 pip3 install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
 OTEL_SERVICE_NAME=ibm-as400 \
-ELASTIC_OTLP_ENDPOINT=https://YOUR-DEPLOYMENT.ingest.REGION.gcp.elastic.cloud:443 \
+ELASTIC_OTLP_ENDPOINT=https://<your-deployment>.ingest.<region>.gcp.elastic.cloud:443 \
 ELASTIC_API_KEY=your-key \
 python3 /opt/otel-sidecar/otel-sidecar.py &
 ```
