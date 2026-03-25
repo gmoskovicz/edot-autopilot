@@ -100,7 +100,7 @@ No other tool has a graceful degradation strategy that covers every runtime ever
 
 ---
 
-## Smoke test suite — 58 tests, 50+ technologies
+## Smoke test suite — 75 tests, 50+ technologies
 
 All tests confirmed green against a live Elastic Cloud Serverless deployment.
 
@@ -134,6 +134,20 @@ meaningful combination, each producing distinct connection patterns in the Kiban
 | 6 | B→C→D | Auto-renewal — billing triggers charge cycle |
 | 7 | C→A→D | Stripe webhook — payment event updates API, SMS confirms |
 | 8 | A→B | Credit denied — trace stops at Tier B |
+
+### Mobile platforms (6)
+React Native (iOS + Android) · Flutter (iOS + Android) · iOS Swift · Android Kotlin ·
+Xamarin / .NET MAUI (iOS + Android) · Ionic / Capacitor (iOS + Android + PWA)
+
+### Web frontend / Browser RUM (5)
+React SPA · Next.js (SSR + client hydration) · Vue.js + Pinia · Angular · SvelteKit
+
+### Backend web frameworks (5)
+NestJS (REST + GraphQL + CQRS) · Gin (Go) · Ruby on Rails + Sidekiq · FastAPI (async) · HTMX
+
+### Mobile multi-service scenario (1)
+9-service mobile e-commerce: React Native client → Express BFF → FastAPI catalog → Go inventory →
+Rails profile → Spring payment → fraud detection → Stripe processor → push notifications
 
 ### Multi-service architecture scenarios (5)
 Complex distributed systems with realistic error mixes, full service maps, span events,
@@ -314,7 +328,7 @@ edot-autopilot/
 │   ├── Dockerfile
 │   └── README.md
 │
-├── smoke-tests/                      # 58 smoke tests — all 4 tiers, 50+ technologies
+├── smoke-tests/                      # 75 smoke tests — all 4 tiers, 50+ technologies
 │   ├── run-all.sh                    #   Run everything locally
 │   ├── docker-compose.yml            #   Full suite with Docker profiles
 │   ├── o11y_bootstrap.py             #   Shared helper: tracer + logger + meter
@@ -332,7 +346,11 @@ edot-autopilot/
 │   ├── 61-auth-platform/             #   7-service auth stack (25 scenarios)
 │   ├── 62-data-pipeline/             #   7-service ETL pipeline (14 scenarios)
 │   ├── 63-ml-inference/              #   7-service ML serving (25 scenarios)
-│   └── 64-saas-ops/                  #   7-service SaaS platform (25 scenarios)
+│   ├── 64-saas-ops/                  #   7-service SaaS platform (25 scenarios)
+│   ├── 65–70-mobile-*/              #   Mobile: React Native / Flutter / iOS / Android / MAUI / Ionic
+│   ├── 71–75-web-*/                 #   Web RUM: React / Next.js / Vue / Angular / Svelte
+│   ├── 76–80-web-*/                 #   Backends: NestJS / Gin / Rails / FastAPI / HTMX
+│   └── 81-mobile-ecommerce/         #   9-service mobile e-commerce scenario
 │
 └── docs/                             # Per-language OpenTelemetry guides (SEO pages)
     ├── opentelemetry-cobol.md

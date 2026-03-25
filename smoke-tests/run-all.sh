@@ -259,6 +259,32 @@ run_test "62-data-pipeline"       "python3 62-data-pipeline/scenario.py"
 run_test "63-ml-inference"        "python3 63-ml-inference/scenario.py"
 run_test "64-saas-ops"            "python3 64-saas-ops/scenario.py"
 
+# ── Mobile & Web Framework tests ──────────────────────────────────────────────
+echo -e "${CYAN}── Mobile Platforms ─────────────────────────────────────────${NC}"
+run_test "65-mobile-react-native"   "python3 65-mobile-react-native/smoke.py"
+run_test "66-mobile-flutter"        "python3 66-mobile-flutter/smoke.py"
+run_test "67-mobile-ios-swift"      "python3 67-mobile-ios-swift/smoke.py"
+run_test "68-mobile-android-kotlin" "python3 68-mobile-android-kotlin/smoke.py"
+run_test "69-mobile-xamarin-maui"   "python3 69-mobile-xamarin-maui/smoke.py"
+run_test "70-mobile-ionic"          "python3 70-mobile-ionic/smoke.py"
+
+echo -e "${CYAN}── Web Frontend / RUM ───────────────────────────────────────${NC}"
+run_test "71-web-react-spa"         "python3 71-web-react-spa/smoke.py"
+run_test "72-web-nextjs"            "python3 72-web-nextjs/smoke.py"
+run_test "73-web-vue"               "python3 73-web-vue/smoke.py"
+run_test "74-web-angular"           "python3 74-web-angular/smoke.py"
+run_test "75-web-svelte"            "python3 75-web-svelte/smoke.py"
+
+echo -e "${CYAN}── Backend Web Frameworks ───────────────────────────────────${NC}"
+run_test "76-web-nestjs"            "python3 76-web-nestjs/smoke.py"
+run_test "77-web-gin-go"            "python3 77-web-gin-go/smoke.py"
+run_test "78-web-rails"             "python3 78-web-rails/smoke.py"
+run_test "79-web-fastapi"           "python3 79-web-fastapi/smoke.py"
+run_test "80-web-htmx"              "python3 80-web-htmx/smoke.py"
+
+echo -e "${CYAN}── Mobile Multi-Service Scenario ────────────────────────────${NC}"
+run_test "81-mobile-ecommerce"      "python3 81-mobile-ecommerce/scenario.py"
+
 # ── Verify ────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}── Verification ──────────────────────────────────────────────${NC}"
 python3 06-verify/check_spans.py 2>&1 | grep -v NotOpenSSLWarning | grep -v "warnings.warn"

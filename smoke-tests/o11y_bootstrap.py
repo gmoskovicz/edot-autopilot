@@ -41,11 +41,11 @@ class O11yBootstrap:
 
     def __init__(self, service_name: str, endpoint: str, api_key: str,
                  env: str = "smoke-test", version: str = "smoke",
-                 sampler=None):
+                 sampler=None, extra_resource_attrs: dict = None):
         endpoint = endpoint.rstrip("/")
         headers = {"Authorization": f"ApiKey {api_key}"}
 
-        resource = Resource.create({
+        base_attrs = {
             "service.name":                service_name,
             "service.version":             version,
             "deployment.environment.name": env,
@@ -53,7 +53,10 @@ class O11yBootstrap:
             "process.pid":                 os.getpid(),
             "os.name":                     platform.system(),
             "telemetry.sdk.name":          "edot-autopilot",
-        })
+        }
+        if extra_resource_attrs:
+            base_attrs.update(extra_resource_attrs)
+        resource = Resource.create(base_attrs)
 
         # ── Traces ────────────────────────────────────────────────────────
         tracer_kwargs = {"resource": resource}
