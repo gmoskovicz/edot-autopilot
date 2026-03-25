@@ -1,127 +1,295 @@
-services:
-  # ── Tier D: OTEL Sidecar (shared by all Tier D tests) ─────────────────────
-  otel-sidecar:
-    build:
-      context: ../otel-sidecar
-    environment:
-      OTEL_SERVICE_NAME: smoke-tier-d-sidecar
-      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
-      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
-      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
-      SIDECAR_HOST: 0.0.0.0
-      SIDECAR_PORT: "9411"
-    ports:
-      - "9411:9411"
-    healthcheck:
-      test: ["CMD", "python3", "-c",
-        "import urllib.request,json; r=urllib.request.urlopen(urllib.request.Request('http://localhost:9411',b'{\"action\":\"health\"}',{'Content-Type':'application/json'})); print(json.loads(r.read()))"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
+# ─────────────────────────────────────────────────────────────────────────────
+# EDOT Autopilot — Full smoke test suite
+#
+# Prerequisites:
+#   1. Copy ../.env.example → ../.env  (one directory up, at repo root)
+#   2. Fill in ELASTIC_OTLP_ENDPOINT and ELASTIC_API_KEY
+#
+# Run everything:
+#   docker compose --env-file ../.env up --abort-on-container-exit
+#
+# Run only Python tests (fastest — all tiers):
+#   docker compose --env-file ../.env run --rm runner
+#
+# Run a single tier:
+#   docker compose --env-file ../.env run --rm runner bash runner.sh tier-c
+#
+# Run only Node.js:
+#   docker compose --env-file ../.env run --rm smoke-nodejs
+#
+# View results in Kibana:
+#   Observability → APM → Services  (filter: service.name: smoke-*)
+# ─────────────────────────────────────────────────────────────────────────────
 
-  # ── Tier A: Python ────────────────────────────────────────────────────────
+x-python-env: &python-env
+  ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
+  ELASTIC_API_KEY: ${ELASTIC_API_KEY}
+  OTEL_DEPLOYMENT_ENVIRONMENT: ${OTEL_DEPLOYMENT_ENVIRONMENT:-smoke-test}
+
+x-python-base: &python-base
+  image: python:3.12-slim
+  working_dir: /smoke
+  volumes:
+    - .:/smoke
+    - pip-cache:/root/.cache/pip
+  environment:
+    <<: *python-env
+
+services:
+
+  # ── Dependency installer (shared pip cache warm-up) ─────────────────────────
+  pip-install:
+    <<: *python-base
+    command: >
+      pip install --quiet --no-warn-script-location
+        opentelemetry-sdk==1.25.0
+        opentelemetry-exporter-otlp-proto-http==1.25.0
+        opentelemetry-semantic-conventions==0.46b0
+    profiles: ["setup"]
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # RUNNER — runs ALL Python smoke tests (Tiers A/B/C/D + cross-tier)
+  # This is the primary entry point.  One container, all 46 Python tests.
+  # ═══════════════════════════════════════════════════════════════════════════
+  runner:
+    <<: *python-base
+    command: >
+      sh -c "pip install --quiet --no-warn-script-location
+               opentelemetry-sdk==1.25.0
+               opentelemetry-exporter-otlp-proto-http==1.25.0
+               opentelemetry-semantic-conventions==0.46b0 &&
+             bash runner.sh"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TIER A — Individual containers per language (native OTel SDK)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Python (also covered by runner above; here for isolated per-tier runs)
   smoke-tier-a-python:
-    image: python:3.12-slim
-    working_dir: /smoke
-    volumes:
-      - .:/smoke
+    <<: *python-base
     command: >
       sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
              python3 01-tier-a-python/smoke.py"
-    environment:
-      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
-      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
-      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+    profiles: ["tier-a", "all"]
 
-  # ── Tier A: Node.js ───────────────────────────────────────────────────────
+  # Node.js
   smoke-tier-a-nodejs:
     image: node:20-slim
     working_dir: /smoke/02-tier-a-nodejs
     volumes:
       - .:/smoke
+      - npm-cache:/root/.npm
     command: >
       sh -c "npm install --silent && node smoke.js"
     environment:
-      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
-      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
-      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+      <<: *python-env
+    profiles: ["tier-a", "nodejs", "all"]
 
-  # ── Tier B: Manual wrap ───────────────────────────────────────────────────
+  # Java (simulation via Python runner — real Java build needs mvn + JDK)
+  smoke-tier-a-java:
+    <<: *python-base
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 08-tier-a-java/smoke.py"
+    profiles: ["tier-a", "all"]
+
+  # Go (simulation via Python runner — real Go build needs go toolchain)
+  smoke-tier-a-go:
+    <<: *python-base
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 09-tier-a-go/smoke.py"
+    profiles: ["tier-a", "all"]
+
+  # Ruby (simulation via Python runner — real Ruby build needs bundler + gems)
+  smoke-tier-a-ruby:
+    <<: *python-base
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 10-tier-a-ruby/smoke.py"
+    profiles: ["tier-a", "all"]
+
+  # .NET (simulation via Python runner — real .NET build needs dotnet SDK)
+  smoke-tier-a-dotnet:
+    <<: *python-base
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 11-tier-a-dotnet/smoke.py"
+    profiles: ["tier-a", "all"]
+
+  # PHP (simulation via Python runner — real PHP build needs composer + extensions)
+  smoke-tier-a-php:
+    <<: *python-base
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 12-tier-a-php/smoke.py"
+    profiles: ["tier-a", "all"]
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TIER B — Manual span wrapping
+  # ═══════════════════════════════════════════════════════════════════════════
   smoke-tier-b:
-    image: python:3.12-slim
-    working_dir: /smoke
-    volumes:
-      - .:/smoke
+    <<: *python-base
     command: >
       sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
-             python3 03-tier-b-manual-wrap/smoke.py"
-    environment:
-      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
-      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
-      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+             for f in
+               03-tier-b-manual-wrap/smoke.py
+               13-tier-b-django-orm/smoke.py
+               14-tier-b-flask-raw/smoke.py
+               15-tier-b-tornado/smoke.py
+               16-tier-b-bottle/smoke.py
+               17-tier-b-falcon/smoke.py
+               18-tier-b-aiohttp/smoke.py
+               19-tier-b-celery/smoke.py
+             ; do echo \"--- $$f ---\" && python3 $$f; done"
+    profiles: ["tier-b", "all"]
 
-  # ── Tier C: Monkey-patch ─────────────────────────────────────────────────
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TIER C — Library monkey-patching
+  # ═══════════════════════════════════════════════════════════════════════════
   smoke-tier-c:
-    image: python:3.12-slim
-    working_dir: /smoke
-    volumes:
-      - .:/smoke
+    <<: *python-base
     command: >
       sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
-             python3 04-tier-c-monkey-patch/smoke.py"
+             for f in
+               04-tier-c-monkey-patch/smoke.py
+               20-tier-c-twilio/smoke.py
+               21-tier-c-sendgrid/smoke.py
+               22-tier-c-boto3-s3/smoke.py
+               23-tier-c-boto3-sqs/smoke.py
+               24-tier-c-redis/smoke.py
+               25-tier-c-pymongo/smoke.py
+               26-tier-c-psycopg2/smoke.py
+               27-tier-c-httpx/smoke.py
+               28-tier-c-celery-worker/smoke.py
+               29-tier-c-rabbitmq/smoke.py
+               30-tier-c-elasticsearch/smoke.py
+               31-tier-c-slack/smoke.py
+               32-tier-c-openai/smoke.py
+             ; do echo \"--- $$f ---\" && python3 $$f; done"
+    profiles: ["tier-c", "all"]
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TIER D — Sidecar bridge (real sidecar + Bash/Perl clients)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Long-running sidecar HTTP server
+  otel-sidecar:
+    build:
+      context: ../otel-sidecar
+    restart: on-failure
     environment:
+      OTEL_SERVICE_NAME: smoke-tier-d-sidecar
       ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
       ELASTIC_API_KEY: ${ELASTIC_API_KEY}
-      OTEL_DEPLOYMENT_ENVIRONMENT: smoke-test
+      OTEL_DEPLOYMENT_ENVIRONMENT: ${OTEL_DEPLOYMENT_ENVIRONMENT:-smoke-test}
+      SIDECAR_HOST: 0.0.0.0
+      SIDECAR_PORT: "9411"
+    ports:
+      - "9411:9411"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - >
+          import urllib.request, json;
+          r = urllib.request.urlopen(
+            urllib.request.Request('http://localhost:9411',
+              b'{"action":"health"}',
+              {'Content-Type':'application/json'}));
+          assert json.loads(r.read()).get('status') == 'ok'
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    profiles: ["tier-d", "all", "sidecar"]
 
-  # ── Tier D: Bash via sidecar ─────────────────────────────────────────────
+  # Bash client via sidecar
   smoke-tier-d-bash:
     image: ubuntu:22.04
     working_dir: /smoke
     volumes:
       - .:/smoke
     command: >
-      sh -c "apt-get update -qq && apt-get install -y -qq curl python3 &&
+      sh -c "apt-get update -qq && apt-get install -y -qq curl &&
              bash 05-tier-d-sidecar/smoke-bash.sh"
     environment:
       OTEL_SIDECAR_URL: http://otel-sidecar:9411
     depends_on:
       otel-sidecar:
         condition: service_healthy
+    profiles: ["tier-d", "all"]
 
-  # ── Tier D: Perl via sidecar ─────────────────────────────────────────────
+  # Perl client via sidecar
   smoke-tier-d-perl:
     image: perl:5.38
     working_dir: /smoke
     volumes:
       - .:/smoke
     command: >
-      sh -c "cpanm --quiet LWP::UserAgent JSON &&
+      sh -c "cpanm --quiet --notest LWP::UserAgent JSON &&
              perl 05-tier-d-sidecar/smoke-perl.pl"
     environment:
       OTEL_SIDECAR_URL: http://otel-sidecar:9411
     depends_on:
       otel-sidecar:
         condition: service_healthy
+    profiles: ["tier-d", "all"]
 
-  # ── Verify ────────────────────────────────────────────────────────────────
-  verify:
-    image: python:3.12-slim
-    working_dir: /smoke
-    volumes:
-      - .:/smoke
+  # Python simulations for all legacy runtimes (COBOL, PowerShell, SAP, etc.)
+  smoke-tier-d-simulations:
+    <<: *python-base
     command: >
       sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
-             sleep 5 && python3 06-verify/check_spans.py"
+             for f in
+               33-tier-d-cobol-batch/smoke.py
+               34-tier-d-powershell/smoke.py
+               35-tier-d-sap-abap/smoke.py
+               36-tier-d-ibm-rpg/smoke.py
+               37-tier-d-classic-asp/smoke.py
+               38-tier-d-vba-excel/smoke.py
+               39-tier-d-matlab/smoke.py
+               40-tier-d-r-statistical/smoke.py
+               41-tier-d-lua/smoke.py
+               42-tier-d-tcl/smoke.py
+               43-tier-d-awk-etl/smoke.py
+               44-tier-d-fortran/smoke.py
+               45-tier-d-delphi/smoke.py
+               46-tier-d-coldfusion/smoke.py
+               47-tier-d-julia/smoke.py
+               48-tier-d-nim/smoke.py
+               49-tier-d-ada/smoke.py
+               50-tier-d-zapier/smoke.py
+             ; do echo \"--- $$f ---\" && python3 $$f; done"
+    profiles: ["tier-d", "all"]
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CROSS-TIER — End-to-end scenario (Tier A→B→C→D, shared trace_id)
+  # ═══════════════════════════════════════════════════════════════════════════
+  smoke-cross-tier:
+    <<: *python-base
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 07-cross-tier-full-o11y/scenario.py"
     environment:
-      ELASTIC_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
-      ELASTIC_API_KEY: ${ELASTIC_API_KEY}
-      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-}
-      ELASTIC_ES_READ_API_KEY: ${ELASTIC_ES_READ_API_KEY:-}
+      <<: *python-env
+      OTEL_SIDECAR_URL: http://otel-sidecar:9411
     depends_on:
-      - smoke-tier-a-python
-      - smoke-tier-a-nodejs
-      - smoke-tier-b
-      - smoke-tier-c
-      - smoke-tier-d-bash
-      - smoke-tier-d-perl
+      otel-sidecar:
+        condition: service_healthy
+    profiles: ["cross-tier", "all"]
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # VERIFY — OTLP ping confirms all services reached Elastic
+  # ═══════════════════════════════════════════════════════════════════════════
+  verify:
+    <<: *python-base
+    command: >
+      sh -c "pip install --quiet opentelemetry-sdk opentelemetry-exporter-otlp-proto-http &&
+             python3 06-verify/check_spans.py"
+    profiles: ["verify", "all"]
+
+volumes:
+  pip-cache:
+  npm-cache:

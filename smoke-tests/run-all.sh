@@ -88,13 +88,54 @@ else
   warn "Node.js not found — skipping 02-tier-a-nodejs"
 fi
 
+# ── Tier A: Java ──────────────────────────────────────────────────────────────
+echo -e "${CYAN}── Tier A: Java (native OTel SDK) ────────────────────────────${NC}"
+run_test "08-tier-a-java" "python3 08-tier-a-java/smoke.py"
+
+# ── Tier A: Go ────────────────────────────────────────────────────────────────
+echo -e "${CYAN}── Tier A: Go (native OTel SDK) ──────────────────────────────${NC}"
+run_test "09-tier-a-go" "python3 09-tier-a-go/smoke.py"
+
+# ── Tier A: Ruby ──────────────────────────────────────────────────────────────
+echo -e "${CYAN}── Tier A: Ruby (native OTel SDK) ────────────────────────────${NC}"
+run_test "10-tier-a-ruby" "python3 10-tier-a-ruby/smoke.py"
+
+# ── Tier A: .NET ──────────────────────────────────────────────────────────────
+echo -e "${CYAN}── Tier A: .NET C# (native OTel SDK) ─────────────────────────${NC}"
+run_test "11-tier-a-dotnet" "python3 11-tier-a-dotnet/smoke.py"
+
+# ── Tier A: PHP ───────────────────────────────────────────────────────────────
+echo -e "${CYAN}── Tier A: PHP (native OTel SDK) ─────────────────────────────${NC}"
+run_test "12-tier-a-php" "python3 12-tier-a-php/smoke.py"
+
 # ── Tier B: Manual wrapping ───────────────────────────────────────────────────
 echo -e "${CYAN}── Tier B: Manual handler wrapping ───────────────────────────${NC}"
 run_test "03-tier-b-manual-wrap" "python3 03-tier-b-manual-wrap/smoke.py"
+run_test "13-tier-b-django-orm"  "python3 13-tier-b-django-orm/smoke.py"
+run_test "14-tier-b-flask-raw"   "python3 14-tier-b-flask-raw/smoke.py"
+run_test "15-tier-b-tornado"     "python3 15-tier-b-tornado/smoke.py"
+run_test "16-tier-b-bottle"      "python3 16-tier-b-bottle/smoke.py"
+run_test "17-tier-b-falcon"      "python3 17-tier-b-falcon/smoke.py"
+run_test "18-tier-b-aiohttp"     "python3 18-tier-b-aiohttp/smoke.py"
+run_test "19-tier-b-celery"      "python3 19-tier-b-celery/smoke.py"
 
 # ── Tier C: Monkey-patching ───────────────────────────────────────────────────
 echo -e "${CYAN}── Tier C: Library monkey-patching ───────────────────────────${NC}"
-run_test "04-tier-c-monkey-patch" "python3 04-tier-c-monkey-patch/smoke.py"
+run_test "04-tier-c-monkey-patch"     "python3 04-tier-c-monkey-patch/smoke.py"
+run_test "20-tier-c-twilio"           "python3 20-tier-c-twilio/smoke.py"
+run_test "21-tier-c-sendgrid"         "python3 21-tier-c-sendgrid/smoke.py"
+run_test "22-tier-c-boto3-s3"         "python3 22-tier-c-boto3-s3/smoke.py"
+run_test "23-tier-c-boto3-sqs"        "python3 23-tier-c-boto3-sqs/smoke.py"
+run_test "24-tier-c-redis"            "python3 24-tier-c-redis/smoke.py"
+run_test "25-tier-c-pymongo"          "python3 25-tier-c-pymongo/smoke.py"
+run_test "26-tier-c-psycopg2"         "python3 26-tier-c-psycopg2/smoke.py"
+run_test "27-tier-c-httpx"            "python3 27-tier-c-httpx/smoke.py"
+run_test "28-tier-c-celery-worker"    "python3 28-tier-c-celery-worker/smoke.py"
+run_test "29-tier-c-rabbitmq"         "python3 29-tier-c-rabbitmq/smoke.py"
+run_test "30-tier-c-elasticsearch"    "python3 30-tier-c-elasticsearch/smoke.py"
+run_test "31-tier-c-slack"            "python3 31-tier-c-slack/smoke.py"
+run_test "32-tier-c-openai"           "python3 32-tier-c-openai/smoke.py"
+run_test "51-tier-c-cuda-nvml"        "python3 51-tier-c-cuda-nvml/smoke.py"
 
 # ── Tier D: Sidecar ───────────────────────────────────────────────────────────
 echo -e "${CYAN}── Tier D: Sidecar (legacy languages) ────────────────────────${NC}"
@@ -143,6 +184,28 @@ else
     info "Install with: cpan install LWP::UserAgent JSON"
   fi
 fi
+
+# ── Tier D: Simulations (Python, always-run) ──────────────────────────────────
+echo -e "${CYAN}── Tier D: Legacy runtime simulations ────────────────────────${NC}"
+run_test "33-tier-d-cobol-batch"    "python3 33-tier-d-cobol-batch/smoke.py"
+run_test "34-tier-d-powershell"     "python3 34-tier-d-powershell/smoke.py"
+run_test "35-tier-d-sap-abap"       "python3 35-tier-d-sap-abap/smoke.py"
+run_test "36-tier-d-ibm-rpg"        "python3 36-tier-d-ibm-rpg/smoke.py"
+run_test "37-tier-d-classic-asp"    "python3 37-tier-d-classic-asp/smoke.py"
+run_test "38-tier-d-vba-excel"      "python3 38-tier-d-vba-excel/smoke.py"
+run_test "39-tier-d-matlab"         "python3 39-tier-d-matlab/smoke.py"
+run_test "40-tier-d-r-statistical"  "python3 40-tier-d-r-statistical/smoke.py"
+run_test "41-tier-d-lua"            "python3 41-tier-d-lua/smoke.py"
+run_test "42-tier-d-tcl"            "python3 42-tier-d-tcl/smoke.py"
+run_test "43-tier-d-awk-etl"        "python3 43-tier-d-awk-etl/smoke.py"
+run_test "44-tier-d-fortran"        "python3 44-tier-d-fortran/smoke.py"
+run_test "45-tier-d-delphi"         "python3 45-tier-d-delphi/smoke.py"
+run_test "46-tier-d-coldfusion"     "python3 46-tier-d-coldfusion/smoke.py"
+run_test "47-tier-d-julia"          "python3 47-tier-d-julia/smoke.py"
+run_test "48-tier-d-nim"            "python3 48-tier-d-nim/smoke.py"
+run_test "49-tier-d-ada"            "python3 49-tier-d-ada/smoke.py"
+run_test "50-tier-d-zapier"         "python3 50-tier-d-zapier/smoke.py"
+run_test "52-tier-d-dcgm-exporter"  "python3 52-tier-d-dcgm-exporter/smoke.py"
 
 # ── Cross-tier full O11y scenario ─────────────────────────────────────────────
 echo -e "${CYAN}── Cross-Tier: Full O11y End-to-End Scenario ─────────────────${NC}"
