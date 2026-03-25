@@ -285,6 +285,13 @@ run_test "80-web-htmx"              "python3 80-web-htmx/smoke.py"
 echo -e "${CYAN}── Mobile Multi-Service Scenario ────────────────────────────${NC}"
 run_test "81-mobile-ecommerce"      "python3 81-mobile-ecommerce/scenario.py"
 
+# ── E2E Auto-Instrumentation Verification ─────────────────────────────────────
+echo -e "${CYAN}── E2E Auto-Instrumentation Verification ─────────────────${NC}"
+echo -e "${CYAN}   (Tests that auto-instrumentation produces correct spans) ${NC}"
+run_test "82-e2e-flask-ecommerce"   "python3 82-e2e-flask-ecommerce/smoke.py"
+run_test "83-e2e-fastapi-ml"        "python3 83-e2e-fastapi-ml/smoke.py"
+run_test "84-e2e-django-cms"        "python3 84-e2e-django-cms/smoke.py"
+
 # ── Verify ────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}── Verification ──────────────────────────────────────────────${NC}"
 python3 06-verify/check_spans.py 2>&1 | grep -v NotOpenSSLWarning | grep -v "warnings.warn"
