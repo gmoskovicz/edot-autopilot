@@ -120,9 +120,20 @@ Bash · Perl · COBOL · PowerShell · SAP ABAP · IBM RPG (AS/400) · Classic A
 VBA/Excel · MATLAB · R · Lua · Tcl · AWK · Fortran HPC · Delphi · ColdFusion ·
 Julia · Nim · Ada · Zapier · **NVIDIA DCGM Exporter (multi-GPU training)**
 
-### Cross-tier end-to-end (1)
-A single trace flowing Tier A → B → C → D with a shared `trace_id`, visible as
-4 connected services in Kibana Service Map.
+### Cross-tier end-to-end (8 scenarios, 7 tier combinations)
+Real architectures don't always flow A → B → C → D. Eight scenarios covering every
+meaningful combination, each producing distinct connection patterns in the Kibana service map:
+
+| # | Flow | Business event |
+|---|------|----------------|
+| 1 | A→B→C→D | Enterprise activation — full happy path |
+| 2 | A→C→D | Pre-approved customer — billing bypassed |
+| 3 | A→B→D | Invoice billing — credit approved, no card charge |
+| 4 | A→D | Free tier — no billing or payment |
+| 5 | D→B→A | COBOL dunning batch initiates — billing flags — API suspends |
+| 6 | B→C→D | Auto-renewal — billing triggers charge cycle |
+| 7 | C→A→D | Stripe webhook — payment event updates API, SMS confirms |
+| 8 | A→B | Credit denied — trace stops at Tier B |
 
 ### Multi-service architecture scenarios (5)
 Complex distributed systems with realistic error mixes, full service maps, span events,
