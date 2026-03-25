@@ -511,15 +511,18 @@ SIDECAR_PORT=9411
 
 ## The Principle
 
-Every tool on the market — Datadog, Dynatrace, New Relic, the upstream OTel collector —
-instruments what it can detect automatically: HTTP calls, DB queries, framework hooks.
+Standard auto-instrumentation — including vanilla OpenTelemetry collectors and generic
+APM agents — instruments what they can detect automatically: HTTP calls, DB queries,
+framework hooks.
 
 They do not read your code. They do not know that `POST /api/v1/txn` is a payment
 authorization, that the Stripe call is the most latency-sensitive step, that `fraud_score`
 is what ops needs during an incident, or that the COBOL batch job on a 1998 AIX server
 is the most critical process in your company.
 
-This workflow does. It reads first. It instruments what matters.
+This workflow does. It reads first. It instruments what matters. The business context it
+generates flows directly into Elastic's ES|QL analytics, ML-based anomaly detection,
+AIOps, and SLO management — turning raw telemetry into operational intelligence.
 
 The goal is not coverage. The goal is understanding.
 

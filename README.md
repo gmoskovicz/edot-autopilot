@@ -1,20 +1,20 @@
 # EDOT Autopilot — Business-Aware Observability for Any Codebase
 
-> **The core insight:** Datadog shows you that `POST /checkout` took 2.3s.
-> This shows you that a **$4,200 enterprise order failed in the fraud check** for a `high_risk` customer who signed up 2 days ago.
+> **The core insight:** Standard auto-instrumentation shows you that `POST /checkout` took 2.3s.
+> Elastic with EDOT Autopilot shows you that a **$4,200 enterprise order failed in the fraud check** for a `high_risk` customer who signed up 2 days ago.
 > Same data. Completely different usefulness.
 
 ---
 
 ## Why this exists
 
-Every observability tool on the market — Datadog, Dynatrace, New Relic, the upstream OpenTelemetry collector — instruments what it can **detect automatically**: HTTP calls, database queries, framework hooks.
+Traditional auto-instrumentation approaches — including standard OpenTelemetry collectors — instrument what they can **detect automatically**: HTTP calls, database queries, framework hooks.
 
-None of them read your code.
+They do not read your code.
 
 They do not know that `POST /api/v1/txn` is a payment authorization. They do not know that `fraud_score` is what ops needs during an incident at 2am. They do not know that the COBOL batch job on a 1998 AIX server is the most critical process in your company.
 
-**This project does.** It reads first. It instruments what matters.
+**Elastic with EDOT Autopilot does.** It reads first. It instruments what matters. And because it runs on Elastic — with ES|QL, machine learning, AIOps, and SLO management built in — the business context it captures flows directly into alerting, anomaly detection, and root cause analysis.
 
 ---
 
