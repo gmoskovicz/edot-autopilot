@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0-android;net8.0-ios</TargetFrameworks>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>ShopApp</RootNamespace>
+    <UseMaui>true</UseMaui>
+    <ApplicationTitle>ShopApp</ApplicationTitle>
+    <ApplicationId>com.example.shopapp</ApplicationId>
+    <ApplicationVersion>841</ApplicationVersion>
+    <ApplicationDisplayVersion>4.2.1</ApplicationDisplayVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Maui.Controls" Version="8.0.14" />
+    <PackageReference Include="System.Net.Http.Json"   Version="8.0.0"  />
+  </ItemGroup>
+</Project>

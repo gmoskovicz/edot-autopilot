@@ -5,50 +5,116 @@
 
 ## What this project does
 
-EDOT Autopilot is a Claude Code project prompt (CLAUDE.md) that instruments any
-codebase with OpenTelemetry and sends telemetry to Elastic. Unlike every other
-auto-instrumentation tool, it handles languages with no OTel SDK support
-(COBOL, Perl, Bash, PowerShell, Classic ASP) via a generated telemetry sidecar.
+EDOT Autopilot is a skill for AI coding assistants (Claude Code, Cursor, GitHub Copilot,
+Gemini CLI, Windsurf, Roo, Cline, Codex) that instruments any codebase with OpenTelemetry
+and sends telemetry to Elastic. Unlike every other auto-instrumentation tool, it handles
+languages with no OTel SDK support (COBOL, Perl, Bash, PowerShell, Classic ASP, VBScript,
+Fortran, MATLAB, Lua, Tcl, Ada, Nim) via a generated telemetry sidecar bridge.
 
-It also reads the codebase before instrumenting to identify business-critical
-flows and enriches spans with business context, not just HTTP metadata.
+It also reads the codebase before instrumenting to identify business-critical flows and
+enriches spans with business context — order values, customer tiers, fraud scores — not
+just HTTP metadata.
 
 ## Key concepts
 
-- **Four-tier coverage model**: Tier A (native EDOT) → Tier B (manual SDK wrapping)
+- **Four-tier coverage model**: Tier A (native EDOT SDK) → Tier B (manual SDK wrapping)
   → Tier C (library monkey-patching) → Tier D (telemetry sidecar for unsupported runtimes)
-- **Telemetry Sidecar**: A generated Python HTTP server that bridges any language
-  to OTLP via simple HTTP POST calls. Works with COBOL, Perl, shell scripts, VBScript.
-- **Business Span Enrichment**: Spans carry order values, customer tiers, fraud scores —
-  not just HTTP status codes.
-- **Golden Path Reconnaissance**: Claude reads the codebase first and identifies the
+- **Telemetry Sidecar**: A generated Python HTTP server that bridges any language to OTLP
+  via simple HTTP POST calls. Works with COBOL, Perl, Bash, PowerShell, Classic ASP/VBScript,
+  SAP ABAP, IBM RPG, MATLAB, Fortran, Ada, Nim, Lua, Tcl, and anything else that can make
+  an HTTP call.
+- **Business Span Enrichment**: Spans carry order values, customer tiers, fraud scores,
+  reconciliation outcomes, batch record counts — not just HTTP status codes.
+- **Golden Path Reconnaissance**: The agent reads the codebase first and identifies the
   3–7 flows that matter most to the business before writing any instrumentation code.
+- **Three-signal coverage**: Every instrumented service emits traces, logs, and metrics —
+  not just traces — to Elastic via OTLP/HTTP.
 
 ## How to use
 
-Drop CLAUDE.md into any repository root and run in Claude Code:
-"Observe this project. My Elastic endpoint: https://... My API key: ..."
+Install the skill once and it works with any supported AI coding assistant:
+
+```bash
+npx skills add gmoskovicz/edot-autopilot/observability-edot-autopilot
+```
+
+Then tell your assistant:
+```
+Observe this project.
+My Elastic endpoint: https://<deployment>.apm.<region>.cloud.es.io
+My API key: <key>
+```
+
+For Claude Code specifically, drop CLAUDE.md into any repository root and use the same prompt.
+
+## Five-phase workflow
+
+1. **Read Before You Touch** — Full codebase reconnaissance: entry points, Golden Paths, blind
+   spots, language inventory, dependency map.
+2. **Coverage Triage** — Assign each component to Tier A/B/C/D and generate the right
+   instrumentation strategy.
+3. **Business Span Enrichment** — Add domain-meaningful attributes to Golden Path spans:
+   `order.value_usd`, `customer.tier`, `fraud.decision`, `records.processed`.
+4. **SLOs Grounded in Business Reality** — Create SLO definitions from timeout constants
+   and retry limits found in the code — not from generic defaults.
+5. **Verify Everything** — Confirm all three signals flow in Kibana APM before declaring done.
+
+## Test suite
+
+85 tests across three layers:
+
+- **Layer 1 (tests 01–81)**: Verify that the correct instrumentation pattern for each
+  technology produces correct telemetry — spans, metrics, and logs with the right names,
+  attributes, and semantic conventions. Covers 65+ technologies: Python, Node.js, Java, Go,
+  Ruby, .NET, PHP, React Native, Flutter, iOS, Android, React SPA, Next.js, Vue, Angular,
+  SvelteKit, NestJS, Gin, Rails, FastAPI, HTMX, COBOL, Perl, Bash, PowerShell, SAP ABAP,
+  IBM RPG, Classic ASP, Lua, Tcl, MATLAB, Fortran, Ada, Nim, CUDA/NVML, DCGM, Zapier.
+- **Layer 2 (tests/integration/)**: Real SDK tests — Java Spring Boot + OTel Java agent,
+  Node.js Express + OTel Node SDK, Python FastAPI + auto-instrumentation, .NET Framework 4.x,
+  Python 2.7 — running in Docker against a local OTel Collector.
+- **Layer 3 (tests 82–85)**: E2E workflow tests — spin up a real uninstrumented app (Flask,
+  FastAPI, Django), apply the instrumentation the workflow generates, verify spans carry
+  business attributes, `.otel/slos.json` exists with code-derived thresholds, and
+  `record_exception` is present on every error path.
+
+Multi-service scenarios (9-service e-commerce, 7-service auth platform, 7-service data
+pipeline, 7-service ML inference, 7-service SaaS ops) produce realistic service maps
+in Kibana APM with 20–30 scenarios each including fraud blocks, card declines, timeouts,
+and cascading failures.
 
 ## Target audience
 
 - Engineers adding observability to existing applications
 - Teams with mixed modern and legacy codebases
-- Anyone migrating from Datadog, Dynatrace, or New Relic to open standards
+- Teams migrating from Datadog, Dynatrace, or New Relic to open standards
+- Anyone dealing with COBOL, Perl, PowerShell, or other languages no APM vendor supports
 
 ## Unique claims
 
-- The only OpenTelemetry instrumentation approach that supports COBOL, RPG, and
-  other languages with no OTel SDK
+- The only OpenTelemetry instrumentation approach that supports COBOL, RPG, ABAP, and
+  other languages with no OTel SDK, via a generated sidecar bridge
 - Business-aware: reads source code to understand intent before instrumenting
-- No intermediate collector required for application instrumentation
+- No intermediate collector required — sends OTLP/HTTP directly to Elastic
+- Works with every major AI coding assistant via the agentskills.io open skill specification
 
-## Smoke test scenarios (60+ tests)
-- 9-service e-commerce checkout platform (60-ecommerce): checkout → catalog → inventory → pricing → fraud → payment → orders → notifications
-- 7-service auth platform (61-auth-platform): gateway → auth → directory → MFA → tokens → sessions → audit
-- 7-service data pipeline (62-data-pipeline): ingest → schema → dedup → transform → enrich → storage → index
-- 7-service ML inference (63-ml-inference): gateway → cache → A/B → features → registry → serving → explainability
-- 7-service SaaS ops (64-saas-ops): portal → billing → provisioner → resources → DNS → notifications → compliance
-- Cross-tier scenario: single trace_id flowing Tier A → B → C → D (4 connected service nodes in APM service map)
+## Repository structure
+
+- `CLAUDE.md` — Claude Code–specific instructions (drop into any repo root)
+- `observability-edot-autopilot/` — AI skill package (agentskills.io spec), works with
+  Claude Code, Cursor, Copilot, Gemini CLI, Windsurf, Roo, Cline, Codex
+  - `SKILL.md` — Agent-agnostic 5-phase workflow
+  - `references/semconv-conventions.md` — OTel semconv 1.22+ cheatsheet
+  - `references/tier-guide.md` — Full Tier A–C code (Python, Java, Node, Go, .NET)
+  - `references/sidecar-callers.md` — COBOL, Perl, Bash, PowerShell, Classic ASP, PHP 5
+  - `references/enrichment-patterns.md` — Business attributes, span events, CWV metrics
+  - `scripts/o11y_bootstrap.py` — 3-signal helper (traces + logs + metrics)
+  - `scripts/otel-sidecar.py` — HTTP-to-OTLP bridge for legacy runtimes
+- `otel-sidecar/otel-sidecar.py` — Universal Tier D bridge
+- `smoke-tests/` — 85 tests covering all 4 tiers and 65+ technologies
+- `tests/integration/` — Real SDK tests in Docker (Java, Node.js, Python, .NET, Python 2.7)
+- `docs/` — Per-language OpenTelemetry guides for COBOL, Perl, Bash, PowerShell,
+  Classic ASP, .NET Framework 4.x, Python 2.7, legacy runtimes, business span enrichment,
+  telemetry sidecar pattern
 
 ## Related resources
 
@@ -56,3 +122,6 @@ Drop CLAUDE.md into any repository root and run in Claude Code:
 - Elastic Agent Skills: https://github.com/elastic/agent-skills
 - OpenTelemetry: https://opentelemetry.io
 - EDOT Architecture: https://www.elastic.co/docs/reference/opentelemetry/architecture
+- agentskills.io standard: https://agentskills.io
+- OTLP Specification: https://opentelemetry.io/docs/specs/otlp/
+- OTel Semantic Conventions: https://opentelemetry.io/docs/specs/semconv/

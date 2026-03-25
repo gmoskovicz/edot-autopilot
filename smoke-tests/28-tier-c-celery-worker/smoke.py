@@ -1,93 +1,190 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — Celery Task.apply_async() (monkey-patched library side).
+E2E "Observe this project." — Tier C: Celery
+=============================================
+Runs `claude -p "Observe this project."` on a blank video transcoding service
+that uses Celery to enqueue transcoding jobs.
 
-Patches celery.app.task.Task.apply_async — existing call sites unchanged.
-Business scenario: Video transcoding job submission.
+EDOT Autopilot workflow:
+  1. Reads blank fixture — finds Task.apply_async calls
+  2. Assigns Tier C (monkey-patch) — Celery OTel instrumentation is incomplete
+  3. Wraps Task.apply_async with CLIENT spans
+  4. Adds business attributes: celery.task_name, celery.queue, celery.task_id
 
 Run:
     cd smoke-tests && python3 28-tier-c-celery-worker/smoke.py
 """
 
-import os, sys, uuid, time
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-SVC = "smoke-tier-c-celery-worker"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "28-tier-c-celery-worker"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-celery")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-tasks_queued = meter.create_counter("celery.tasks_queued")
-task_latency = meter.create_histogram("celery.enqueue_ms", unit="ms")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-class _MockAsyncResult:
-    def __init__(self, task_id):
-        self.id = task_id
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-celery (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print()
 
-class _MockTask:
-    name  = "video.transcode"
-    queue = "media"
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture dir exists", os.path.isdir(FIXTURE_DIR), FIXTURE_DIR)
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-    def apply_async(self, args=None, kwargs=None, queue=None, countdown=None, **opts):
-        time.sleep(0.01)
-        return _MockAsyncResult(str(uuid.uuid4()))
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-class celery:
-    class app:
-        class task:
-            Task = _MockTask
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-celery-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
 
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-_orig_apply_async = _MockTask.apply_async
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-def _inst_apply_async(self, args=None, kwargs=None, queue=None, countdown=None, **opts):
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
+
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
+
     t0 = time.time()
-    q  = queue or self.queue
-    with tracer.start_as_current_span("celery.apply_async", kind=SpanKind.CLIENT,
-        attributes={"celery.task_name": self.name, "celery.queue": q,
-                    "celery.countdown_sec": countdown or 0}) as span:
-        result = _orig_apply_async(self, args, kwargs, queue=q, countdown=countdown, **opts)
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("celery.task_id", result.id)
-        tasks_queued.add(1, attributes={"celery.task_name": self.name, "celery.queue": q})
-        task_latency.record(dur, attributes={"celery.task_name": self.name})
-        logger.info("celery task enqueued",
-                    extra={"celery.task_name": self.name, "celery.task_id": result.id,
-                           "celery.queue": q})
-        return result
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
-_MockTask.apply_async = _inst_apply_async
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-transcode = celery.app.task.Task()
-transcode.name = "video.transcode"
+    # ── Step 4: Inspect what the agent changed ────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+    print(f"  New files: {new_files}")
 
-videos = [
-    {"video_id": "VID-001", "source_format": "mov",  "target_formats": ["mp4", "hls", "webm"], "customer": "CUST-ENT-001"},
-    {"video_id": "VID-002", "source_format": "avi",  "target_formats": ["mp4", "hls"],          "customer": "CUST-PRO-042"},
-    {"video_id": "VID-003", "source_format": "webm", "target_formats": ["mp4"],                 "customer": "CUST-FREE-007"},
-]
+    app_file = os.path.join(tmpdir, "app.py")
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
 
-print(f"\n[{SVC}] Submitting video transcode jobs via patched celery.apply_async...")
-for video in videos:
-    for fmt in video["target_formats"]:
-        result = transcode.apply_async(
-            args=[video["video_id"]],
-            kwargs={"output_format": fmt, "quality": "high"},
-            queue="media",
-        )
-        print(f"  ✅ {video['video_id']}  → {fmt:<6}  task={result.id[:12]}...")
+    print("\nTier C monkey-patch checks:")
+    check("opentelemetry added to requirements.txt",
+          "opentelemetry" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SDK client method monkey-patched (Tier C)",
+          "_orig_" in app_content or "functools.wraps" in app_content
+          or "= original_" in app_content,
+          "no monkey-patch pattern found")
+    check("SpanKind.CLIENT on SDK calls",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("Business attributes on spans",
+          any(attr in app_content for attr in [
+              "celery.", "task_name", "celery.queue", "task.name",
+          ]),
+          "no celery.* attributes found in app.py")
+    check("apply_async is patched",
+          "apply_async" in app_content and (
+              "_orig_" in app_content or "wrap" in app_content.lower()
+          ),
+          "apply_async patch not detected")
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ──────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

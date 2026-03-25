@@ -21,7 +21,8 @@ import uuid
 
 from opentelemetry import trace, metrics
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.trace.sampling import TraceIdRatioBased, ParentBased
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
@@ -67,6 +68,9 @@ class O11yBootstrap:
         if sampler is not None:
             tracer_kwargs["sampler"] = sampler
         self._trace_provider = TracerProvider(**tracer_kwargs)
+        # In-memory exporter for assertion-based tests (always enabled)
+        self._memory_exporter = InMemorySpanExporter()
+        self._trace_provider.add_span_processor(SimpleSpanProcessor(self._memory_exporter))
         self._trace_provider.add_span_processor(BatchSpanProcessor(
             OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces", headers=headers),
             max_export_batch_size=64,
@@ -101,6 +105,10 @@ class O11yBootstrap:
         )
         metrics.set_meter_provider(self._meter_provider)
         self.meter = self._meter_provider.get_meter("io.edot-autopilot", "1.0.0")
+
+    def get_finished_spans(self):
+        """Return all spans captured by the in-memory exporter for assertions."""
+        return self._memory_exporter.get_finished_spans()
 
     def flush(self):
         """Force-flush all three providers before process exit."""

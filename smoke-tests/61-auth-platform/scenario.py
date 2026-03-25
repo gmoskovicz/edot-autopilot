@@ -25,15 +25,14 @@ Run:
 
 import os, sys, uuid, time, random, ipaddress
 from pathlib import Path
+from dotenv import load_dotenv
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
-env_file = Path(__file__).parent.parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from o11y_bootstrap import O11yBootstrap
@@ -41,9 +40,12 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
-API_KEY  = os.environ["ELASTIC_API_KEY"]
-ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+ENV = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+
+CHECKS: list[tuple[str, str, str]] = []
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
 propagator = TraceContextTextMapPropagator()
 
@@ -595,11 +597,9 @@ def run_auth_flow(scenario: str, user: dict, auth_method: str,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"\n{'='*70}")
-    print("  Auth & Identity Platform — Distributed Tracing Demo")
-    print("  Services: api-gateway → auth-service → user-directory")
-    print("            → mfa-service → token-service → session-store → audit-service")
-    print(f"{'='*70}")
+    print(f"\n{'='*62}")
+    print(f"EDOT-Autopilot | Auth & Identity Platform")
+    print(f"{'='*62}")
 
     # 25 scenarios: 14 success, 4 wrong_pw, 3 locked, 2 mfa_timeout, 1 suspicious, 1 refresh
     scenario_pool = (
@@ -612,8 +612,7 @@ if __name__ == "__main__":
     )
     random.shuffle(scenario_pool)
 
-    stats = {"success": 0, "wrong_password": 0, "locked": 0,
-             "mfa_timeout": 0, "suspicious": 0, "refresh": 0, "total": 0}
+    results = []
 
     for i, scenario in enumerate(scenario_pool):
         user        = random.choice(USERS)
@@ -638,48 +637,71 @@ if __name__ == "__main__":
         if not is_suspicious:
             ip, country, is_vpn = random_ip(user, vpn=(random.random() < 0.1))
 
-        print(f"\n{'─'*70}")
+        print(f"\n{'─'*62}")
         print(f"  Scenario {i+1:02d}/25  [{scenario}]")
 
-        result = run_auth_flow(
-            scenario, user, method, ip, country, is_vpn,
-            device_type, device_os,
-            force_wrong_pw=force_wrong_pw,
-            force_locked=force_locked,
-            force_mfa_timeout=force_mfa_timeout,
-            is_refresh=is_refresh,
-            is_suspicious=is_suspicious,
-        )
-        stats["total"] += 1
-        if result:
-            if is_refresh: stats["refresh"] += 1
-            else: stats["success"] += 1
-        elif force_wrong_pw:   stats["wrong_password"] += 1
-        elif force_locked:     stats["locked"] += 1
-        elif force_mfa_timeout:stats["mfa_timeout"] += 1
-        elif is_suspicious:    stats["suspicious"] += 1
+        try:
+            result = run_auth_flow(
+                scenario, user, method, ip, country, is_vpn,
+                device_type, device_os,
+                force_wrong_pw=force_wrong_pw,
+                force_locked=force_locked,
+                force_mfa_timeout=force_mfa_timeout,
+                is_refresh=is_refresh,
+                is_suspicious=is_suspicious,
+            )
+            status = "OK" if result else "WARN"
+            results.append((f"Scenario {i+1:02d}/25 [{scenario}]", status, None))
+        except Exception as e:
+            results.append((f"Scenario {i+1:02d}/25 [{scenario}]", "ERROR", str(e)))
 
         time.sleep(random.uniform(0.1, 0.25))
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*62}")
     print("  Flushing all telemetry providers...")
     for svc in [gateway, auth, directory, mfa, tokens, sessions, audit]:
         svc.flush()
 
-    print(f"\n  Results: {stats['total']} scenarios")
-    print(f"    ✅ Success:         {stats['success']}")
-    print(f"    🔄 Token refresh:   {stats['refresh']}")
-    print(f"    ❌ Wrong password:  {stats['wrong_password']}")
-    print(f"    🔒 Account locked:  {stats['locked']}")
-    print(f"    ⏱️  MFA timeout:     {stats['mfa_timeout']}")
-    print(f"    ⚠️  Suspicious:      {stats['suspicious']}")
+    for scenario_name, status, error_detail in results:
+        if status in ("OK", "WARN"):
+            check(scenario_name, True)
+        else:
+            check(scenario_name, False, error_detail or "")
 
-    print(f"\n  Kibana:")
-    print(f"    Service Map → Observability → APM → Service Map")
-    print(f"    Filter: api-gateway (7 connected nodes expected)")
-    print(f"\n  ES|QL query:")
-    print(f'    FROM traces-apm*,logs-*')
-    print(f'    | WHERE service.name IN ("api-gateway","auth-service","user-directory",')
-    print(f'        "mfa-service","token-service","session-store","audit-service")')
-    print(f'    | SORT @timestamp DESC | LIMIT 100')
-    print(f"{'='*70}\n")
+    # ── Span assertions: verify instrumentation correctness ──────────────────────
+    # Collect from all o11y instances in this test
+    all_spans = []
+    all_spans += gateway.get_finished_spans()
+    all_spans += auth.get_finished_spans()
+    all_spans += directory.get_finished_spans()
+    all_spans += mfa.get_finished_spans()
+    all_spans += tokens.get_finished_spans()
+    all_spans += sessions.get_finished_spans()
+    all_spans += audit.get_finished_spans()
+    print("\nSpan assertions:")
+    check("At least one span captured across all services",
+          len(all_spans) > 0,
+          f"got {len(all_spans)} total spans")
+    server_spans = [s for s in all_spans if s.kind.name == "SERVER"]
+    check("At least one SERVER span emitted",
+          len(server_spans) > 0,
+          f"got {len(server_spans)} SERVER spans")
+    attrs_with_mfa = [s for s in all_spans if s.attributes and "mfa.verified" in s.attributes]
+    check("At least one span carries mfa.verified attribute",
+          len(attrs_with_mfa) > 0,
+          f"got {len(attrs_with_mfa)} spans with mfa.verified")
+    svc_names = {s.resource.attributes.get("service.name") for s in all_spans}
+    check("All 7 services emitted spans",
+          len(svc_names) >= 7,
+          f"services with spans: {svc_names}")
+
+    passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+    failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+    if failed:
+        sys.exit(1)

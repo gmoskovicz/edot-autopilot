@@ -92,7 +92,7 @@ Output a **Reconnaissance Report** before proceeding:
 
 ---
 
-## Phase 2 — Coverage Triage (Which tier does each component fall into?)
+## Phase 2 — Coverage Triage (Which tier does each component fall into, and what instrumentation strategy does that require?)
 
 Every component falls into one of four tiers.
 
@@ -404,7 +404,7 @@ For bare-metal: run the sidecar as a systemd service on the same host.
 
 ---
 
-## Phase 3 — Business Span Enrichment (What does the business care about?)
+## Phase 3 — Business Span Enrichment (What does the business care about, and which spans carry that context?)
 
 After the technical instrumentation is in place, go back to the Golden Paths from Phase 1.
 For each one, add business-meaningful attributes to the spans — not just HTTP codes and
@@ -496,7 +496,7 @@ the on-call engineer know exactly what happened and what to do?"*
 
 ---
 
-## Phase 4 — SLOs Grounded in Business Reality (What are the real performance contracts?)
+## Phase 4 — SLOs Grounded in Business Reality (What are the real performance contracts this codebase already encodes?)
 
 Use the `slo-management` Elastic Skill to create SLOs via the Kibana API.
 
@@ -510,7 +510,7 @@ For each Golden Path:
 
 ---
 
-## Phase 5 — Verify Everything Is Working (Is telemetry actually flowing to Elastic?)
+## Phase 5 — Verify Everything Is Working (Is telemetry actually flowing to Elastic, and do spans carry the right context?)
 
 Do not declare success until data is confirmed flowing in Elastic.
 

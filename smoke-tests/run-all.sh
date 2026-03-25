@@ -291,6 +291,7 @@ echo -e "${CYAN}   (Tests that auto-instrumentation produces correct spans) ${NC
 run_test "82-e2e-flask-ecommerce"   "python3 82-e2e-flask-ecommerce/smoke.py"
 run_test "83-e2e-fastapi-ml"        "python3 83-e2e-fastapi-ml/smoke.py"
 run_test "84-e2e-django-cms"        "python3 84-e2e-django-cms/smoke.py"
+run_test "85-e2e-observe-command"   "python3 85-e2e-observe-command/smoke.py"\nrun_test "86-e2e-observe-this-project" "python3 86-e2e-observe-this-project/smoke.py"
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}── Verification ──────────────────────────────────────────────${NC}"

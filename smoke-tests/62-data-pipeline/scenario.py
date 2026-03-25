@@ -26,15 +26,14 @@ Run:
 
 import os, sys, uuid, time, random, json
 from pathlib import Path
+from dotenv import load_dotenv
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
-env_file = Path(__file__).parent.parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from o11y_bootstrap import O11yBootstrap
@@ -42,9 +41,12 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
-API_KEY  = os.environ["ELASTIC_API_KEY"]
-ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+ENV = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+
+CHECKS: list[tuple[str, str, str]] = []
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
 propagator = TraceContextTextMapPropagator()
 
@@ -730,12 +732,9 @@ def run_pipeline_scenario(scenario: str, event_type: str, source: str, batch_siz
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"\n{'='*70}")
-    print("  Real-Time Data Ingestion Pipeline — Distributed Tracing Demo")
-    print("  Services: ingest-api → schema-validator → dedup-service")
-    print("            → transform-worker → enrichment-service")
-    print("            → storage-writer → search-indexer")
-    print(f"{'='*70}")
+    print(f"\n{'='*62}")
+    print(f"EDOT-Autopilot | Real-Time Data Ingestion Pipeline")
+    print(f"{'='*62}")
 
     # 25 scenarios
     scenario_pool = (
@@ -748,50 +747,69 @@ if __name__ == "__main__":
     )
     random.shuffle(scenario_pool)
 
-    stats = {"success": 0, "schema_failure": 0, "duplicate": 0,
-             "transform_error": 0, "enrichment_timeout": 0,
-             "storage_backpressure": 0, "total": 0}
+    results = []
 
     for i, scenario in enumerate(scenario_pool):
         event_type = random.choice(EVENT_TYPES)
         source     = random.choice(EVENT_SOURCES)
         batch_size = random.randint(10, 500)
 
-        print(f"\n{'─'*70}")
+        print(f"\n{'─'*62}")
         print(f"  Scenario {i+1:02d}/25  [{scenario}]")
-        result = run_pipeline_scenario(scenario, event_type, source, batch_size)
-        stats["total"] += 1
-        if result:
-            if scenario == "enrichment_timeout":
-                stats["enrichment_timeout"] += 1
-            elif scenario == "storage_backpressure":
-                stats["storage_backpressure"] += 1
-            else:
-                stats["success"] += 1
-        elif scenario in stats:
-            stats[scenario] += 1
+        try:
+            result = run_pipeline_scenario(scenario, event_type, source, batch_size)
+            status = "OK" if result else "WARN"
+            results.append((f"Scenario {i+1:02d}/25 [{scenario}]", status, None))
+        except Exception as e:
+            results.append((f"Scenario {i+1:02d}/25 [{scenario}]", "ERROR", str(e)))
 
         time.sleep(random.uniform(0.1, 0.3))
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*62}")
     print("  Flushing all telemetry providers...")
     for svc in [ingest, schema, dedup, transform, enrichment, storage, indexer]:
         svc.flush()
 
-    print(f"\n  Results: {stats['total']} scenarios")
-    print(f"    ✅ Success:              {stats['success']}")
-    print(f"    ❌ Schema failures:      {stats['schema_failure']}")
-    print(f"    🚫 Duplicates:           {stats['duplicate']}")
-    print(f"    ❌ Transform errors:     {stats['transform_error']}")
-    print(f"    ⚠️  Enrichment timeouts: {stats['enrichment_timeout']}")
-    print(f"    ⚠️  Storage backpressure:{stats['storage_backpressure']}")
+    for scenario_name, status, error_detail in results:
+        if status in ("OK", "WARN"):
+            check(scenario_name, True)
+        else:
+            check(scenario_name, False, error_detail or "")
 
-    print(f"\n  Kibana:")
-    print(f"    Service Map → Observability → APM → Service Map")
-    print(f"    Filter: ingest-api (7 connected nodes expected)")
-    print(f"\n  ES|QL query:")
-    print(f'    FROM traces-apm*,logs-*')
-    print(f'    | WHERE service.name IN ("ingest-api","schema-validator","dedup-service",')
-    print(f'        "transform-worker","enrichment-service","storage-writer","search-indexer")')
-    print(f'    | SORT @timestamp DESC | LIMIT 100')
-    print(f"{'='*70}\n")
+    # ── Span assertions: verify instrumentation correctness ──────────────────────
+    # Collect from all o11y instances in this test
+    all_spans = []
+    all_spans += ingest.get_finished_spans()
+    all_spans += schema.get_finished_spans()
+    all_spans += dedup.get_finished_spans()
+    all_spans += transform.get_finished_spans()
+    all_spans += enrichment.get_finished_spans()
+    all_spans += storage.get_finished_spans()
+    all_spans += indexer.get_finished_spans()
+    print("\nSpan assertions:")
+    check("At least one span captured across all services",
+          len(all_spans) > 0,
+          f"got {len(all_spans)} total spans")
+    server_spans = [s for s in all_spans if s.kind.name == "SERVER"]
+    check("At least one SERVER span emitted",
+          len(server_spans) > 0,
+          f"got {len(server_spans)} SERVER spans")
+    attrs_with_records = [s for s in all_spans if s.attributes and "records.valid" in s.attributes]
+    check("At least one span carries records.valid attribute",
+          len(attrs_with_records) > 0,
+          f"got {len(attrs_with_records)} spans with records.valid")
+    svc_names = {s.resource.attributes.get("service.name") for s in all_spans}
+    check("All 7 pipeline services emitted spans",
+          len(svc_names) >= 7,
+          f"services with spans: {svc_names}")
+
+    passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+    failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+    if failed:
+        sys.exit(1)

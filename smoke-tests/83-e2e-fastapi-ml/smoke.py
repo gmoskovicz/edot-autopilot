@@ -272,3 +272,8 @@ failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
 for status, name, detail in CHECKS:
     print(f"  [{status}] {name}" + (f"\n         -> {detail}" if detail else ""))
 print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    print(f"  FAIL: {failed} check(s) failed")
+    print("  Required: pip install opentelemetry-instrumentation-fastapi "
+          "opentelemetry-instrumentation-sqlalchemy")
+    sys.exit(1)

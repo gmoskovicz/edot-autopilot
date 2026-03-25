@@ -1,110 +1,214 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier D — Tcl / network automation (sidecar simulation).
-
-Simulates a Tcl Expect script submitting observability via the HTTP sidecar.
-Business scenario: network device configuration management — SSH to routers,
-push OSPF route changes, validate BGP peering, collect interface stats.
+E2E "Observe this project." — Tier D Tcl/Expect Network Automation
+===================================================================
+Runs `claude -p "Observe this project."` on a blank Tcl Expect script.
+Tcl has no OTel SDK; agent must assign Tier D sidecar bridge.
 
 Run:
     cd smoke-tests && python3 42-tier-d-tcl/smoke.py
 """
 
-import os, sys, time, random
-from pathlib import Path
+import os, sys, time, json, shutil, subprocess, tempfile, urllib.request
+from dotenv import load_dotenv
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set"); sys.exit(0)
 
-SVC = "smoke-tier-d-tcl"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "42-tier-d-tcl"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-tcl")
+SIDECAR_SRC = os.path.join(os.path.dirname(__file__), "../../otel-sidecar/otel-sidecar.py")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
+SIDECAR_PORT = 19442
 
-devices_configured  = meter.create_counter("tcl.devices_configured")
-ssh_sessions        = meter.create_counter("tcl.ssh_sessions")
-config_push_ms      = meter.create_histogram("tcl.config_push_ms", unit="ms")
-interface_errors    = meter.create_counter("tcl.interface_errors")
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name, ok, detail=""):
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-NETWORK_DEVICES = [
-    {"hostname": "core-rtr-01.dc1",   "ip": "10.0.0.1",   "platform": "cisco_ios",    "role": "core",    "interfaces": 48},
-    {"hostname": "edge-rtr-03.dc1",   "ip": "10.0.0.3",   "platform": "cisco_ios_xr", "role": "edge",    "interfaces": 24},
-    {"hostname": "dist-sw-07.dc2",    "ip": "10.1.0.7",   "platform": "juniper_junos","role": "dist",    "interfaces": 96},
-    {"hostname": "access-sw-22.dc2",  "ip": "10.1.1.22",  "platform": "cisco_nxos",   "role": "access",  "interfaces": 48},
-]
+print(f"\n{'='*62}\nEDOT-Autopilot | {SVC}\n{'='*62}")
+print("  Fixture: blank-tcl (no OTel, no sidecar)\n")
 
-ROUTE_CHANGES = [
-    {"prefix": "192.168.100.0/24", "next_hop": "10.0.0.254", "action": "add"},
-    {"prefix": "172.16.50.0/22",   "next_hop": "10.0.0.252", "action": "modify"},
-    {"prefix": "10.50.0.0/16",     "next_hop": "null",        "action": "withdraw"},
-]
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None)
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD))
+check("Fixture directory exists", os.path.isdir(FIXTURE_DIR))
+check("otel-sidecar.py source exists", os.path.exists(SIDECAR_SRC))
+tcl_path = os.path.join(FIXTURE_DIR, "push_ospf_routes.tcl")
+if os.path.exists(tcl_path):
+    content = open(tcl_path).read()
+    check("Fixture Tcl has no sidecar calls yet",
+          "sidecar" not in content.lower() and "otel" not in content.lower())
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for s, n, d in CHECKS:
+        print(f"  [{s}] {n}" + (f"\n         -> {d}" if d and s == "FAIL" else ""))
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-def configure_device(device):
+print("Step 2: Setting up blank Tcl workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-tcl-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank Tcl, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}\n")
+
+    print("Step 3: Running claude -p 'Observe this project.' ...")
+    observe_prompt = f"Observe this project.\nMy Elastic endpoint: {ENDPOINT}\nMy Elastic API key: {API_KEY}"
     t0 = time.time()
-    error_count = 0
+    result = subprocess.run(
+        [claude_bin, "--dangerously-skip-permissions", "-p", observe_prompt,
+         "--model", "claude-sonnet-4-6", "--max-budget-usd", "2.00"],
+        cwd=tmpdir, capture_output=True, text=True, timeout=600)
+    elapsed = time.time() - t0
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        for line in result.stdout.strip().splitlines()[-20:]:
+            print(f"    {line}")
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-    with tracer.start_as_current_span("tcl.network_change_push", kind=SpanKind.INTERNAL,
-            attributes={"tcl.script": "push_ospf_routes.tcl", "net.hostname": device["hostname"],
-                        "net.ip": device["ip"], "net.platform": device["platform"],
-                        "net.role": device["role"]}) as span:
+    print("\nStep 4: Inspecting what the agent changed")
+    diff = subprocess.run(["git", "diff", "HEAD"], cwd=tmpdir, capture_output=True, text=True).stdout
+    new_files = [f.strip() for f in subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True).stdout.splitlines() if f.strip()]
+    print(f"  Diff lines: {len(diff.splitlines())}  New files: {new_files}")
 
-        with tracer.start_as_current_span("tcl.expect.spawn_ssh", kind=SpanKind.CLIENT,
-                attributes={"net.hostname": device["hostname"], "net.port": 22,
-                            "net.protocol": "ssh"}):
-            time.sleep(random.uniform(0.08, 0.25))
-            ssh_sessions.add(1, attributes={"net.platform": device["platform"]})
+    all_text = "\n".join(
+        open(os.path.join(tmpdir, f)).read()
+        for f in os.listdir(tmpdir)
+        if os.path.isfile(os.path.join(tmpdir, f)) and not f.startswith(".") and f != "CLAUDE.md"
+    )
+    sidecar_path = os.path.join(tmpdir, "otel-sidecar.py")
+    otel_slos    = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden  = os.path.join(tmpdir, ".otel", "golden-paths.md")
 
-        with tracer.start_as_current_span("tcl.expect.send_commands", kind=SpanKind.INTERNAL,
-                attributes={"net.hostname": device["hostname"],
-                            "net.command_count": len(ROUTE_CHANGES) * 2}):
-            for route in ROUTE_CHANGES:
-                time.sleep(random.uniform(0.02, 0.06))
-                if random.random() < 0.05:
-                    error_count += 1
-                    interface_errors.add(1, attributes={"net.hostname": device["hostname"]})
+    print("\nTier D (sidecar bridge) checks:")
+    check("otel-sidecar.py added to project",
+          os.path.exists(sidecar_path) or any("otel-sidecar" in f for f in new_files))
+    check("Tcl or helper contains HTTP sidecar calls",
+          any(kw in all_text.lower() for kw in
+              ["http::geturl", "otel-sidecar", "start_span", "sidecar", "curl"]))
+    check("Correct Tcl span names referenced",
+          any(n in all_text for n in
+              ["network_change_push", "spawn_ssh", "send_commands",
+               "verify_bgp", "collect_interface_stats", "tcl.network"]))
+    check("Business span attributes referenced (net.*/tcl.*)",
+          any(a in all_text for a in
+              ["net.hostname", "net.platform", "tcl.script", "net.routes_pushed",
+               "net.protocol"]))
 
-        with tracer.start_as_current_span("tcl.expect.verify_bgp", kind=SpanKind.INTERNAL,
-                attributes={"net.hostname": device["hostname"], "net.protocol": "bgp"}):
-            time.sleep(random.uniform(0.05, 0.15))
-            bgp_peers_up = random.randint(2, 8)
-            logger.info("BGP peer state verified",
-                        extra={"net.hostname": device["hostname"], "bgp.peers_up": bgp_peers_up})
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    if os.path.exists(otel_slos):
+        try:
+            check(".otel/slos.json is valid JSON", isinstance(json.load(open(otel_slos)), (list, dict)))
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-        with tracer.start_as_current_span("tcl.expect.collect_interface_stats", kind=SpanKind.INTERNAL,
-                attributes={"net.hostname": device["hostname"],
-                            "net.interfaces_polled": device["interfaces"]}):
-            time.sleep(random.uniform(0.1, 0.3))
+    print("\nStep 5: Starting otel-sidecar.py and sending simulated Tcl payloads")
+    sidecar_py = sidecar_path if os.path.exists(sidecar_path) else SIDECAR_SRC
+    sidecar_env = os.environ.copy()
+    sidecar_env.update({"OTEL_SERVICE_NAME": SVC, "ELASTIC_OTLP_ENDPOINT": ENDPOINT,
+                         "ELASTIC_API_KEY": API_KEY, "OTEL_DEPLOYMENT_ENVIRONMENT": "smoke-test",
+                         "SIDECAR_PORT": str(SIDECAR_PORT)})
+    sidecar_proc = subprocess.Popen(
+        [sys.executable, sidecar_py], env=sidecar_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("net.routes_pushed",    len(ROUTE_CHANGES))
-        span.set_attribute("net.error_count",      error_count)
-        span.set_attribute("tcl.push_duration_ms", round(dur, 2))
+    sidecar_up = False
+    for _ in range(30):
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=b'{"action":"health"}',
+                headers={"Content-Type": "application/json"}, method="POST"), timeout=1)
+            if resp.status == 200:
+                sidecar_up = True; break
+        except Exception:
+            time.sleep(0.3)
+    check("otel-sidecar started and responds to health check", sidecar_up)
 
-        if error_count > 0:
-            span.set_status(StatusCode.ERROR, f"{error_count} command errors")
+    if sidecar_up:
+        print(f"  Sidecar running on port {SIDECAR_PORT}")
+        def post(payload):
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=data, headers={"Content-Type": "application/json"}, method="POST")
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
 
-        devices_configured.add(1, attributes={"net.platform": device["platform"], "net.role": device["role"]})
-        config_push_ms.record(dur, attributes={"net.platform": device["platform"]})
+        DEVICES = [
+            {"hostname": "core-rtr-01.dc1", "ip": "10.0.0.1", "platform": "cisco_ios"},
+            {"hostname": "edge-rtr-03.dc1", "ip": "10.0.0.3", "platform": "cisco_ios_xr"},
+        ]
+        try:
+            for dev in DEVICES:
+                r = post({"action": "start_span", "name": "tcl.network_change_push",
+                           "kind": "internal",
+                           "attributes": {"tcl.script": "push_ospf_routes.tcl",
+                                          "net.hostname": dev["hostname"],
+                                          "net.ip": dev["ip"],
+                                          "net.platform": dev["platform"]}})
+                root_id = r["span_id"]; tp = r["traceparent"]
+                check(f"start_span tcl.network_change_push ({dev['hostname']}) → ok",
+                      r.get("ok") is True, str(r))
+                for step in ["tcl.expect.spawn_ssh", "tcl.expect.send_commands",
+                             "tcl.expect.verify_bgp", "tcl.expect.collect_interface_stats"]:
+                    rs = post({"action": "start_span", "name": step,
+                               "kind": "client" if "ssh" in step else "internal",
+                               "traceparent": tp,
+                               "attributes": {"net.hostname": dev["hostname"]}})
+                    post({"action": "end_span", "span_id": rs["span_id"],
+                          "attributes": {"bgp.peers_up": 4}})
+                post({"action": "end_span", "span_id": root_id,
+                      "attributes": {"net.routes_pushed": 3, "net.error_count": 0}})
+            check(f"Tcl network change spans sent for {len(DEVICES)} devices", True)
+            post({"action": "metric_counter", "name": "tcl.devices_configured",
+                  "value": len(DEVICES), "attributes": {}})
+        except Exception as exc:
+            check("Sidecar payload simulation completed without error", False, str(exc))
 
-        logger.info("device configuration complete",
-                    extra={"net.hostname": device["hostname"], "net.platform": device["platform"],
-                           "net.routes_pushed": len(ROUTE_CHANGES), "net.error_count": error_count,
-                           "tcl.push_duration_ms": round(dur, 2)})
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+        check("Sidecar process still alive", sidecar_proc.poll() is None)
 
-    return error_count
+    if sidecar_proc.poll() is None:
+        sidecar_proc.terminate(); sidecar_proc.wait(timeout=5)
 
-print(f"\n[{SVC}] Simulating Tcl Expect network configuration push script...")
-for device in NETWORK_DEVICES:
-    errs = configure_device(device)
-    icon = "⚠️ " if errs else "✅"
-    print(f"  {icon} {device['hostname']:<28}  {device['platform']:<18}  routes={len(ROUTE_CHANGES)}  errors={errs}")
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+print(f"  Kibana -> APM -> {SVC}")
+if failed:
+    sys.exit(1)

@@ -1,113 +1,273 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier B — Celery task queue (no OTel Celery integration).
+Eval: Tier B — Celery Task Queue (No EDOT Instrumentor)
+========================================================
+Runs `claude -p "Observe this project."` on a blank Celery billing worker
+that has no OTel instrumentation.
 
-Wraps Celery task execution manually by decorating the task function.
-Business scenario: Monthly invoice generation batch — generate PDF invoices,
-email them, record delivery confirmation.
+What this tests:
+  1. The agent reads the blank Celery worker and understands it (invoice
+     generation batch: PDF render, email dispatch, payment reminders).
+  2. The agent correctly assigns Tier B (manual span wrapping — no official
+     EDOT Celery instrumentor; the agent wraps each @app.task function with
+     `with tracer.start_as_current_span(...)`).
+  3. The agent wraps both tasks: generate_invoice and send_payment_reminder.
+  4. The agent adds business enrichment attributes (invoice.*, customer.*,
+     task.*, email.*).
+  5. The agent uses record_exception on error paths.
+  6. The instrumented worker module imports and runs tasks without error.
 
 Run:
     cd smoke-tests && python3 19-tier-b-celery/smoke.py
+
+Requirements:
+  - `claude` CLI installed and authenticated
+  - ELASTIC_OTLP_ENDPOINT and ELASTIC_API_KEY set in .env or environment
 """
 
-import os, sys, uuid, time, random
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
-SVC = "smoke-tier-b-celery"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-task_counter   = meter.create_counter("celery.tasks.executed")
-task_latency   = meter.create_histogram("celery.task.duration_ms", unit="ms")
-invoice_value  = meter.create_histogram("invoice.amount_usd", unit="USD")
+SVC         = "19-tier-b-celery"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-celery-billing")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
-# ── Tier B: Celery task wrapper ───────────────────────────────────────────────
-def celery_task(name, queue="default"):
-    """Wraps a Celery task function — applied once at definition."""
-    def decorator(fn):
-        def wrapped(*args, **kwargs):
-            t0 = time.time()
-            task_id = f"task-{uuid.uuid4().hex[:12]}"
-            with tracer.start_as_current_span(
-                f"celery.task.{name}", kind=SpanKind.SERVER,
-                attributes={"celery.task_name": name, "celery.queue": queue,
-                            "celery.task_id": task_id},
-            ) as span:
-                try:
-                    result = fn(*args, **kwargs)
-                    span.set_attribute("celery.task_status", "success")
-                    task_counter.add(1, attributes={"celery.task_name": name,
-                                                     "celery.status": "success"})
-                    return result
-                except Exception as e:
-                    span.record_exception(e)
-                    span.set_status(StatusCode.ERROR, str(e))
-                    task_counter.add(1, attributes={"celery.task_name": name,
-                                                     "celery.status": "failed"})
-                    raise
-                finally:
-                    task_latency.record((time.time() - t0) * 1000,
-                                        attributes={"celery.task_name": name,
-                                                    "celery.queue": queue})
-        return wrapped
-    return decorator
+CHECKS: list[tuple[str, bool, str]] = []
 
 
-# ── Celery tasks — UNCHANGED ──────────────────────────────────────────────────
-@celery_task("generate_invoice", queue="billing")
-def generate_invoice(customer_id, billing_period, amount):
-    invoice_id = f"INV-{uuid.uuid4().hex[:8].upper()}"
-
-    with tracer.start_as_current_span("invoice.pdf.generate", kind=SpanKind.CLIENT,
-        attributes={"invoice.id": invoice_id, "customer.id": customer_id,
-                    "invoice.amount_usd": amount}) as span:
-        time.sleep(0.03)
-        span.set_attribute("invoice.pages", random.randint(1, 4))
-        span.set_attribute("invoice.format", "pdf")
-
-    with tracer.start_as_current_span("invoice.email.send", kind=SpanKind.CLIENT,
-        attributes={"invoice.id": invoice_id, "customer.id": customer_id}) as span:
-        time.sleep(0.02)
-        delivered = random.random() > 0.05
-        span.set_attribute("email.delivered", delivered)
-        span.set_attribute("email.provider", "sendgrid")
-        if not delivered:
-            span.set_status(StatusCode.ERROR, "email bounce")
-
-    invoice_value.record(amount, attributes={"billing.period": billing_period})
-    logger.info("invoice generated and dispatched",
-                extra={"invoice.id": invoice_id, "customer.id": customer_id,
-                       "invoice.amount_usd": amount, "billing.period": billing_period,
-                       "email.delivered": delivered})
-    return {"invoice_id": invoice_id, "delivered": delivered}
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
 
-invoices = [
-    ("CUST-ENT-001", "2026-02", 4200.00),
-    ("CUST-PRO-042", "2026-02", 99.00),
-    ("CUST-FREE-007","2026-02", 0.00),
-    ("CUST-ENT-002", "2026-02", 8500.00),
-    ("CUST-PRO-015", "2026-02", 99.00),
-]
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-celery-billing (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print(f"  Target:  {ENDPOINT.split('@')[-1].split('/')[0] if '@' in ENDPOINT else ENDPOINT[:40]}")
+print()
 
-print(f"\n[{SVC}] Simulating Celery invoice batch (manual task wrapping)...")
-for customer_id, period, amount in invoices:
-    result = generate_invoice(customer_id, period, amount)
-    icon = "✅" if result["delivered"] else "⚠️ "
-    print(f"  {icon} {customer_id:<18}  ${amount:>8.2f}  "
-          f"invoice={result['invoice_id']}  delivered={result['delivered']}")
+# ── Step 1: Prerequisites ──────────────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture directory exists", os.path.isdir(FIXTURE_DIR))
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    print("Prerequisites failed — cannot continue")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+
+print("  [PASS] all prerequisites met\n")
+
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-19-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        dst = os.path.join(tmpdir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
+
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
+
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
+
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
+
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
+
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
+
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
+
+    # ── Step 4: Inspect the diff ──────────────────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    diff_result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    diff = diff_result.stdout
+
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+
+    print(f"  Modified files (git diff): {len(diff.splitlines())} diff lines")
+    print(f"  New files: {new_files}")
+
+    req_file  = os.path.join(tmpdir, "requirements.txt")
+    app_file  = os.path.join(tmpdir, "app.py")
+
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+
+    print("\nCode correctness checks (Tier B — manual Celery task span wrapping):")
+
+    check("opentelemetry-sdk or opentelemetry-api added to requirements.txt",
+          "opentelemetry-sdk" in req_content or "opentelemetry-api" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("OTLP exporter added to requirements.txt",
+          "opentelemetry-exporter-otlp" in req_content,
+          f"requirements.txt:\n{req_content}")
+
+    check("Manual SERVER spans added to route handlers",
+          "start_as_current_span" in app_content and "SpanKind.SERVER" in app_content,
+          "start_as_current_span with SpanKind.SERVER not found in app.py")
+    check("TracerProvider or OTLPSpanExporter configured",
+          "TracerProvider" in app_content or "OTLPSpanExporter" in app_content,
+          "no tracer setup found in app.py")
+    check("Elastic endpoint configured from env",
+          "ELASTIC_OTLP_ENDPOINT" in app_content or "OTLP_ENDPOINT" in app_content
+          or (ENDPOINT and ENDPOINT.split("//")[1][:20] in app_content),
+          "endpoint not referenced in app.py")
+
+    print("\nBusiness enrichment checks:")
+    check("Business enrichment attributes present",
+          any(attr in app_content for attr in
+              ["invoice.", "customer.", "task.", "payment.", "email.", "billing"]),
+          "no business enrichment attributes (invoice.*, customer.*, task.*) found")
+    check("record_exception used (not add_event)",
+          "record_exception" in app_content,
+          "record_exception not found in app.py")
+
+    # Celery-specific: both tasks should be wrapped
+    print("\nCelery-specific checks:")
+    check("generate_invoice task is instrumented",
+          "generate_invoice" in app_content and "start_as_current_span" in app_content,
+          "generate_invoice + start_as_current_span not both present in app.py")
+    check("send_payment_reminder task is instrumented",
+          "send_payment_reminder" in app_content and "start_as_current_span" in app_content,
+          "send_payment_reminder + start_as_current_span not both present in app.py")
+
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos),
+          f"expected at {otel_slos}")
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden),
+          f"expected at {otel_golden}")
+
+    # ── Step 5: Run the instrumented module ───────────────────────────────────
+    print("\nStep 5: Running the instrumented Celery worker module")
+
+    pip_install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "-r", req_file, "--no-warn-script-location"],
+        capture_output=True, text=True
+    )
+    if pip_install.returncode != 0:
+        check("pip install of generated requirements succeeded",
+              False, pip_install.stderr[-500:])
+    else:
+        check("pip install of generated requirements succeeded", True)
+
+    # Run the module — it executes the __main__ block which calls tasks directly
+    # (task_always_eager=True means tasks run synchronously)
+    run_result = subprocess.run(
+        [sys.executable, app_file],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ,
+             "ELASTIC_OTLP_ENDPOINT": ENDPOINT,
+             "ELASTIC_API_KEY": API_KEY,
+             "CELERY_BROKER_URL": "memory://"},
+    )
+    check("Instrumented Celery worker module runs without error",
+          run_result.returncode == 0,
+          f"stdout: {run_result.stdout[-300:]}\nstderr: {run_result.stderr[-300:]}")
+
+    if run_result.returncode == 0:
+        output = run_result.stdout.strip()
+        print(f"  Module output: {output[:300]}")
+        check("generate_invoice returned invoice_id with INV- prefix",
+              "INV-" in output,
+              f"output: {output[:200]}")
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ─────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

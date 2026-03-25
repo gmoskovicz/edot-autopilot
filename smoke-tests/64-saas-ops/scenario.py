@@ -25,15 +25,14 @@ Run:
 
 import os, sys, uuid, time, random
 from pathlib import Path
+from dotenv import load_dotenv
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
-env_file = Path(__file__).parent.parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from o11y_bootstrap import O11yBootstrap
@@ -41,9 +40,12 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
-API_KEY  = os.environ["ELASTIC_API_KEY"]
-ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+ENV = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+
+CHECKS: list[tuple[str, str, str]] = []
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
 propagator = TraceContextTextMapPropagator()
 
@@ -788,12 +790,9 @@ def run_saas_scenario(scenario: str, tenant: dict):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"\n{'='*70}")
-    print("  B2B SaaS Tenant Provisioning Platform — Distributed Tracing Demo")
-    print("  Services: tenant-portal → billing-service → provisioner")
-    print("            → resource-allocator → dns-manager")
-    print("            → notification-hub → compliance-auditor")
-    print(f"{'='*70}")
+    print(f"\n{'='*62}")
+    print(f"EDOT-Autopilot | B2B SaaS Tenant Provisioning Platform")
+    print(f"{'='*62}")
 
     # 25 scenarios
     scenario_pool = (
@@ -806,40 +805,67 @@ if __name__ == "__main__":
     )
     random.shuffle(scenario_pool)
 
-    stats = {"new_tenant": 0, "plan_upgrade": 0, "payment_failure": 0,
-             "quota_exceeded": 0, "tenant_deactivation": 0,
-             "provisioning_failure": 0, "total": 0}
+    results = []
 
     for i, scenario in enumerate(scenario_pool):
         tenant = random.choice(TENANTS)
 
-        print(f"\n{'─'*70}")
+        print(f"\n{'─'*62}")
         print(f"  Scenario {i+1:02d}/25  [{scenario}]")
-        result = run_saas_scenario(scenario, tenant)
-        stats["total"] += 1
-        stats[scenario] = stats.get(scenario, 0) + 1
+        try:
+            result = run_saas_scenario(scenario, tenant)
+            status = "OK" if result else "WARN"
+            results.append((f"Scenario {i+1:02d}/25 [{scenario}]", status, None))
+        except Exception as e:
+            results.append((f"Scenario {i+1:02d}/25 [{scenario}]", "ERROR", str(e)))
 
         time.sleep(random.uniform(0.1, 0.4))
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*62}")
     print("  Flushing all telemetry providers...")
     for svc in [portal, billing, provisioner, allocator, dns, notifhub, compliance]:
         svc.flush()
 
-    print(f"\n  Results: {stats['total']} scenarios")
-    print(f"    ✅ New provisioning:    {stats['new_tenant']}")
-    print(f"    ⬆️  Plan upgrades:       {stats['plan_upgrade']}")
-    print(f"    ❌ Payment failures:    {stats['payment_failure']}")
-    print(f"    ⚠️  Quota exceeded:      {stats['quota_exceeded']}")
-    print(f"    🗑️  Deactivations:       {stats['tenant_deactivation']}")
-    print(f"    💥 Prov. failures:      {stats['provisioning_failure']}")
+    for scenario_name, status, error_detail in results:
+        if status in ("OK", "WARN"):
+            check(scenario_name, True)
+        else:
+            check(scenario_name, False, error_detail or "")
 
-    print(f"\n  Kibana:")
-    print(f"    Service Map → Observability → APM → Service Map")
-    print(f"    Filter: tenant-portal (7 connected nodes expected)")
-    print(f"\n  ES|QL query:")
-    print(f'    FROM traces-apm*,logs-*')
-    print(f'    | WHERE service.name IN ("tenant-portal","billing-service","provisioner",')
-    print(f'        "resource-allocator","dns-manager","notification-hub","compliance-auditor")')
-    print(f'    | SORT @timestamp DESC | LIMIT 100')
-    print(f"{'='*70}\n")
+    # ── Span assertions: verify instrumentation correctness ──────────────────────
+    # Collect from all o11y instances in this test
+    all_spans = []
+    all_spans += portal.get_finished_spans()
+    all_spans += billing.get_finished_spans()
+    all_spans += provisioner.get_finished_spans()
+    all_spans += allocator.get_finished_spans()
+    all_spans += dns.get_finished_spans()
+    all_spans += notifhub.get_finished_spans()
+    all_spans += compliance.get_finished_spans()
+    print("\nSpan assertions:")
+    check("At least one span captured across all services",
+          len(all_spans) > 0,
+          f"got {len(all_spans)} total spans")
+    server_spans = [s for s in all_spans if s.kind.name == "SERVER"]
+    check("At least one SERVER span emitted",
+          len(server_spans) > 0,
+          f"got {len(server_spans)} SERVER spans")
+    attrs_with_billing = [s for s in all_spans if s.attributes and "billing.subscription_id" in s.attributes]
+    check("At least one span carries billing.subscription_id attribute",
+          len(attrs_with_billing) > 0,
+          f"got {len(attrs_with_billing)} spans with billing.subscription_id")
+    svc_names = {s.resource.attributes.get("service.name") for s in all_spans}
+    check("All 7 SaaS services emitted spans",
+          len(svc_names) >= 7,
+          f"services with spans: {svc_names}")
+
+    passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+    failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+    if failed:
+        sys.exit(1)

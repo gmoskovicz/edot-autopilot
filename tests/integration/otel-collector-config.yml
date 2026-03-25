@@ -1,0 +1,45 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 100
+
+exporters:
+  # Write all signals to files for offline validation — no Elastic required.
+  file/traces:
+    path: /output/traces.jsonl
+    rotation:
+      max_megabytes: 10
+  file/metrics:
+    path: /output/metrics.jsonl
+    rotation:
+      max_megabytes: 10
+  file/logs:
+    path: /output/logs.jsonl
+    rotation:
+      max_megabytes: 10
+  # Debug exporter for CI log visibility
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/traces, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/logs]

@@ -1,151 +1,190 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — PyMongo client (monkey-patched).
+E2E "Observe this project." — Tier C: pymongo
+==============================================
+Runs `claude -p "Observe this project."` on a blank product catalog service
+that uses pymongo to manage MongoDB documents.
 
-Patches Collection.insert_one / find / update_one.
-Business scenario: Product catalog service — seasonal price updates,
-stock level writes, search index sync.
+EDOT Autopilot workflow:
+  1. Reads blank fixture — finds MongoClient with insert_one / find / update_one
+  2. Assigns Tier C (monkey-patch) — no official opentelemetry-instrumentation-pymongo
+  3. Wraps collection methods with CLIENT spans
+  4. Adds business attributes: db.system=mongodb, db.mongodb.collection, db.operation
 
 Run:
     cd smoke-tests && python3 25-tier-c-pymongo/smoke.py
 """
 
-import os, sys, uuid, time, random
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-SVC = "smoke-tier-c-pymongo"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "25-tier-c-pymongo"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-pymongo")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-mongo_ops    = meter.create_counter("mongodb.operations")
-mongo_latency= meter.create_histogram("mongodb.operation_ms", unit="ms")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
-_collections = {}
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-pymongo (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print()
 
-class _MockCollection:
-    def __init__(self, name, db_name):
-        self.name    = name
-        self.db_name = db_name
-        if name not in _collections:
-            _collections[name] = {}
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture dir exists", os.path.isdir(FIXTURE_DIR), FIXTURE_DIR)
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-    def insert_one(self, document):
-        time.sleep(0.01)
-        doc_id = str(uuid.uuid4())
-        _collections[self.name][doc_id] = {**document, "_id": doc_id}
-        return type("InsertResult", (), {"inserted_id": doc_id})()
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-    def find(self, filter_=None, **kwargs):
-        time.sleep(0.015)
-        docs = list(_collections.get(self.name, {}).values())
-        return docs
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-pymongo-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
 
-    def update_one(self, filter_, update, upsert=False):
-        time.sleep(0.012)
-        matched = len(_collections.get(self.name, {})) > 0
-        return type("UpdateResult", (), {"matched_count": 1 if matched else 0,
-                                         "modified_count": 1 if matched else 0})()
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-class _MockDatabase:
-    def __init__(self, name):
-        self.name = name
-    def __getitem__(self, collection_name):
-        return _MockCollection(collection_name, self.name)
-    def get_collection(self, name):
-        return _MockCollection(name, self.name)
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-class _MockClient:
-    def __init__(self, *args, **kwargs): pass
-    def __getitem__(self, db_name):
-        return _MockDatabase(db_name)
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-class pymongo:
-    MongoClient = _MockClient
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
 
-
-_orig_insert = _MockCollection.insert_one
-_orig_find   = _MockCollection.find
-_orig_update = _MockCollection.update_one
-
-def _inst_insert(self, document):
     t0 = time.time()
-    with tracer.start_as_current_span("mongodb.insert_one", kind=SpanKind.CLIENT,
-        attributes={"db.system": "mongodb", "db.name": self.db_name,
-                    "db.mongodb.collection": self.name, "db.operation": "insert"}) as span:
-        result = _orig_insert(self, document)
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("db.mongodb.inserted_id", str(result.inserted_id))
-        mongo_ops.add(1, attributes={"db.operation": "insert", "db.mongodb.collection": self.name})
-        mongo_latency.record(dur, attributes={"db.operation": "insert"})
-        return result
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
-def _inst_find(self, filter_=None, **kwargs):
-    t0 = time.time()
-    with tracer.start_as_current_span("mongodb.find", kind=SpanKind.CLIENT,
-        attributes={"db.system": "mongodb", "db.name": self.db_name,
-                    "db.mongodb.collection": self.name, "db.operation": "find"}) as span:
-        results = _orig_find(self, filter_, **kwargs)
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("db.mongodb.result_count", len(results))
-        mongo_ops.add(1, attributes={"db.operation": "find", "db.mongodb.collection": self.name})
-        mongo_latency.record(dur, attributes={"db.operation": "find"})
-        return results
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
-def _inst_update(self, filter_, update, upsert=False):
-    t0 = time.time()
-    with tracer.start_as_current_span("mongodb.update_one", kind=SpanKind.CLIENT,
-        attributes={"db.system": "mongodb", "db.name": self.db_name,
-                    "db.mongodb.collection": self.name, "db.operation": "update",
-                    "db.mongodb.upsert": upsert}) as span:
-        result = _inst_update.__wrapped__(self, filter_, update, upsert)
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("db.mongodb.matched_count",  result.matched_count)
-        span.set_attribute("db.mongodb.modified_count", result.modified_count)
-        mongo_ops.add(1, attributes={"db.operation": "update", "db.mongodb.collection": self.name})
-        mongo_latency.record(dur, attributes={"db.operation": "update"})
-        return result
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-_inst_update.__wrapped__ = _orig_update
-_MockCollection.insert_one = _inst_insert
-_MockCollection.find       = _inst_find
-_MockCollection.update_one = _inst_update
+    # ── Step 4: Inspect what the agent changed ────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+    print(f"  New files: {new_files}")
 
+    app_file = os.path.join(tmpdir, "app.py")
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
 
-def apply_seasonal_discount(category, discount_pct):
-    client   = pymongo.MongoClient("mongodb://catalog-db:27017")
-    products = client["catalog"]["products"]
-    existing = products.find({"category": category})
+    print("\nTier C monkey-patch checks:")
+    check("opentelemetry added to requirements.txt",
+          "opentelemetry" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SDK client method monkey-patched (Tier C)",
+          "_orig_" in app_content or "functools.wraps" in app_content
+          or "= original_" in app_content,
+          "no monkey-patch pattern found")
+    check("SpanKind.CLIENT on SDK calls",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("Business attributes on spans",
+          any(attr in app_content for attr in [
+              "mongo.", "db.system", "mongodb", "db.mongodb", "db.name",
+          ]),
+          "no MongoDB db.* attributes found in app.py")
+    check("Collection method (insert_one / find / update_one) patched",
+          any(m in app_content for m in ["insert_one", "find", "update_one"]) and (
+              "_orig_" in app_content or "wrap" in app_content.lower()
+          ),
+          "collection method patch not detected")
 
-    for product in existing:
-        new_price = round(product.get("price_usd", 100) * (1 - discount_pct / 100), 2)
-        products.update_one({"_id": product["_id"]}, {"$set": {"price_usd": new_price,
-                                                                "discount_pct": discount_pct}})
-        logger.info("product price updated",
-                    extra={"product.sku": product.get("sku", ""), "product.category": category,
-                           "discount.pct": discount_pct, "product.new_price_usd": new_price})
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-    products.insert_one({"sku": f"SKU-{uuid.uuid4().hex[:6].upper()}", "category": category,
-                          "price_usd": 49.99, "discount_pct": discount_pct,
-                          "name": f"New {category} item"})
-    print(f"  ✅ {category:<15}  discount={discount_pct}%  updated={len(existing)} products")
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-
-print(f"\n[{SVC}] Product catalog operations via patched PyMongo...")
-apply_seasonal_discount("electronics",  15)
-apply_seasonal_discount("clothing",     25)
-apply_seasonal_discount("home-goods",   10)
-
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+# ── Final summary ──────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

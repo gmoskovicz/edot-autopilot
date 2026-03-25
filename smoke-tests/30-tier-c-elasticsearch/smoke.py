@@ -1,134 +1,191 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — elasticsearch-py client (monkey-patched).
+E2E "Observe this project." — Tier C: elasticsearch-py
+=======================================================
+Runs `claude -p "Observe this project."` on a blank product search sync service
+that uses the elasticsearch-py client to index, search, and update documents.
 
-Patches Elasticsearch.index / search / update.
-Business scenario: Product search index — index new products, search by
-category, update stock levels.
+EDOT Autopilot workflow:
+  1. Reads blank fixture — finds Elasticsearch().index / search / update
+  2. Assigns Tier C (monkey-patch) — no standalone OTel instrumentation package
+  3. Wraps index, search, update with CLIENT spans
+  4. Adds business attributes: db.system=elasticsearch, elasticsearch.index, db.operation
 
 Run:
     cd smoke-tests && python3 30-tier-c-elasticsearch/smoke.py
 """
 
-import os, sys, uuid, time, random
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-SVC = "smoke-tier-c-elasticsearch"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "30-tier-c-elasticsearch"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-elasticsearch")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-es_ops    = meter.create_counter("elasticsearch.operations")
-es_latency= meter.create_histogram("elasticsearch.operation_ms", unit="ms")
-es_hits   = meter.create_histogram("elasticsearch.search_hits")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
-_index_store = {}
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-elasticsearch (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print()
 
-class _MockES:
-    def __init__(self, hosts=None, **kwargs): pass
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture dir exists", os.path.isdir(FIXTURE_DIR), FIXTURE_DIR)
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-    def index(self, index, body, id=None, **kwargs):
-        time.sleep(0.015)
-        doc_id = id or uuid.uuid4().hex
-        _index_store.setdefault(index, {})[doc_id] = {**body, "_id": doc_id}
-        return {"_id": doc_id, "_index": index, "result": "created", "_shards": {"successful": 1}}
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-    def search(self, index, body, **kwargs):
-        time.sleep(0.02)
-        docs = list(_index_store.get(index, {}).values())[:5]
-        return {"hits": {"total": {"value": len(docs)},
-                         "hits": [{"_source": d, "_id": d["_id"]} for d in docs]}}
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-elasticsearch-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
 
-    def update(self, index, id, body, **kwargs):
-        time.sleep(0.012)
-        if index in _index_store and id in _index_store[index]:
-            _index_store[index][id].update(body.get("doc", {}))
-        return {"_id": id, "result": "updated", "_shards": {"successful": 1}}
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-class Elasticsearch:
-    def __new__(cls, *args, **kwargs):
-        return _MockES(*args, **kwargs)
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-_orig_index  = _MockES.index
-_orig_search = _MockES.search
-_orig_update = _MockES.update
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
 
-def _inst_index(self, index, body, id=None, **kwargs):
     t0 = time.time()
-    with tracer.start_as_current_span("elasticsearch.index", kind=SpanKind.CLIENT,
-        attributes={"db.system": "elasticsearch", "elasticsearch.index": index,
-                    "db.operation": "index"}) as span:
-        result = _orig_index(self, index, body, id, **kwargs)
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("elasticsearch.doc_id",     result["_id"])
-        span.set_attribute("elasticsearch.result",     result["result"])
-        es_ops.add(1, attributes={"elasticsearch.operation": "index", "elasticsearch.index": index})
-        es_latency.record(dur, attributes={"elasticsearch.operation": "index"})
-        return result
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
-def _inst_search(self, index, body, **kwargs):
-    t0 = time.time()
-    with tracer.start_as_current_span("elasticsearch.search", kind=SpanKind.CLIENT,
-        attributes={"db.system": "elasticsearch", "elasticsearch.index": index,
-                    "db.operation": "search"}) as span:
-        result = _orig_search(self, index, body, **kwargs)
-        hits = result["hits"]["total"]["value"]
-        dur  = (time.time() - t0) * 1000
-        span.set_attribute("elasticsearch.hits_total", hits)
-        es_ops.add(1, attributes={"elasticsearch.operation": "search", "elasticsearch.index": index})
-        es_latency.record(dur, attributes={"elasticsearch.operation": "search"})
-        es_hits.record(hits, attributes={"elasticsearch.index": index})
-        return result
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
-def _inst_update(self, index, id, body, **kwargs):
-    t0 = time.time()
-    with tracer.start_as_current_span("elasticsearch.update", kind=SpanKind.CLIENT,
-        attributes={"db.system": "elasticsearch", "elasticsearch.index": index,
-                    "db.operation": "update", "elasticsearch.doc_id": id}) as span:
-        result = _orig_update(self, index, id, body, **kwargs)
-        es_ops.add(1, attributes={"elasticsearch.operation": "update", "elasticsearch.index": index})
-        es_latency.record((time.time() - t0) * 1000, attributes={"elasticsearch.operation": "update"})
-        return result
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-_MockES.index  = _inst_index
-_MockES.search = _inst_search
-_MockES.update = _inst_update
+    # ── Step 4: Inspect what the agent changed ────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+    print(f"  New files: {new_files}")
 
+    app_file = os.path.join(tmpdir, "app.py")
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
 
-def sync_product_catalog(products):
-    es = Elasticsearch(hosts=["https://search.internal:9200"])
-    for product in products:
-        result = es.index(index="products", body=product, id=product["sku"])
-        logger.info("product indexed", extra={"product.sku": product["sku"],
-                    "product.category": product["category"], "es.doc_id": result["_id"]})
+    print("\nTier C monkey-patch checks:")
+    check("opentelemetry added to requirements.txt",
+          "opentelemetry" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SDK client method monkey-patched (Tier C)",
+          "_orig_" in app_content or "functools.wraps" in app_content
+          or "= original_" in app_content,
+          "no monkey-patch pattern found")
+    check("SpanKind.CLIENT on SDK calls",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("Business attributes on spans",
+          any(attr in app_content for attr in [
+              "elasticsearch.", "db.system", "elasticsearch.index",
+              "db.operation", "es.index",
+          ]),
+          "no elasticsearch.* attributes found in app.py")
+    check("index / search / update is patched",
+          any(m in app_content for m in ["def index", "def search", "def update"]) and (
+              "_orig_" in app_content or "wrap" in app_content.lower()
+          ),
+          "elasticsearch method patch not detected")
 
-    results = es.search(index="products", body={"query": {"match_all": {}}})
-    print(f"  ✅ indexed {len(products)} products, found {results['hits']['total']['value']} in index")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-    for doc in results["hits"]["hits"]:
-        es.update(index="products", id=doc["_id"], body={"doc": {"stock_updated": True}})
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-
-products = [
-    {"sku": "SKU-A001", "name": "Widget Pro",   "category": "electronics", "price_usd": 299.99, "stock": 48,  "_id": "SKU-A001"},
-    {"sku": "SKU-B002", "name": "Gadget Plus",  "category": "electronics", "price_usd": 149.99, "stock": 120, "_id": "SKU-B002"},
-    {"sku": "SKU-C003", "name": "Component X",  "category": "components",  "price_usd": 12.50,  "stock": 500, "_id": "SKU-C003"},
-]
-
-print(f"\n[{SVC}] Product catalog via patched elasticsearch-py...")
-sync_product_catalog(products)
-
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+# ── Final summary ──────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

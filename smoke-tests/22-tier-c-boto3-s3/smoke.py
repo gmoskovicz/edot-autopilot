@@ -1,133 +1,190 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — AWS SDK (boto3) S3 client (monkey-patched).
+E2E "Observe this project." — Tier C: boto3 S3
+================================================
+Runs `claude -p "Observe this project."` on a blank document archival service
+that uses boto3 to store customer contracts in S3.
 
-Patches boto3.client.put_object / get_object — existing call sites unchanged.
-Business scenario: Document archival service — upload customer contracts to S3,
-verify checksums, generate presigned URLs.
+EDOT Autopilot workflow:
+  1. Reads blank fixture — finds boto3.client("s3") with put_object / get_object
+  2. Assigns Tier C (monkey-patch) — no official opentelemetry-instrumentation-boto3
+  3. Wraps put_object and get_object with CLIENT spans
+  4. Adds business attributes: aws.s3.bucket, aws.s3.key, aws.s3.content_length
 
 Run:
     cd smoke-tests && python3 22-tier-c-boto3-s3/smoke.py
 """
 
-import os, sys, uuid, time, hashlib, random
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-SVC = "smoke-tier-c-boto3-s3"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "22-tier-c-boto3-s3"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-boto3-s3")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-s3_puts    = meter.create_counter("aws.s3.put_objects")
-s3_gets    = meter.create_counter("aws.s3.get_objects")
-s3_latency = meter.create_histogram("aws.s3.operation_ms", unit="ms")
-s3_bytes   = meter.create_histogram("aws.s3.object_bytes", unit="bytes")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-# ── Mock boto3 S3 client ──────────────────────────────────────────────────────
-class _MockS3Client:
-    def put_object(self, **kwargs):
-        time.sleep(0.04)
-        body = kwargs.get("Body", b"")
-        return {"ETag": f'"{hashlib.md5(body).hexdigest()}"',
-                "VersionId": uuid.uuid4().hex}
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-boto3-s3 (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print()
 
-    def get_object(self, **kwargs):
-        time.sleep(0.02)
-        content = b"contract-pdf-content-stub"
-        return {"Body": type("Body", (), {"read": lambda self: content})(),
-                "ContentLength": len(content),
-                "ETag": f'"{hashlib.md5(content).hexdigest()}"'}
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture dir exists", os.path.isdir(FIXTURE_DIR), FIXTURE_DIR)
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-    def generate_presigned_url(self, operation, Params, ExpiresIn=3600):
-        key = Params.get("Key", "")
-        return f"https://s3.amazonaws.com/{Params.get('Bucket')}/{key}?X-Amz-Expires={ExpiresIn}&sig=abc123"
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-class boto3:
-    @staticmethod
-    def client(service, **kwargs):
-        return _MockS3Client()
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-boto3-s3-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
 
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-# ── Tier C: patch put_object and get_object ───────────────────────────────────
-_orig_put = _MockS3Client.put_object
-_orig_get = _MockS3Client.get_object
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-def _instrumented_put(self, **kwargs):
-    t0     = time.time()
-    bucket = kwargs.get("Bucket", "")
-    key    = kwargs.get("Key", "")
-    body   = kwargs.get("Body", b"")
-    size   = len(body) if isinstance(body, bytes) else 0
-    with tracer.start_as_current_span("aws.s3.put_object", kind=SpanKind.CLIENT,
-        attributes={"aws.s3.bucket": bucket, "aws.s3.key": key,
-                    "aws.s3.content_length": size, "aws.service": "s3",
-                    "aws.operation": "PutObject"}) as span:
-        result = _orig_put(self, **kwargs)
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("aws.s3.etag", result["ETag"])
-        s3_puts.add(1, attributes={"aws.s3.bucket": bucket})
-        s3_latency.record(dur, attributes={"aws.s3.operation": "put"})
-        s3_bytes.record(size,  attributes={"aws.s3.operation": "put"})
-        logger.info("S3 object uploaded", extra={"aws.s3.bucket": bucket, "aws.s3.key": key,
-                    "aws.s3.etag": result["ETag"], "aws.s3.content_length": size})
-        return result
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-def _instrumented_get(self, **kwargs):
-    t0     = time.time()
-    bucket = kwargs.get("Bucket", "")
-    key    = kwargs.get("Key", "")
-    with tracer.start_as_current_span("aws.s3.get_object", kind=SpanKind.CLIENT,
-        attributes={"aws.s3.bucket": bucket, "aws.s3.key": key,
-                    "aws.service": "s3", "aws.operation": "GetObject"}) as span:
-        result = _orig_get(self, **kwargs)
-        dur  = (time.time() - t0) * 1000
-        size = result.get("ContentLength", 0)
-        span.set_attribute("aws.s3.content_length", size)
-        span.set_attribute("aws.s3.etag", result.get("ETag", ""))
-        s3_gets.add(1, attributes={"aws.s3.bucket": bucket})
-        s3_latency.record(dur,  attributes={"aws.s3.operation": "get"})
-        s3_bytes.record(size,   attributes={"aws.s3.operation": "get"})
-        logger.info("S3 object downloaded", extra={"aws.s3.bucket": bucket, "aws.s3.key": key,
-                    "aws.s3.content_length": size})
-        return result
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
 
-_MockS3Client.put_object = _instrumented_put   # ← patch
-_MockS3Client.get_object = _instrumented_get   # ← patch
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
-# ── Existing application code — ZERO CHANGES ─────────────────────────────────
-def archive_contract(customer_id, doc_type, content):
-    s3 = boto3.client("s3", region_name="us-east-1")
-    key = f"contracts/{customer_id}/{doc_type}-{uuid.uuid4().hex[:8]}.pdf"
-    s3.put_object(Bucket="company-contracts-prod", Key=key, Body=content)
-    s3.get_object(Bucket="company-contracts-prod", Key=key)
-    url = s3.generate_presigned_url("get_object",
-        Params={"Bucket": "company-contracts-prod", "Key": key}, ExpiresIn=86400)
-    return {"key": key, "presigned_url": url}
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
+    # ── Step 4: Inspect what the agent changed ────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+    print(f"  New files: {new_files}")
 
-contracts = [
-    ("CUST-ENT-001", "master-services-agreement", b"MSA PDF content... " * 100),
-    ("CUST-PRO-042", "subscription-agreement",    b"Sub agreement PDF..." * 50),
-    ("CUST-ENT-002", "data-processing-addendum",  b"DPA PDF content..." * 80),
-    ("CUST-FREE-007","terms-of-service",           b"TOS PDF content..." * 20),
-]
+    app_file = os.path.join(tmpdir, "app.py")
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
 
-print(f"\n[{SVC}] Archiving contracts via patched boto3 S3...")
-for cust, doc_type, content in contracts:
-    result = archive_contract(cust, doc_type, content)
-    print(f"  ✅ {cust:<18}  {doc_type:<30}  key={result['key'].split('/')[-1]}")
+    print("\nTier C monkey-patch checks:")
+    check("opentelemetry added to requirements.txt",
+          "opentelemetry" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SDK client method monkey-patched (Tier C)",
+          "_orig_" in app_content or "functools.wraps" in app_content
+          or "= original_" in app_content,
+          "no monkey-patch pattern found")
+    check("SpanKind.CLIENT on SDK calls",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("Business attributes on spans",
+          any(attr in app_content for attr in [
+              "aws.s3.", "s3.bucket", "s3.key", "aws.service",
+          ]),
+          "no aws.s3.* attributes found in app.py")
+    check("put_object or get_object is patched",
+          "put_object" in app_content and (
+              "_orig_" in app_content or "wrap" in app_content.lower()
+          ),
+          "put_object patch not detected")
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ──────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

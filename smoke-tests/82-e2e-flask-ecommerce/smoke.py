@@ -328,6 +328,7 @@ for status, name, detail in CHECKS:
     print(line)
 print(f"\n  Result: {passed}/{total} checks passed")
 if failed:
-    print(f"  WARN: {failed} check(s) failed — auto-instrumentation may need package install")
-    print("  Run: pip install opentelemetry-instrumentation-flask "
+    print(f"  FAIL: {failed} check(s) failed")
+    print("  Required: pip install opentelemetry-instrumentation-flask "
           "opentelemetry-instrumentation-sqlalchemy opentelemetry-instrumentation-requests")
+    sys.exit(1)

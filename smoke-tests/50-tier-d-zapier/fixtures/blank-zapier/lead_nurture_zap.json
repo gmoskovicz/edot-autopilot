@@ -1,0 +1,102 @@
+{
+  "zap": {
+    "id": "ZAP-48291",
+    "title": "SF Lead → Enrich → HubSpot → Slack → Mailchimp",
+    "description": "Multi-step lead nurturing automation. Triggered when a new lead is created in Salesforce. Enriches via Clearbit, creates/updates a HubSpot contact, sends a Slack notification to #sales-alerts, and adds the lead to the correct Mailchimp nurture sequence.",
+    "status": "on",
+    "created_at": "2024-11-12T09:30:00Z",
+    "updated_at": "2026-01-15T14:22:00Z",
+    "owner": "marketing-ops@company.com"
+  },
+  "trigger": {
+    "app": "Salesforce",
+    "event": "New Lead",
+    "description": "Fires when a new Lead record is created in Salesforce CRM.",
+    "config": {
+      "object": "Lead",
+      "filter_formula": "LeadSource IN ('webinar', 'demo_request', 'referral', 'paid_search')"
+    }
+  },
+  "steps": [
+    {
+      "step_no": 1,
+      "app": "Salesforce",
+      "action": "Find Lead",
+      "description": "Look up the full lead record (including custom fields) by ID from the trigger payload.",
+      "config": {
+        "object": "Lead",
+        "search_field": "Id",
+        "search_value": "{{trigger.LeadId}}"
+      },
+      "output_fields": ["Id", "FirstName", "LastName", "Email", "Company",
+                        "Title", "LeadSource", "Phone", "AnnualRevenue",
+                        "NumberOfEmployees", "Industry"]
+    },
+    {
+      "step_no": 2,
+      "app": "Clearbit",
+      "action": "Enrich Person",
+      "description": "Enrich the lead's email with Clearbit Enrichment API to get company size, funding stage, job seniority, and technology stack.",
+      "config": {
+        "email": "{{step_1.Email}}",
+        "company_domain": "{{step_1.Company}}"
+      },
+      "output_fields": ["person.name.fullName", "person.employment.title",
+                        "person.employment.seniority", "company.name",
+                        "company.metrics.employees", "company.category.industry",
+                        "company.crunchbase.handle"]
+    },
+    {
+      "step_no": 3,
+      "app": "HubSpot",
+      "action": "Create/Update Contact",
+      "description": "Upsert the enriched contact in HubSpot CRM using email as the unique key. Sets lead score and assigns to appropriate sales pipeline.",
+      "config": {
+        "email": "{{step_1.Email}}",
+        "properties": {
+          "firstname":        "{{step_1.FirstName}}",
+          "lastname":         "{{step_1.LastName}}",
+          "company":          "{{step_2.company.name}}",
+          "jobtitle":         "{{step_2.person.employment.title}}",
+          "hs_lead_status":   "NEW",
+          "lead_source":      "{{step_1.LeadSource}}",
+          "clearbit_seniority": "{{step_2.person.employment.seniority}}",
+          "num_employees":    "{{step_2.company.metrics.employees}}"
+        }
+      }
+    },
+    {
+      "step_no": 4,
+      "app": "Slack",
+      "action": "Send Channel Message",
+      "description": "Post a formatted notification to the #sales-alerts Slack channel with lead details and CRM links.",
+      "config": {
+        "channel": "#sales-alerts",
+        "message": ":bell: *New Lead*: {{step_1.FirstName}} {{step_1.LastName}} ({{step_1.Title}} @ {{step_2.company.name}})\nSource: {{step_1.LeadSource}} | Employees: {{step_2.company.metrics.employees}}\n<https://app.hubspot.com/contacts/{{step_3.vid}}|View in HubSpot>"
+      }
+    },
+    {
+      "step_no": 5,
+      "app": "Mailchimp",
+      "action": "Add/Update Subscriber",
+      "description": "Add the lead to the appropriate Mailchimp nurture audience based on lead source and company size. Tags are applied for segmentation.",
+      "config": {
+        "audience_id": "f3a9c2b1d0",
+        "email_address": "{{step_1.Email}}",
+        "status": "subscribed",
+        "merge_fields": {
+          "FNAME":    "{{step_1.FirstName}}",
+          "LNAME":    "{{step_1.LastName}}",
+          "COMPANY":  "{{step_2.company.name}}"
+        },
+        "tags": ["{{step_1.LeadSource}}", "new-lead-2026"]
+      }
+    }
+  ],
+  "error_handling": {
+    "on_step_failure": "continue",
+    "notify_email": "zapier-errors@company.com",
+    "max_retries": 3,
+    "retry_delay_seconds": 60
+  }
+}

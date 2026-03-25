@@ -1,132 +1,190 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — httpx HTTP client (monkey-patched).
+E2E "Observe this project." — Tier C: httpx
+============================================
+Runs `claude -p "Observe this project."` on a blank currency exchange rate
+fetcher that uses httpx to call an FX API and cache rates.
 
-Patches httpx.Client.get and .post — existing call sites unchanged.
-Business scenario: Currency exchange rate fetcher — call FX API,
-parse rates, store to cache.
+EDOT Autopilot workflow:
+  1. Reads blank fixture — finds httpx.Client with .get() and .post()
+  2. Assigns Tier C (monkey-patch) — no official opentelemetry-instrumentation-httpx
+  3. Wraps Client.get and Client.post with CLIENT spans
+  4. Adds business attributes: http.method, http.url, http.status_code
 
 Run:
     cd smoke-tests && python3 27-tier-c-httpx/smoke.py
 """
 
-import os, sys, uuid, time, random
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-SVC = "smoke-tier-c-httpx"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "27-tier-c-httpx"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-httpx")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-http_counter = meter.create_counter("httpx.requests")
-http_latency = meter.create_histogram("httpx.response_ms", unit="ms")
-http_errors  = meter.create_counter("httpx.errors")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
-FX_RATES = {"USD/EUR": 0.92, "USD/GBP": 0.79, "USD/JPY": 149.8, "USD/BRL": 5.07, "EUR/USD": 1.09}
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-httpx (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print()
 
-class _MockResponse:
-    def __init__(self, status_code, json_data, url):
-        self.status_code = status_code
-        self._json       = json_data
-        self.url         = url
-        self.headers     = {"content-type": "application/json", "x-request-id": uuid.uuid4().hex}
-    def json(self):
-        return self._json
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise Exception(f"HTTP {self.status_code}")
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture dir exists", os.path.isdir(FIXTURE_DIR), FIXTURE_DIR)
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-class _MockHttpxClient:
-    def get(self, url, **kwargs):
-        time.sleep(random.uniform(0.02, 0.08))
-        if random.random() < 0.05:
-            raise Exception(f"httpx.ConnectTimeout connecting to {url}")
-        pair = url.split("?")[0].split("/")[-1]
-        rate = FX_RATES.get(pair, 1.0) * random.uniform(0.998, 1.002)
-        return _MockResponse(200, {"pair": pair, "rate": round(rate, 4),
-                                    "timestamp": int(time.time())}, url)
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-    def post(self, url, **kwargs):
-        time.sleep(random.uniform(0.01, 0.04))
-        return _MockResponse(201, {"stored": True, "key": kwargs.get("json", {}).get("key")}, url)
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-httpx-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
 
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-class httpx:
-    Client = _MockHttpxClient
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-_orig_get  = _MockHttpxClient.get
-_orig_post = _MockHttpxClient.post
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
 
-def _inst_get(self, url, **kwargs):
     t0 = time.time()
-    with tracer.start_as_current_span("httpx.get", kind=SpanKind.CLIENT,
-        attributes={"http.method": "GET", "http.url": url,
-                    "http.client": "httpx"}) as span:
-        try:
-            resp = _orig_get(self, url, **kwargs)
-            dur = (time.time() - t0) * 1000
-            span.set_attribute("http.status_code",    resp.status_code)
-            span.set_attribute("http.response_ms",    round(dur, 2))
-            http_counter.add(1, attributes={"http.method": "GET", "http.status": str(resp.status_code)})
-            http_latency.record(dur, attributes={"http.method": "GET"})
-            return resp
-        except Exception as e:
-            span.set_status(StatusCode.ERROR, str(e))
-            http_errors.add(1, attributes={"http.method": "GET"})
-            logger.error("httpx GET failed", extra={"http.url": url, "error.message": str(e)})
-            raise
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
-def _inst_post(self, url, **kwargs):
-    t0 = time.time()
-    with tracer.start_as_current_span("httpx.post", kind=SpanKind.CLIENT,
-        attributes={"http.method": "POST", "http.url": url, "http.client": "httpx"}) as span:
-        resp = _orig_post(self, url, **kwargs)
-        dur  = (time.time() - t0) * 1000
-        span.set_attribute("http.status_code", resp.status_code)
-        http_counter.add(1, attributes={"http.method": "POST", "http.status": str(resp.status_code)})
-        http_latency.record(dur, attributes={"http.method": "POST"})
-        return resp
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
-_MockHttpxClient.get  = _inst_get
-_MockHttpxClient.post = _inst_post
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
+    # ── Step 4: Inspect what the agent changed ────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+    print(f"  New files: {new_files}")
 
-def fetch_fx_rate(base, quote):
-    with httpx.Client() as client:
-        resp = client.get(f"https://api.fx-provider.io/v2/rates/{base}/{quote}",
-                          headers={"Authorization": "Bearer fx-api-key"})
-        resp.raise_for_status()
-        data = resp.json()
-        client.post("https://api.fx-provider.io/v2/cache/store",
-                    json={"key": f"fx:{base}:{quote}", "value": data["rate"], "ttl": 300})
-        logger.info("FX rate fetched and cached",
-                    extra={"fx.base_currency": base, "fx.quote_currency": quote,
-                           "fx.rate": data["rate"], "fx.cache_ttl_sec": 300})
-        return data["rate"]
+    app_file = os.path.join(tmpdir, "app.py")
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
 
+    print("\nTier C monkey-patch checks:")
+    check("opentelemetry added to requirements.txt",
+          "opentelemetry" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SDK client method monkey-patched (Tier C)",
+          "_orig_" in app_content or "functools.wraps" in app_content
+          or "= original_" in app_content,
+          "no monkey-patch pattern found")
+    check("SpanKind.CLIENT on SDK calls",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("Business attributes on spans",
+          any(attr in app_content for attr in [
+              "http.method", "http.url", "http.status", "http.client",
+          ]),
+          "no http.* attributes found in app.py")
+    check("Client.get or Client.post is patched",
+          ("def" in app_content and "get" in app_content) and (
+              "_orig_" in app_content or "wrap" in app_content.lower()
+          ),
+          "httpx.Client.get patch not detected")
 
-print(f"\n[{SVC}] Fetching FX rates via patched httpx client...")
-pairs = [("USD", "EUR"), ("USD", "GBP"), ("USD", "JPY"), ("EUR", "USD"), ("USD", "BRL")]
-for base, quote in pairs:
-    try:
-        rate = fetch_fx_rate(base, quote)
-        print(f"  ✅ {base}/{quote}  rate={rate:.4f}")
-    except Exception as e:
-        print(f"  🚫 {base}/{quote}  error={e}")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ──────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

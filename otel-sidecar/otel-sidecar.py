@@ -205,13 +205,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
             for k, v in body.get("attributes", {}).items():
                 span.set_attribute(k, v)
             if err := body.get("error"):
-                span.set_attribute("error.type", "unknown")
-                span.add_event("exception", {
-                    "exception.message": err,
-                    "exception.type": "unknown",
-                    "exception.escaped": True,
-                })
-                span.set_status(trace.StatusCode.ERROR)
+                _exc = RuntimeError(err)
+                span.set_attribute("error.type", "RuntimeError")
+                span.record_exception(_exc, attributes={"exception.escaped": True})
+                span.set_status(trace.StatusCode.ERROR, description=err)
             span.end()
             if ctx_token is not None:
                 detach(ctx_token)
@@ -277,13 +274,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
         kind  = _KIND_MAP.get(body.get("kind", "internal"), trace.SpanKind.INTERNAL)
         with tracer.start_as_current_span(name, kind=kind, attributes=attrs) as span:
             if err := body.get("error"):
-                span.set_attribute("error.type", "unknown")
-                span.add_event("exception", {
-                    "exception.message": err,
-                    "exception.type": "unknown",
-                    "exception.escaped": True,
-                })
-                span.set_status(trace.StatusCode.ERROR)
+                _exc = RuntimeError(err)
+                span.set_attribute("error.type", "RuntimeError")
+                span.record_exception(_exc, attributes={"exception.escaped": True})
+                span.set_status(trace.StatusCode.ERROR, description=err)
         log.info("event name=%s", name)
         self._respond(200, {"ok": True})
 

@@ -1,133 +1,216 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier D — Ada safety-critical systems (sidecar simulation).
-
-Simulates an Ada program in an avionics context submitting observability via the
-HTTP sidecar bridge. Business scenario: flight management system health monitor —
-track sensor input validity, navigation accuracy, fuel calculations,
-and autopilot mode transitions.
+E2E "Observe this project." — Tier D Ada FMS Navigation Monitor
+================================================================
+Runs `claude -p "Observe this project."` on a blank Ada avionics program.
+Ada has no OTel SDK; agent must assign Tier D sidecar bridge.
 
 Run:
     cd smoke-tests && python3 49-tier-d-ada/smoke.py
 """
 
-import os, sys, time, random
-from pathlib import Path
+import os, sys, time, json, shutil, subprocess, tempfile, urllib.request
+from dotenv import load_dotenv
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set"); sys.exit(0)
 
-SVC = "smoke-tier-d-ada"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "49-tier-d-ada"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-ada")
+SIDECAR_SRC = os.path.join(os.path.dirname(__file__), "../../otel-sidecar/otel-sidecar.py")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
+SIDECAR_PORT = 19449
 
-sensor_cycles      = meter.create_counter("ada.sensor_cycles")
-warnings_issued    = meter.create_counter("ada.system_warnings")
-nav_accuracy       = meter.create_histogram("ada.nav_accuracy_m")
-fuel_remaining     = meter.create_histogram("ada.fuel_remaining_kg")
-cycle_duration     = meter.create_histogram("ada.cycle_duration_ms", unit="ms")
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name, ok, detail=""):
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-FLIGHT_PARAMS = {
-    "flight_id":   "AA1234",
-    "aircraft":    "B789",
-    "phase":       "cruise",
-    "altitude_ft": 37000,
-    "speed_kts":   487,
-    "fuel_total_kg": 42000,
-}
+print(f"\n{'='*62}\nEDOT-Autopilot | {SVC}\n{'='*62}")
+print("  Fixture: blank-ada (no OTel, no sidecar)\n")
 
-MONITORING_CYCLES = [
-    {"cycle": 1, "nav_err_m": 4.2,  "fuel_kg": 41_850, "iru_valid": True,  "gps_valid": True,  "mode": "VNAV"},
-    {"cycle": 2, "nav_err_m": 5.1,  "fuel_kg": 41_620, "iru_valid": True,  "gps_valid": True,  "mode": "VNAV"},
-    {"cycle": 3, "nav_err_m": 12.7, "fuel_kg": 41_390, "iru_valid": True,  "gps_valid": False, "mode": "VNAV"},  # GPS dropout
-    {"cycle": 4, "nav_err_m": 8.3,  "fuel_kg": 41_165, "iru_valid": True,  "gps_valid": True,  "mode": "VNAV"},
-    {"cycle": 5, "nav_err_m": 4.9,  "fuel_kg": 40_940, "iru_valid": True,  "gps_valid": True,  "mode": "VNAV"},
-]
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None)
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD))
+check("Fixture directory exists", os.path.isdir(FIXTURE_DIR))
+check("otel-sidecar.py source exists", os.path.exists(SIDECAR_SRC))
+ada_path = os.path.join(FIXTURE_DIR, "fms_navigation.adb")
+if os.path.exists(ada_path):
+    content = open(ada_path).read()
+    check("Fixture Ada has no sidecar calls yet",
+          "sidecar" not in content.lower() and "otel" not in content.lower())
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for s, n, d in CHECKS:
+        print(f"  [{s}] {n}" + (f"\n         -> {d}" if d and s == "FAIL" else ""))
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-def run_monitoring_cycle(cycle_data):
+print("Step 2: Setting up blank Ada workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-ada-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank Ada, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}\n")
+
+    print("Step 3: Running claude -p 'Observe this project.' ...")
+    observe_prompt = f"Observe this project.\nMy Elastic endpoint: {ENDPOINT}\nMy Elastic API key: {API_KEY}"
     t0 = time.time()
-    has_warning = not cycle_data["gps_valid"] or cycle_data["nav_err_m"] > 10.0
+    result = subprocess.run(
+        [claude_bin, "--dangerously-skip-permissions", "-p", observe_prompt,
+         "--model", "claude-sonnet-4-6", "--max-budget-usd", "2.00"],
+        cwd=tmpdir, capture_output=True, text=True, timeout=600)
+    elapsed = time.time() - t0
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        for line in result.stdout.strip().splitlines()[-20:]:
+            print(f"    {line}")
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-    with tracer.start_as_current_span("Ada.FMS.Navigation_Monitor", kind=SpanKind.INTERNAL,
-            attributes={"ada.package": "FMS.Navigation_Monitor",
-                        "ada.task":    "Navigation_Monitor_Task",
-                        "flight.id":   FLIGHT_PARAMS["flight_id"],
-                        "flight.phase": FLIGHT_PARAMS["phase"],
-                        "ada.cycle":   cycle_data["cycle"]}) as span:
+    print("\nStep 4: Inspecting what the agent changed")
+    diff = subprocess.run(["git", "diff", "HEAD"], cwd=tmpdir, capture_output=True, text=True).stdout
+    new_files = [f.strip() for f in subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True).stdout.splitlines() if f.strip()]
+    print(f"  Diff lines: {len(diff.splitlines())}  New files: {new_files}")
 
-        with tracer.start_as_current_span("Ada.FMS.Read_IRU_Data", kind=SpanKind.INTERNAL,
-                attributes={"ada.procedure": "Read_IRU_Data", "sensor.type": "IRU",
-                            "sensor.valid": cycle_data["iru_valid"]}):
-            time.sleep(0.002)
+    all_text = "\n".join(
+        open(os.path.join(tmpdir, f)).read()
+        for f in os.listdir(tmpdir)
+        if os.path.isfile(os.path.join(tmpdir, f)) and not f.startswith(".") and f != "CLAUDE.md"
+    )
+    sidecar_path = os.path.join(tmpdir, "otel-sidecar.py")
+    otel_slos    = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden  = os.path.join(tmpdir, ".otel", "golden-paths.md")
 
-        with tracer.start_as_current_span("Ada.FMS.Read_GPS_Data", kind=SpanKind.INTERNAL,
-                attributes={"ada.procedure": "Read_GPS_Data", "sensor.type": "GPS",
-                            "sensor.valid": cycle_data["gps_valid"]}) as s:
-            time.sleep(0.002)
-            if not cycle_data["gps_valid"]:
-                s.set_status(StatusCode.ERROR, "GPS_SENSOR_INVALID")
-                warnings_issued.add(1, attributes={"ada.warning": "GPS_DROPOUT",
-                                                    "flight.id": FLIGHT_PARAMS["flight_id"]})
-                logger.warning("GPS sensor invalid — reverting to IRU-only navigation",
-                               extra={"flight.id": FLIGHT_PARAMS["flight_id"],
-                                      "sensor.type": "GPS", "ada.cycle": cycle_data["cycle"],
-                                      "nav.accuracy_m": cycle_data["nav_err_m"]})
+    print("\nTier D (sidecar bridge) checks:")
+    check("otel-sidecar.py added to project",
+          os.path.exists(sidecar_path) or any("otel-sidecar" in f for f in new_files))
+    check("Ada or helper contains HTTP sidecar calls",
+          any(kw in all_text.lower() for kw in
+              ["aws.net", "otel-sidecar", "start_span", "sidecar", "curl", "http"]))
+    check("Correct Ada span names referenced",
+          any(n in all_text for n in
+              ["Navigation_Monitor", "Read_IRU_Data", "Read_GPS_Data",
+               "Fuel_Computation", "Ada.FMS", "fms_navigation"]))
+    check("Business span attributes referenced (fms.*/nav.*/ada.*)",
+          any(a in all_text for a in
+              ["ada.package", "fms.flight_id", "nav.rnp_required", "nav.actual_nav_performance",
+               "fms.fuel_kg", "nav.sensor"]))
 
-        with tracer.start_as_current_span("Ada.FMS.Compute_Nav_Accuracy", kind=SpanKind.INTERNAL,
-                attributes={"ada.function": "Compute_RNP_Accuracy",
-                            "nav.accuracy_m": cycle_data["nav_err_m"]}):
-            time.sleep(0.001)
-            if cycle_data["nav_err_m"] > 10.0:
-                warnings_issued.add(1, attributes={"ada.warning": "RNP_EXCEEDED",
-                                                    "flight.id": FLIGHT_PARAMS["flight_id"]})
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    if os.path.exists(otel_slos):
+        try:
+            check(".otel/slos.json is valid JSON", isinstance(json.load(open(otel_slos)), (list, dict)))
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-        with tracer.start_as_current_span("Ada.FMS.Fuel_Computation", kind=SpanKind.INTERNAL,
-                attributes={"ada.procedure": "Compute_Fuel_State",
-                            "fuel.remaining_kg": cycle_data["fuel_kg"]}):
-            time.sleep(0.001)
-            eta_dest_min = 215 - cycle_data["cycle"] * 43
-            fuel_reserve  = cycle_data["fuel_kg"] - 4200  # min reserve
+    print("\nStep 5: Starting otel-sidecar.py and sending simulated Ada FMS payloads")
+    sidecar_py = sidecar_path if os.path.exists(sidecar_path) else SIDECAR_SRC
+    sidecar_env = os.environ.copy()
+    sidecar_env.update({"OTEL_SERVICE_NAME": SVC, "ELASTIC_OTLP_ENDPOINT": ENDPOINT,
+                         "ELASTIC_API_KEY": API_KEY, "OTEL_DEPLOYMENT_ENVIRONMENT": "smoke-test",
+                         "SIDECAR_PORT": str(SIDECAR_PORT)})
+    sidecar_proc = subprocess.Popen(
+        [sys.executable, sidecar_py], env=sidecar_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("nav.accuracy_m",       cycle_data["nav_err_m"])
-        span.set_attribute("nav.gps_valid",         cycle_data["gps_valid"])
-        span.set_attribute("nav.iru_valid",          cycle_data["iru_valid"])
-        span.set_attribute("fuel.remaining_kg",      cycle_data["fuel_kg"])
-        span.set_attribute("fuel.reserve_kg",        fuel_reserve)
-        span.set_attribute("flight.autopilot_mode",  cycle_data["mode"])
-        span.set_attribute("ada.cycle_duration_ms",  round(dur, 3))
+    sidecar_up = False
+    for _ in range(30):
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=b'{"action":"health"}',
+                headers={"Content-Type": "application/json"}, method="POST"), timeout=1)
+            if resp.status == 200:
+                sidecar_up = True; break
+        except Exception:
+            time.sleep(0.3)
+    check("otel-sidecar started and responds to health check", sidecar_up)
 
-        if has_warning:
-            span.set_status(StatusCode.ERROR, "navigation_warning")
+    if sidecar_up:
+        print(f"  Sidecar running on port {SIDECAR_PORT}")
+        def post(payload):
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=data, headers={"Content-Type": "application/json"}, method="POST")
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
 
-        sensor_cycles.add(1, attributes={"flight.phase": FLIGHT_PARAMS["phase"],
-                                          "flight.id": FLIGHT_PARAMS["flight_id"]})
-        nav_accuracy.record(cycle_data["nav_err_m"], attributes={"flight.id": FLIGHT_PARAMS["flight_id"]})
-        fuel_remaining.record(cycle_data["fuel_kg"], attributes={"flight.id": FLIGHT_PARAMS["flight_id"]})
-        cycle_duration.record(dur, attributes={"ada.task": "Navigation_Monitor_Task"})
+        FLIGHTS = [
+            {"flight_id": "UA841", "origin": "KSFO", "dest": "EGLL", "fuel_kg": 68400.0},
+            {"flight_id": "BA286", "origin": "EGLL", "dest": "KLAX", "fuel_kg": 72100.0},
+        ]
+        try:
+            for flight in FLIGHTS:
+                r = post({"action": "start_span", "name": "Ada.FMS.Navigation_Monitor",
+                           "kind": "internal",
+                           "attributes": {"ada.package": "FMS_Navigation",
+                                          "fms.flight_id": flight["flight_id"],
+                                          "fms.origin": flight["origin"],
+                                          "fms.dest": flight["dest"]}})
+                root_id = r["span_id"]; tp = r["traceparent"]
+                check(f"start_span Ada.FMS.Navigation_Monitor ({flight['flight_id']}) → ok",
+                      r.get("ok") is True, str(r))
+                for step in ["Ada.FMS.Read_IRU_Data", "Ada.FMS.Read_GPS_Data",
+                             "Ada.FMS.Fuel_Computation"]:
+                    rs = post({"action": "start_span", "name": step,
+                               "kind": "internal", "traceparent": tp,
+                               "attributes": {"fms.flight_id": flight["flight_id"],
+                                              "nav.sensor": "IRU" if "IRU" in step else "GPS"}})
+                    post({"action": "end_span", "span_id": rs["span_id"],
+                          "attributes": {"nav.actual_nav_performance": 0.042}})
+                post({"action": "end_span", "span_id": root_id,
+                      "attributes": {"nav.rnp_required": 0.1,
+                                     "nav.actual_nav_performance": 0.042,
+                                     "fms.fuel_kg": flight["fuel_kg"]}})
+            check(f"Ada FMS navigation spans sent for {len(FLIGHTS)} flights", True)
+            post({"action": "metric_counter", "name": "ada.navigation_cycles",
+                  "value": len(FLIGHTS) * 3600, "attributes": {}})
+        except Exception as exc:
+            check("Sidecar payload simulation completed without error", False, str(exc))
 
-        logger.info("nav monitor cycle complete",
-                    extra={"flight.id": FLIGHT_PARAMS["flight_id"], "ada.cycle": cycle_data["cycle"],
-                           "nav.accuracy_m": cycle_data["nav_err_m"], "fuel.remaining_kg": cycle_data["fuel_kg"],
-                           "nav.gps_valid": cycle_data["gps_valid"], "flight.autopilot_mode": cycle_data["mode"]})
-    return has_warning
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+        check("Sidecar process still alive", sidecar_proc.poll() is None)
 
-print(f"\n[{SVC}] Simulating Ada FMS navigation monitor ({FLIGHT_PARAMS['flight_id']}, "
-      f"{FLIGHT_PARAMS['altitude_ft']}ft, {FLIGHT_PARAMS['speed_kts']}kts)...")
-for cycle in MONITORING_CYCLES:
-    warn = run_monitoring_cycle(cycle)
-    icon = "⚠️ " if warn else "✅"
-    gps  = "GPS:OK" if cycle["gps_valid"] else "GPS:FAIL"
-    print(f"  {icon} Cycle {cycle['cycle']}  nav_err={cycle['nav_err_m']:>5.1f}m  {gps}  "
-          f"fuel={cycle['fuel_kg']:,}kg  mode={cycle['mode']}")
+    if sidecar_proc.poll() is None:
+        sidecar_proc.terminate(); sidecar_proc.wait(timeout=5)
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+print(f"  Kibana -> APM -> {SVC}")
+if failed:
+    sys.exit(1)

@@ -26,15 +26,14 @@ Run:
 
 import os, sys, uuid, time, random
 from pathlib import Path
+from dotenv import load_dotenv
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
-env_file = Path(__file__).parent.parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from o11y_bootstrap import O11yBootstrap
@@ -42,9 +41,12 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
-API_KEY  = os.environ["ELASTIC_API_KEY"]
-ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+ENV = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+
+CHECKS: list[tuple[str, str, str]] = []
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
 propagator = TraceContextTextMapPropagator()
 
@@ -693,12 +695,9 @@ def run_inference_scenario(scenario: str, model: dict, entity_id: str,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"\n{'='*70}")
-    print("  ML Inference Platform — Distributed Tracing Demo")
-    print("  Services: inference-gateway → result-cache → ab-testing-service")
-    print("            → feature-store → model-registry → serving-engine")
-    print("            → explainability-service")
-    print(f"{'='*70}")
+    print(f"\n{'='*62}")
+    print(f"EDOT-Autopilot | ML Inference Platform")
+    print(f"{'='*62}")
 
     # 25 scenarios
     scenario_pool = (
@@ -711,8 +710,7 @@ if __name__ == "__main__":
     )
     random.shuffle(scenario_pool)
 
-    stats = {"cache_hit": 0, "cache_miss": 0, "cold_start": 0,
-             "feature_stale": 0, "gpu_oom": 0, "version_mismatch": 0, "total": 0}
+    results = []
 
     for i, scenario in enumerate(scenario_pool):
         model         = random.choice(MODELS)
@@ -728,33 +726,61 @@ if __name__ == "__main__":
         if scenario == "version_mismatch":
             model = next((m for m in MODELS if m["version"] != m["latest"]), MODELS[1])
 
-        print(f"\n{'─'*70}")
+        print(f"\n{'─'*62}")
         print(f"  Scenario {i+1:02d}/25  [{scenario}]")
-        run_inference_scenario(scenario, model, entity_id, industry, needs_explain)
-        stats["total"] += 1
-        stats[scenario] = stats.get(scenario, 0) + 1
+        try:
+            run_inference_scenario(scenario, model, entity_id, industry, needs_explain)
+            results.append((f"Scenario {i+1:02d}/25 [{scenario}]", "OK", None))
+        except Exception as e:
+            results.append((f"Scenario {i+1:02d}/25 [{scenario}]", "ERROR", str(e)))
 
         time.sleep(random.uniform(0.05, 0.2))
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*62}")
     print("  Flushing all telemetry providers...")
     for svc in [gateway, cache, abtesting, features, registry, serving, explain]:
         svc.flush()
 
-    print(f"\n  Results: {stats['total']} scenarios")
-    print(f"    ✅ Cache hits:         {stats['cache_hit']}")
-    print(f"    🔄 Full inference:     {stats['cache_miss']}")
-    print(f"    🥶 Cold starts:        {stats['cold_start']}")
-    print(f"    ⚠️  Stale features:    {stats['feature_stale']}")
-    print(f"    💥 GPU OOM (CPU fb):  {stats['gpu_oom']}")
-    print(f"    🔀 Version mismatch:  {stats['version_mismatch']}")
+    for scenario_name, status, error_detail in results:
+        if status in ("OK", "WARN"):
+            check(scenario_name, True)
+        else:
+            check(scenario_name, False, error_detail or "")
 
-    print(f"\n  Kibana:")
-    print(f"    Service Map → Observability → APM → Service Map")
-    print(f"    Filter: inference-gateway (7 connected nodes expected)")
-    print(f"\n  ES|QL query:")
-    print(f'    FROM traces-apm*,logs-*')
-    print(f'    | WHERE service.name IN ("inference-gateway","result-cache","ab-testing-service",')
-    print(f'        "feature-store","model-registry","serving-engine","explainability-service")')
-    print(f'    | SORT @timestamp DESC | LIMIT 100')
-    print(f"{'='*70}\n")
+    # ── Span assertions: verify instrumentation correctness ──────────────────────
+    # Collect from all o11y instances in this test
+    all_spans = []
+    all_spans += gateway.get_finished_spans()
+    all_spans += cache.get_finished_spans()
+    all_spans += abtesting.get_finished_spans()
+    all_spans += features.get_finished_spans()
+    all_spans += registry.get_finished_spans()
+    all_spans += serving.get_finished_spans()
+    all_spans += explain.get_finished_spans()
+    print("\nSpan assertions:")
+    check("At least one span captured across all services",
+          len(all_spans) > 0,
+          f"got {len(all_spans)} total spans")
+    server_spans = [s for s in all_spans if s.kind.name == "SERVER"]
+    check("At least one SERVER span emitted",
+          len(server_spans) > 0,
+          f"got {len(server_spans)} SERVER spans")
+    attrs_with_cache = [s for s in all_spans if s.attributes and "cache.hit" in s.attributes]
+    check("At least one span carries cache.hit attribute",
+          len(attrs_with_cache) > 0,
+          f"got {len(attrs_with_cache)} spans with cache.hit")
+    svc_names = {s.resource.attributes.get("service.name") for s in all_spans}
+    check("All 7 ML services emitted spans",
+          len(svc_names) >= 7,
+          f"services with spans: {svc_names}")
+
+    passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+    failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+    if failed:
+        sys.exit(1)

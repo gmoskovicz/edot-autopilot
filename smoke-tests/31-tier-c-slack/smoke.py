@@ -1,132 +1,191 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — slack-sdk WebClient (monkey-patched).
+E2E "Observe this project." — Tier C: slack-sdk
+================================================
+Runs `claude -p "Observe this project."` on a blank SLA incident alerting service
+that uses slack-sdk to post messages to Slack channels.
 
-Patches WebClient.chat_postMessage and chat_postEphemeral.
-Business scenario: Incident alerting — SLA breach triggers Slack alerts
-to #ops-alerts, follow-up thread to #on-call.
+EDOT Autopilot workflow:
+  1. Reads blank fixture — finds WebClient.chat_postMessage calls
+  2. Assigns Tier C (monkey-patch) — no official opentelemetry-instrumentation-slack-sdk
+  3. Wraps chat_postMessage with CLIENT spans
+  4. Adds business attributes: slack.channel, messaging.system=slack, slack.message_ts
 
 Run:
     cd smoke-tests && python3 31-tier-c-slack/smoke.py
 """
 
-import os, sys, uuid, time, random
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-SVC = "smoke-tier-c-slack"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "31-tier-c-slack"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-slack")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-slack_msgs   = meter.create_counter("slack.messages_sent")
-slack_latency= meter.create_histogram("slack.send_ms", unit="ms")
-alert_counter= meter.create_counter("slack.alerts_fired")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-class _MockSlackResponse:
-    def __init__(self):
-        self.data = {"ok": True, "ts": f"{time.time():.6f}", "channel": "C123456",
-                     "message": {"ts": f"{time.time():.6f}"}}
-    def __getitem__(self, key):
-        return self.data[key]
-    def get(self, key, default=None):
-        return self.data.get(key, default)
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-slack (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print()
 
-class _MockWebClient:
-    def __init__(self, token=None):
-        self.token = token
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture dir exists", os.path.isdir(FIXTURE_DIR), FIXTURE_DIR)
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-    def chat_postMessage(self, channel, text=None, blocks=None, thread_ts=None, **kwargs):
-        time.sleep(random.uniform(0.03, 0.08))
-        if random.random() < 0.02:
-            raise Exception("slack_sdk.errors.SlackApiError: not_in_channel")
-        return _MockSlackResponse()
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-    def chat_postEphemeral(self, channel, user, text=None, **kwargs):
-        time.sleep(0.02)
-        return _MockSlackResponse()
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-slack-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
 
-class slack_sdk:
-    WebClient = _MockWebClient
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-_orig_post      = _MockWebClient.chat_postMessage
-_orig_ephemeral = _MockWebClient.chat_postEphemeral
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-def _inst_post(self, channel, text=None, blocks=None, thread_ts=None, **kwargs):
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
+
     t0 = time.time()
-    with tracer.start_as_current_span("slack.chat_postMessage", kind=SpanKind.CLIENT,
-        attributes={"slack.channel":     channel,
-                    "slack.has_blocks":  blocks is not None,
-                    "slack.is_thread":   thread_ts is not None,
-                    "messaging.system":  "slack"}) as span:
-        try:
-            resp = _orig_post(self, channel, text, blocks, thread_ts, **kwargs)
-            dur  = (time.time() - t0) * 1000
-            span.set_attribute("slack.message_ts", resp.get("ts", ""))
-            slack_msgs.add(1, attributes={"slack.channel": channel})
-            slack_latency.record(dur, attributes={"slack.channel": channel})
-            logger.info("slack message sent",
-                        extra={"slack.channel": channel, "slack.message_ts": resp.get("ts", ""),
-                               "slack.is_thread": thread_ts is not None})
-            return resp
-        except Exception as e:
-            span.set_status(StatusCode.ERROR, str(e))
-            logger.error("slack message failed",
-                         extra={"slack.channel": channel, "error.message": str(e)})
-            raise
-
-_MockWebClient.chat_postMessage = _inst_post
-
-
-def fire_sla_alert(incident_id, service, sla_type, severity, breach_duration_min):
-    client = slack_sdk.WebClient(token="xoxb-fake-token")
-    alert_counter.add(1, attributes={"alert.severity": severity, "alert.sla_type": sla_type})
-
-    resp = client.chat_postMessage(
-        channel="#ops-alerts",
-        text=f"🚨 SLA Breach: {service} — {sla_type} ({severity})",
-        blocks=[{"type": "section", "text": {"type": "mrkdwn",
-                 "text": f"*Incident:* `{incident_id}`\n*Service:* {service}\n"
-                         f"*SLA:* {sla_type}\n*Severity:* {severity}\n"
-                         f"*Breach duration:* {breach_duration_min}m"}}],
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
     )
-    client.chat_postMessage(
-        channel="#on-call",
-        text=f"⚠️ {incident_id}: {service} SLA breach assigned",
-        thread_ts=resp.get("ts"),
+    elapsed = time.time() - t0
+
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
+
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
+
+    # ── Step 4: Inspect what the agent changed ────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
     )
-    logger.warning("SLA breach alert fired",
-                   extra={"incident.id": incident_id, "alert.service": service,
-                          "alert.sla_type": sla_type, "alert.severity": severity,
-                          "alert.breach_duration_min": breach_duration_min})
-    return resp
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+    print(f"  New files: {new_files}")
 
+    app_file = os.path.join(tmpdir, "app.py")
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
 
-incidents = [
-    ("INC-001", "payment-api",      "response_time_p99", "critical", 12),
-    ("INC-002", "checkout-service", "error_rate",        "warning",  3),
-    ("INC-003", "inventory-db",     "availability",      "critical", 45),
-]
+    print("\nTier C monkey-patch checks:")
+    check("opentelemetry added to requirements.txt",
+          "opentelemetry" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SDK client method monkey-patched (Tier C)",
+          "_orig_" in app_content or "functools.wraps" in app_content
+          or "= original_" in app_content,
+          "no monkey-patch pattern found")
+    check("SpanKind.CLIENT on SDK calls",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("Business attributes on spans",
+          any(attr in app_content for attr in [
+              "slack.", "messaging.system", "slack.channel",
+              "slack.message_ts", "channel",
+          ]),
+          "no slack.* attributes found in app.py")
+    check("chat_postMessage is patched",
+          "chat_postMessage" in app_content and (
+              "_orig_" in app_content or "wrap" in app_content.lower()
+          ),
+          "chat_postMessage patch not detected")
 
-print(f"\n[{SVC}] Firing incident alerts via patched slack-sdk...")
-for inc_id, service, sla, severity, duration in incidents:
-    try:
-        fire_sla_alert(inc_id, service, sla, severity, duration)
-        icon = "🚨" if severity == "critical" else "⚠️ "
-        print(f"  {icon} {inc_id}  {service:<25}  {sla:<25}  {severity}")
-    except Exception as e:
-        print(f"  🚫 {inc_id}  error={e}")
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ──────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

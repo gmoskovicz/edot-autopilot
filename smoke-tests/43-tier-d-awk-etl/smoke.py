@@ -1,104 +1,214 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier D — AWK ETL pipeline (sidecar simulation).
-
-Simulates an AWK + shell ETL pipeline submitting observability via the HTTP
-sidecar. Business scenario: access log analytics — parse Apache/Nginx access
-logs, aggregate by endpoint and status, compute p99 latency, write summary CSV.
+E2E "Observe this project." — Tier D AWK ETL Access Log Parser
+===============================================================
+Runs `claude -p "Observe this project."` on a blank AWK ETL script.
+AWK has no OTel SDK; agent must assign Tier D sidecar bridge.
 
 Run:
     cd smoke-tests && python3 43-tier-d-awk-etl/smoke.py
 """
 
-import os, sys, time, random
-from pathlib import Path
+import os, sys, time, json, shutil, subprocess, tempfile, urllib.request
+from dotenv import load_dotenv
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set"); sys.exit(0)
 
-SVC = "smoke-tier-d-awk-etl"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "43-tier-d-awk-etl"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-awk-etl")
+SIDECAR_SRC = os.path.join(os.path.dirname(__file__), "../../otel-sidecar/otel-sidecar.py")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
+SIDECAR_PORT = 19443
 
-lines_processed   = meter.create_counter("awk.lines_processed")
-files_processed   = meter.create_counter("awk.files_processed")
-etl_duration      = meter.create_histogram("awk.etl_duration_ms", unit="ms")
-error_lines       = meter.create_counter("awk.parse_errors")
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name, ok, detail=""):
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-LOG_FILES = [
-    {"path": "/var/log/nginx/access_2026-02-28.log", "lines": 142_831, "server": "web-01"},
-    {"path": "/var/log/nginx/access_2026-02-28.log", "lines": 98_445,  "server": "web-02"},
-    {"path": "/var/log/apache2/access_2026-02-28.log","lines": 55_120,  "server": "api-01"},
-]
+print(f"\n{'='*62}\nEDOT-Autopilot | {SVC}\n{'='*62}")
+print("  Fixture: blank-awk-etl (no OTel, no sidecar)\n")
 
-ENDPOINTS = [
-    ("/api/v1/products",   200, 45),
-    ("/api/v1/orders",     200, 120),
-    ("/api/v1/auth/token", 200, 18),
-    ("/api/v1/cart",       200, 35),
-    ("/api/v1/products",   404, 12),
-    ("/health",            200, 5),
-    ("/api/v1/checkout",   500, 8),
-]
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None)
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD))
+check("Fixture directory exists", os.path.isdir(FIXTURE_DIR))
+check("otel-sidecar.py source exists", os.path.exists(SIDECAR_SRC))
+awk_path = os.path.join(FIXTURE_DIR, "parse_access_logs.awk")
+if os.path.exists(awk_path):
+    content = open(awk_path).read()
+    check("Fixture AWK has no sidecar calls yet",
+          "sidecar" not in content.lower() and "otel" not in content.lower())
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for s, n, d in CHECKS:
+        print(f"  [{s}] {n}" + (f"\n         -> {d}" if d and s == "FAIL" else ""))
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-def process_log_file(log_file):
+print("Step 2: Setting up blank AWK workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-awk-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank AWK, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}\n")
+
+    print("Step 3: Running claude -p 'Observe this project.' ...")
+    observe_prompt = f"Observe this project.\nMy Elastic endpoint: {ENDPOINT}\nMy Elastic API key: {API_KEY}"
     t0 = time.time()
-    parse_errors = int(log_file["lines"] * random.uniform(0.0001, 0.002))
+    result = subprocess.run(
+        [claude_bin, "--dangerously-skip-permissions", "-p", observe_prompt,
+         "--model", "claude-sonnet-4-6", "--max-budget-usd", "2.00"],
+        cwd=tmpdir, capture_output=True, text=True, timeout=600)
+    elapsed = time.time() - t0
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        for line in result.stdout.strip().splitlines()[-20:]:
+            print(f"    {line}")
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-    with tracer.start_as_current_span("awk.etl_pipeline", kind=SpanKind.INTERNAL,
-            attributes={"awk.script": "parse_access_logs.awk", "etl.input_file": log_file["path"],
-                        "etl.server": log_file["server"], "etl.expected_lines": log_file["lines"]}) as span:
+    print("\nStep 4: Inspecting what the agent changed")
+    diff = subprocess.run(["git", "diff", "HEAD"], cwd=tmpdir, capture_output=True, text=True).stdout
+    new_files = [f.strip() for f in subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True).stdout.splitlines() if f.strip()]
+    print(f"  Diff lines: {len(diff.splitlines())}  New files: {new_files}")
 
-        with tracer.start_as_current_span("awk.parse_log", kind=SpanKind.INTERNAL,
-                attributes={"awk.command": "awk -F'\"' '{print $1,$2,$3}'",
-                            "etl.input_file": log_file["path"]}):
-            time.sleep(random.uniform(0.05, 0.20))
-            lines_processed.add(log_file["lines"], attributes={"etl.server": log_file["server"]})
-            if parse_errors:
-                error_lines.add(parse_errors, attributes={"etl.server": log_file["server"]})
+    all_text = "\n".join(
+        open(os.path.join(tmpdir, f)).read()
+        for f in os.listdir(tmpdir)
+        if os.path.isfile(os.path.join(tmpdir, f)) and not f.startswith(".") and f != "CLAUDE.md"
+    )
+    sidecar_path = os.path.join(tmpdir, "otel-sidecar.py")
+    otel_slos    = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden  = os.path.join(tmpdir, ".otel", "golden-paths.md")
 
-        endpoint_stats = {}
-        with tracer.start_as_current_span("awk.aggregate_by_endpoint", kind=SpanKind.INTERNAL,
-                attributes={"awk.command": "awk '{count[$7]++; sum[$7]+=$NF} END {for(k in count) print k,count[k],sum[k]/count[k]}'"}):
-            time.sleep(random.uniform(0.03, 0.10))
-            for ep, status, base_ms in ENDPOINTS:
-                hits = int(log_file["lines"] * random.uniform(0.01, 0.15))
-                p99  = base_ms * random.uniform(1.5, 8.0)
-                endpoint_stats[ep] = {"hits": hits, "status": status, "p99_ms": round(p99, 1)}
+    print("\nTier D (sidecar bridge) checks:")
+    check("otel-sidecar.py added to project",
+          os.path.exists(sidecar_path) or any("otel-sidecar" in f for f in new_files))
+    check("AWK or helper contains HTTP sidecar calls",
+          any(kw in all_text.lower() for kw in
+              ["curl", "wget", "otel-sidecar", "start_span", "sidecar", "http"]))
+    check("Correct AWK span names referenced",
+          any(n in all_text for n in
+              ["etl_pipeline", "parse_log", "aggregate_by_endpoint",
+               "write_summary_csv", "awk.etl", "access_log"]))
+    check("Business span attributes referenced (awk.*/http.*/etl.*)",
+          any(a in all_text for a in
+              ["awk.script", "http.method", "http.status", "log.source",
+               "etl.records_processed", "log.endpoint"]))
 
-        with tracer.start_as_current_span("awk.write_summary_csv", kind=SpanKind.INTERNAL,
-                attributes={"etl.output_file": f"reports/{log_file['server']}_summary.csv",
-                            "etl.rows_written": len(endpoint_stats)}):
-            time.sleep(random.uniform(0.005, 0.015))
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    if os.path.exists(otel_slos):
+        try:
+            check(".otel/slos.json is valid JSON", isinstance(json.load(open(otel_slos)), (list, dict)))
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("etl.lines_processed", log_file["lines"])
-        span.set_attribute("etl.parse_errors",    parse_errors)
-        span.set_attribute("etl.endpoints_found", len(endpoint_stats))
-        span.set_attribute("awk.duration_ms",     round(dur, 2))
+    print("\nStep 5: Starting otel-sidecar.py and sending simulated AWK ETL payloads")
+    sidecar_py = sidecar_path if os.path.exists(sidecar_path) else SIDECAR_SRC
+    sidecar_env = os.environ.copy()
+    sidecar_env.update({"OTEL_SERVICE_NAME": SVC, "ELASTIC_OTLP_ENDPOINT": ENDPOINT,
+                         "ELASTIC_API_KEY": API_KEY, "OTEL_DEPLOYMENT_ENVIRONMENT": "smoke-test",
+                         "SIDECAR_PORT": str(SIDECAR_PORT)})
+    sidecar_proc = subprocess.Popen(
+        [sys.executable, sidecar_py], env=sidecar_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        files_processed.add(1, attributes={"etl.server": log_file["server"]})
-        etl_duration.record(dur, attributes={"etl.server": log_file["server"]})
+    sidecar_up = False
+    for _ in range(30):
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=b'{"action":"health"}',
+                headers={"Content-Type": "application/json"}, method="POST"), timeout=1)
+            if resp.status == 200:
+                sidecar_up = True; break
+        except Exception:
+            time.sleep(0.3)
+    check("otel-sidecar started and responds to health check", sidecar_up)
 
-        logger.info("log file ETL complete",
-                    extra={"etl.server": log_file["server"], "etl.lines_processed": log_file["lines"],
-                           "etl.parse_errors": parse_errors, "etl.endpoints_found": len(endpoint_stats),
-                           "awk.duration_ms": round(dur, 2)})
+    if sidecar_up:
+        print(f"  Sidecar running on port {SIDECAR_PORT}")
+        def post(payload):
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=data, headers={"Content-Type": "application/json"}, method="POST")
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
 
-    return log_file["lines"], parse_errors
+        LOG_BATCHES = [
+            {"source": "/var/log/nginx/access.log", "records": 52341, "date": "2024-01-15"},
+            {"source": "/var/log/apache2/access.log", "records": 18920, "date": "2024-01-15"},
+        ]
+        try:
+            for batch in LOG_BATCHES:
+                r = post({"action": "start_span", "name": "awk.etl_pipeline",
+                           "kind": "internal",
+                           "attributes": {"awk.script": "parse_access_logs.awk",
+                                          "log.source": batch["source"],
+                                          "etl.date": batch["date"]}})
+                root_id = r["span_id"]; tp = r["traceparent"]
+                check(f"start_span awk.etl_pipeline ({batch['source']}) → ok",
+                      r.get("ok") is True, str(r))
+                for step in ["awk.parse_log", "awk.aggregate_by_endpoint", "awk.write_summary_csv"]:
+                    rs = post({"action": "start_span", "name": step,
+                               "kind": "internal",
+                               "traceparent": tp,
+                               "attributes": {"log.source": batch["source"]}})
+                    post({"action": "end_span", "span_id": rs["span_id"],
+                          "attributes": {"etl.records_processed": batch["records"]}})
+                post({"action": "end_span", "span_id": root_id,
+                      "attributes": {"etl.records_processed": batch["records"],
+                                     "http.status_200_count": 41073,
+                                     "http.status_4xx_count": 892}})
+            check(f"AWK ETL pipeline spans sent for {len(LOG_BATCHES)} batches", True)
+            post({"action": "metric_counter", "name": "awk.log_lines_parsed",
+                  "value": sum(b["records"] for b in LOG_BATCHES), "attributes": {}})
+        except Exception as exc:
+            check("Sidecar payload simulation completed without error", False, str(exc))
 
-print(f"\n[{SVC}] Simulating AWK access log ETL pipeline...")
-for log_file in LOG_FILES:
-    lines, errs = process_log_file(log_file)
-    print(f"  ✅ {log_file['server']:<12}  lines={lines:>8,}  parse_errors={errs:>4}  file={Path(log_file['path']).name}")
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+        check("Sidecar process still alive", sidecar_proc.poll() is None)
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+    if sidecar_proc.poll() is None:
+        sidecar_proc.terminate(); sidecar_proc.wait(timeout=5)
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+print(f"  Kibana -> APM -> {SVC}")
+if failed:
+    sys.exit(1)

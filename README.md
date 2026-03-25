@@ -4,7 +4,7 @@
 [![Elastic EDOT](https://img.shields.io/badge/Elastic-EDOT-005571?logo=elastic)](https://www.elastic.co/docs/reference/opentelemetry)
 [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-agentskills.io-8A2BE2)](https://agentskills.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Languages](https://img.shields.io/badge/languages-65%2B-brightgreen)](smoke-tests/README.md)
+[![Languages](https://img.shields.io/badge/languages-85%2B-brightgreen)](smoke-tests/README.md)
 
 OpenTelemetry auto-instrumentation for any language — modern or legacy — powered by Elastic EDOT, with full support for runtimes that have no OTel SDK.
 
@@ -101,15 +101,61 @@ No other tool has a graceful degradation strategy that covers every runtime ever
 
 ---
 
-## Smoke test suite — 81 tests, 65+ technologies
+## Test suite — 85 tests, three verification layers
 
-All tests confirmed green against a live Elastic Cloud Serverless deployment.
-All instrumentation follows **OTel semantic conventions 1.22+** — stable attribute names
-(`http.request.method`, `db.query.text`, `db.system.name`), correct `SpanKind`,
-`service.peer.name` on every CLIENT span, and INP (not FID) for Core Web Vitals.
+The test suite is built in three layers. Each layer proves something different and none of
+them is a substitute for the others.
+
+### Layer 1 — Instrumentation pattern tests (tests 01–81): does each technology's instrumentation produce correct telemetry?
+
+85 tests covering every technology in the four-tier model. Each test bootstraps the OTel SDK,
+exercises a realistic business scenario (checkout, payroll run, ML inference, mobile session, etc.),
+emits all three OpenTelemetry signals to Elastic, and asserts that each scenario produced the
+expected span names, attributes, metric values, and log records. Tests exit 1 on any failed check.
+
+These tests verify that the correct instrumentation pattern for each technology produces correct
+telemetry: a Java Spring Boot service emitting the spans a Java Spring Boot service should emit,
+a COBOL batch job emitting events through the sidecar bridge, a Stripe monkey-patch capturing
+the right payment attributes. Every test targets a specific technology's instrumentation contract
+and fails if that contract is violated.
+
+All tests run against a live Elastic Cloud Serverless deployment via OTLP/HTTP. All instrumentation
+follows **OTel semantic conventions 1.22+**: stable attribute names (`http.request.method`,
+`db.query.text`, `db.system.name`), correct `SpanKind`, `service.peer.name` on every CLIENT span,
+and INP (not FID) for Core Web Vitals.
+
+### Layer 2 — Real SDK integration tests (`tests/integration/`): do the actual OTel SDKs produce correct output?
+
+Builds and runs real application processes — Java (Spring Boot + OTel Java agent), Node.js
+(Express + OTel Node SDK), Python (FastAPI + auto-instrumentation), .NET Framework 4.x
+(manual span wrapping), and Python 2.7 — against a local OTel Collector with a file exporter.
+No Elastic credentials required. The validator reads the collector's JSONL output and asserts:
+
+- All expected services emitted spans with the correct service names
+- Semconv 1.20+ attribute names used (not deprecated `http.method`, `db.system`)
+- SpanKind is correct (SERVER for ingress, CLIENT for DB/outbound)
+
+Run with: `bash tests/integration/run.sh`
+
+### Layer 3 — E2E workflow tests (tests 82–85): does the full "Observe this project." workflow produce correct results?
+
+Spin up a real, uninstrumented application (Flask e-commerce store, FastAPI ML service,
+Django CMS, or a blank fixture app), apply the instrumentation that the EDOT Autopilot
+workflow generates, then assert that the output is correct end-to-end: spans carry the right
+business attributes, `.otel/slos.json` was created with SLO thresholds derived from actual code
+constants, `record_exception` is used on every error path (not bare `add_event`), and all three
+signals reach Elastic.
+
+| Test | What it proves |
+|------|---------------|
+| `82-e2e-flask-ecommerce` | Runs a real Flask + SQLAlchemy store; verifies auto-instrumentation produces semconv 1.20+ attribute names and business enrichment hooks fire correctly |
+| `83-e2e-fastapi-ml` | Runs a real FastAPI ML inference service; verifies ML business attributes (`ml.model_name`, `ml.inference_ms`) appear on every inference span |
+| `84-e2e-django-cms` | Runs a real Django application; verifies ORM CLIENT spans, 404 handling, and session context |
+| `85-e2e-observe-command` | Invokes `claude -p "Observe this project."` on a blank fixture app; verifies Tier B manual wrapping output, `.otel/` file structure, SLO derivation from code constants, and `record_exception` regression guard |
 
 ### Tier A — Native OTel SDK (7)
 Python · Node.js · Java · Go · Ruby · .NET C# · PHP
+*(Java/Go/Ruby/.NET/PHP Layer 1 tests verify the instrumentation pattern and signal shape; Layer 2 `tests/integration/` runs the real SDKs against a live OTel Collector)*
 
 ### Tier B — Manual span wrapping (8)
 Flask · Django ORM · Tornado · Bottle · Falcon · aiohttp · Celery tasks
@@ -119,7 +165,7 @@ Stripe · Twilio · SendGrid · boto3 S3/SQS · Redis · PyMongo · psycopg2 · 
 Celery worker · pika/RabbitMQ · elasticsearch-py · Slack SDK · OpenAI SDK ·
 **NVIDIA GPU / CUDA (nvidia-ml-py)**
 
-### Tier D — Sidecar bridge and legacy simulations (22)
+### Tier D — Sidecar bridge and legacy language patterns (22)
 Bash · Perl · COBOL · PowerShell · SAP ABAP · IBM RPG (AS/400) · Classic ASP ·
 VBA/Excel · MATLAB · R · Lua · Tcl · AWK · Fortran HPC · Delphi · ColdFusion ·
 Julia · Nim · Ada · Zapier · **NVIDIA DCGM Exporter (multi-GPU training)**
@@ -207,6 +253,10 @@ a rich, realistic service map in Kibana APM with errors that have full exception
 See [`smoke-tests/README.md`](smoke-tests/README.md) for the full test inventory,
 ES|QL queries, and Docker instructions.
 
+Every test in this repo follows the same pattern: `CHECKS` list, `check(name, ok, detail)` helper,
+canonical header, and `sys.exit(1)` when any check fails. The same pattern appears whether the test
+is a 70-line Tier A smoke test or a 300-line E2E workflow verification.
+
 ---
 
 ## Quick start
@@ -220,8 +270,11 @@ cp .env.example .env
 
 # 2. Run all smoke tests (Python only — no other runtimes needed)
 cd smoke-tests
-pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+pip install -r requirements.txt
 bash run-all.sh
+
+# 3. Run real SDK integration tests (Java + Node.js + Python in Docker, no Elastic needed)
+bash ../tests/integration/run.sh
 ```
 
 **Or with Docker — zero local dependencies:**
@@ -341,8 +394,8 @@ FROM traces-apm*
 - **OpenTelemetry Collector** — drop-in for teams that need a collector tier; configure the `otlphttp` exporter to point at your Elastic endpoint, all pipelines work unchanged
 - **OTel Collector contrib receivers** — `prometheusreceiver`, `hostmetricsreceiver`, `dockerstatsreceiver` all forward to Elastic via the same OTLP/HTTP pipeline this project uses
 - **Elastic Fleet + EDOT managed agents** — for teams using Fleet-managed instrumentation alongside this project; both write to the same APM indices
-- **GitHub Actions** — CI-friendly; smoke tests run headlessly against any Elastic endpoint
-- **Docker** — full suite runs in a single `docker compose up` with no local runtimes required
+- **GitHub Actions** — three-job CI pipeline: syntax check (every PR, no credentials), smoke tests (push to main + nightly, uses Elastic secrets), integration tests (every PR, Docker-only, no credentials)
+- **Docker** — full suite runs in a single `docker compose up` with no local runtimes required; integration tests run entirely in containers with a local OTel Collector
 - **Claude Code · Cursor · GitHub Copilot · Gemini CLI · Windsurf · Roo · Cline · Codex** — via the agentskills.io skill package
 
 ---
@@ -372,14 +425,15 @@ edot-autopilot/
 │   ├── Dockerfile
 │   └── README.md
 │
-├── smoke-tests/                      # 81 smoke tests — all 4 tiers, 65+ technologies
+├── smoke-tests/                      # 85 smoke tests — all 4 tiers, 65+ technologies
 │   ├── run-all.sh                    #   Run everything locally
+│   ├── requirements.txt              #   All Python dependencies for the suite
 │   ├── docker-compose.yml            #   Full suite with Docker profiles
 │   ├── o11y_bootstrap.py             #   Shared helper: tracer + logger + meter
 │   │
-│   ├── 01-tier-a-python/             #   Tier A: Python
-│   ├── 02-tier-a-nodejs/             #   Tier A: Node.js (multi-service, 25 scenarios)
-│   ├── 08–12-tier-a-*/               #   Tier A: Java / Go / Ruby / .NET / PHP
+│   ├── 01-tier-a-python/             #   Tier A: Python (real SDK)
+│   ├── 02-tier-a-nodejs/             #   Tier A: Node.js (real SDK, multi-service, 25 scenarios)
+│   ├── 08–12-tier-a-*/               #   Tier A: Java / Go / Ruby / .NET / PHP (instrumentation pattern tests)
 │   ├── 03,13–19-tier-b-*/            #   Tier B: Flask / Django / Tornado / Bottle …
 │   ├── 04,20–32,51-tier-c-*/         #   Tier C: Stripe / Twilio / boto3 / CUDA …
 │   ├── 05,33–52-tier-d-*/            #   Tier D: COBOL / SAP / MATLAB / DCGM …
@@ -394,7 +448,15 @@ edot-autopilot/
 │   ├── 65–70-mobile-*/              #   Mobile: React Native / Flutter / iOS / Android / MAUI / Ionic
 │   ├── 71–75-web-*/                 #   Web RUM: React / Next.js / Vue / Angular / Svelte
 │   ├── 76–80-web-*/                 #   Backends: NestJS / Gin / Rails / FastAPI / HTMX
-│   └── 81-mobile-ecommerce/         #   9-service mobile e-commerce scenario
+│   ├── 81-mobile-ecommerce/         #   9-service mobile e-commerce scenario
+│   └── 82–85-e2e-*/                 #   E2E workflow verification (real apps, InMemory + Elastic)
+│
+├── tests/
+│   └── integration/                  # Real SDK tests — Java + Node.js + Python in Docker
+│       ├── docker-compose.yml        #   Collector + real app containers
+│       ├── otel-collector-config.yml #   File exporter (no Elastic credentials needed)
+│       ├── validate.py               #   Parses collector JSONL, asserts span shapes
+│       └── run.sh                    #   Build → start → traffic → validate → teardown
 │
 └── docs/                             # Per-language OpenTelemetry guides (SEO pages)
     ├── opentelemetry-cobol.md

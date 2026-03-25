@@ -1,102 +1,214 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier D — ColdFusion / CFML (sidecar simulation).
-
-Simulates a ColdFusion web application submitting observability via the HTTP
-sidecar. Business scenario: e-commerce CMS content publishing — product catalog
-updates, cache invalidation, CDN purge, search index sync.
+E2E "Observe this project." — Tier D ColdFusion CMS Content Publishing
+=======================================================================
+Runs `claude -p "Observe this project."` on a blank ColdFusion CFM page.
+ColdFusion/CFML has no OTel SDK; agent must assign Tier D sidecar bridge.
 
 Run:
     cd smoke-tests && python3 46-tier-d-coldfusion/smoke.py
 """
 
-import os, sys, time, random, uuid
-from pathlib import Path
+import os, sys, time, json, shutil, subprocess, tempfile, urllib.request
+from dotenv import load_dotenv
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set"); sys.exit(0)
 
-SVC = "smoke-tier-d-coldfusion"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "46-tier-d-coldfusion"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-coldfusion")
+SIDECAR_SRC = os.path.join(os.path.dirname(__file__), "../../otel-sidecar/otel-sidecar.py")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
+SIDECAR_PORT = 19446
 
-pages_published    = meter.create_counter("cf.pages_published")
-cache_purges       = meter.create_counter("cf.cache_purges")
-publish_duration   = meter.create_histogram("cf.publish_duration_ms", unit="ms")
-db_query_count     = meter.create_counter("cf.db_queries")
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name, ok, detail=""):
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-PUBLISH_REQUESTS = [
-    {"page_id": "CAT-ELECTRONICS-01", "type": "category",  "products": 48,  "images": 48,  "author": "m.johnson"},
-    {"page_id": "PROD-SKU-WB4421",    "type": "product",   "products": 1,   "images": 8,   "author": "a.silva"},
-    {"page_id": "PROMO-SUMMER-2026",  "type": "promotion", "products": 120, "images": 25,  "author": "k.chen"},
-    {"page_id": "BLOG-TECH-UPDATE",   "type": "blog_post", "products": 0,   "images": 3,   "author": "r.park"},
-]
+print(f"\n{'='*62}\nEDOT-Autopilot | {SVC}\n{'='*62}")
+print("  Fixture: blank-coldfusion (no OTel, no sidecar)\n")
 
-def publish_content(req):
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None)
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD))
+check("Fixture directory exists", os.path.isdir(FIXTURE_DIR))
+check("otel-sidecar.py source exists", os.path.exists(SIDECAR_SRC))
+cfm_path = os.path.join(FIXTURE_DIR, "content_publish.cfm")
+if os.path.exists(cfm_path):
+    content = open(cfm_path).read()
+    check("Fixture CFM has no sidecar calls yet",
+          "sidecar" not in content.lower() and "start_span" not in content.lower())
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for s, n, d in CHECKS:
+        print(f"  [{s}] {n}" + (f"\n         -> {d}" if d and s == "FAIL" else ""))
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
+
+print("Step 2: Setting up blank ColdFusion workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-cf-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank ColdFusion, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}\n")
+
+    print("Step 3: Running claude -p 'Observe this project.' ...")
+    observe_prompt = f"Observe this project.\nMy Elastic endpoint: {ENDPOINT}\nMy Elastic API key: {API_KEY}"
     t0 = time.time()
-    version_id = uuid.uuid4().hex[:8]
+    result = subprocess.run(
+        [claude_bin, "--dangerously-skip-permissions", "-p", observe_prompt,
+         "--model", "claude-sonnet-4-6", "--max-budget-usd", "2.00"],
+        cwd=tmpdir, capture_output=True, text=True, timeout=600)
+    elapsed = time.time() - t0
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        for line in result.stdout.strip().splitlines()[-20:]:
+            print(f"    {line}")
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-    with tracer.start_as_current_span("CF.content_publish.cfm", kind=SpanKind.SERVER,
-            attributes={"cf.template": "content_publish.cfm", "cf.page_id": req["page_id"],
-                        "cf.content_type": req["type"], "cf.author": req["author"]}) as span:
+    print("\nStep 4: Inspecting what the agent changed")
+    diff = subprocess.run(["git", "diff", "HEAD"], cwd=tmpdir, capture_output=True, text=True).stdout
+    new_files = [f.strip() for f in subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True).stdout.splitlines() if f.strip()]
+    print(f"  Diff lines: {len(diff.splitlines())}  New files: {new_files}")
 
-        with tracer.start_as_current_span("CF.cfquery.SELECT_content", kind=SpanKind.CLIENT,
-                attributes={"db.system": "mssql", "db.operation": "SELECT",
-                            "db.table": "cms_content", "cf.cfquery": "getContentByID"}):
-            time.sleep(random.uniform(0.02, 0.06))
-            db_query_count.add(1, attributes={"db.operation": "SELECT"})
+    all_text = "\n".join(
+        open(os.path.join(tmpdir, f)).read()
+        for f in os.listdir(tmpdir)
+        if os.path.isfile(os.path.join(tmpdir, f)) and not f.startswith(".") and f != "CLAUDE.md"
+    )
+    sidecar_path = os.path.join(tmpdir, "otel-sidecar.py")
+    otel_slos    = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden  = os.path.join(tmpdir, ".otel", "golden-paths.md")
 
-        with tracer.start_as_current_span("CF.cfquery.UPDATE_publish_status", kind=SpanKind.CLIENT,
-                attributes={"db.system": "mssql", "db.operation": "UPDATE",
-                            "db.table": "cms_content", "cf.cfquery": "publishContent"}):
-            time.sleep(random.uniform(0.01, 0.04))
-            db_query_count.add(1, attributes={"db.operation": "UPDATE"})
+    print("\nTier D (sidecar bridge) checks:")
+    check("otel-sidecar.py added to project",
+          os.path.exists(sidecar_path) or any("otel-sidecar" in f for f in new_files))
+    check("ColdFusion or helper contains HTTP sidecar calls",
+          any(kw in all_text.lower() for kw in
+              ["cfhttp", "otel-sidecar", "start_span", "sidecar", "curl"]))
+    check("Correct ColdFusion span names referenced",
+          any(n in all_text for n in
+              ["content_publish", "cfquery", "cfcache", "cdn_purge",
+               "CF.content", "cfm"]))
+    check("Business span attributes referenced (cf.*/cms.*/cdn.*)",
+          any(a in all_text for a in
+              ["cf.template", "cms.content_id", "cms.channel", "cdn.purge_urls",
+               "cms.publish_status", "cf.datasource"]))
 
-        with tracer.start_as_current_span("CF.cfcache.flushAll", kind=SpanKind.INTERNAL,
-                attributes={"cf.operation": "cfcache", "cf.action": "flush",
-                            "cf.cache_region": f"content_{req['type']}"}):
-            time.sleep(random.uniform(0.005, 0.020))
-            cache_purges.add(1, attributes={"cf.content_type": req["type"]})
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    if os.path.exists(otel_slos):
+        try:
+            check(".otel/slos.json is valid JSON", isinstance(json.load(open(otel_slos)), (list, dict)))
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-        if req["images"] > 0:
-            with tracer.start_as_current_span("CF.cfhttp.cdn_purge", kind=SpanKind.CLIENT,
-                    attributes={"http.method": "POST", "cf.operation": "cfhttp",
-                                "cdn.provider": "CloudFront", "cdn.files_purged": req["images"]}):
-                time.sleep(random.uniform(0.05, 0.15))
+    print("\nStep 5: Starting otel-sidecar.py and sending simulated ColdFusion payloads")
+    sidecar_py = sidecar_path if os.path.exists(sidecar_path) else SIDECAR_SRC
+    sidecar_env = os.environ.copy()
+    sidecar_env.update({"OTEL_SERVICE_NAME": SVC, "ELASTIC_OTLP_ENDPOINT": ENDPOINT,
+                         "ELASTIC_API_KEY": API_KEY, "OTEL_DEPLOYMENT_ENVIRONMENT": "smoke-test",
+                         "SIDECAR_PORT": str(SIDECAR_PORT)})
+    sidecar_proc = subprocess.Popen(
+        [sys.executable, sidecar_py], env=sidecar_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        if req["products"] > 0:
-            with tracer.start_as_current_span("CF.cfhttp.search_index_sync", kind=SpanKind.CLIENT,
-                    attributes={"http.method": "POST", "cf.operation": "cfhttp",
-                                "search.provider": "Elasticsearch", "search.docs_updated": req["products"]}):
-                time.sleep(random.uniform(0.03, 0.10))
+    sidecar_up = False
+    for _ in range(30):
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=b'{"action":"health"}',
+                headers={"Content-Type": "application/json"}, method="POST"), timeout=1)
+            if resp.status == 200:
+                sidecar_up = True; break
+        except Exception:
+            time.sleep(0.3)
+    check("otel-sidecar started and responds to health check", sidecar_up)
 
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("cf.version_id",   version_id)
-        span.set_attribute("cf.images_purged", req["images"])
-        span.set_attribute("cf.products_indexed", req["products"])
-        span.set_attribute("cf.publish_ms",    round(dur, 2))
+    if sidecar_up:
+        print(f"  Sidecar running on port {SIDECAR_PORT}")
+        def post(payload):
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=data, headers={"Content-Type": "application/json"}, method="POST")
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
 
-        pages_published.add(1, attributes={"cf.content_type": req["type"]})
-        publish_duration.record(dur, attributes={"cf.content_type": req["type"]})
+        PUBLISHES = [
+            {"content_id": "ART-10042", "channel": "web", "datasource": "CMS_DB"},
+            {"content_id": "ART-10043", "channel": "mobile", "datasource": "CMS_DB"},
+        ]
+        try:
+            for pub in PUBLISHES:
+                r = post({"action": "start_span", "name": "CF.content_publish.cfm",
+                           "kind": "internal",
+                           "attributes": {"cf.template": "content_publish.cfm",
+                                          "cms.content_id": pub["content_id"],
+                                          "cms.channel": pub["channel"],
+                                          "cf.datasource": pub["datasource"]}})
+                root_id = r["span_id"]; tp = r["traceparent"]
+                check(f"start_span CF.content_publish.cfm ({pub['content_id']}) → ok",
+                      r.get("ok") is True, str(r))
+                for step in ["CF.cfquery.SELECT_content", "CF.cfcache.flushAll", "CF.cfhttp.cdn_purge"]:
+                    rs = post({"action": "start_span", "name": step,
+                               "kind": "client" if "cfhttp" in step else "internal",
+                               "traceparent": tp,
+                               "attributes": {"cms.content_id": pub["content_id"]}})
+                    post({"action": "end_span", "span_id": rs["span_id"],
+                          "attributes": {"cdn.purge_urls": 12}})
+                post({"action": "end_span", "span_id": root_id,
+                      "attributes": {"cms.publish_status": "success",
+                                     "cms.content_id": pub["content_id"]}})
+            check(f"ColdFusion publish spans sent for {len(PUBLISHES)} articles", True)
+            post({"action": "metric_counter", "name": "cf.content_published",
+                  "value": len(PUBLISHES), "attributes": {}})
+        except Exception as exc:
+            check("Sidecar payload simulation completed without error", False, str(exc))
 
-        logger.info("content published",
-                    extra={"cf.page_id": req["page_id"], "cf.content_type": req["type"],
-                           "cf.author": req["author"], "cf.version_id": version_id,
-                           "cf.images_purged": req["images"], "cf.publish_ms": round(dur, 2)})
-    return version_id
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+        check("Sidecar process still alive", sidecar_proc.poll() is None)
 
-print(f"\n[{SVC}] Simulating ColdFusion CMS content publishing pipeline...")
-for req in PUBLISH_REQUESTS:
-    vid = publish_content(req)
-    print(f"  ✅ {req['page_id']:<28}  type={req['type']:<12}  v={vid}  by={req['author']}")
+    if sidecar_proc.poll() is None:
+        sidecar_proc.terminate(); sidecar_proc.wait(timeout=5)
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+print(f"  Kibana -> APM -> {SVC}")
+if failed:
+    sys.exit(1)

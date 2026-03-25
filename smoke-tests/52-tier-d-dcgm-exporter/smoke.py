@@ -1,246 +1,221 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier D — NVIDIA DCGM Exporter (sidecar simulation).
-
-Simulates what the NVIDIA DCGM Exporter + OTel Collector pipeline would emit
-when monitoring a multi-GPU training cluster. No GPU or DCGM installation
-required — this is the Tier D sidecar pattern applied to GPU infrastructure.
-
-Real-world pipeline this simulates:
-  DCGM Exporter (:9400/metrics)
-      ↓  Prometheus scrape
-  OTel Collector (prometheus receiver)
-      ↓  OTLP/HTTP
-  Elastic (APM + Metrics)
-
-Business scenario: Multi-GPU distributed training job (data-parallel DDP).
-4x H100 GPUs training a 70B parameter language model. The DCGM exporter
-emits per-GPU metrics every collection interval (1–5s). This test pushes
-one collection cycle's worth of metrics directly via OTel Python SDK.
-
-DCGM field IDs used (from default-counters.csv):
-  DCGM_FI_DEV_GPU_UTIL, DCGM_FI_DEV_MEM_COPY_UTIL,
-  DCGM_FI_DEV_FB_USED, DCGM_FI_DEV_FB_FREE,
-  DCGM_FI_DEV_GPU_TEMP, DCGM_FI_DEV_POWER_USAGE,
-  DCGM_FI_DEV_SM_CLOCK, DCGM_FI_DEV_MEM_CLOCK,
-  DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, DCGM_FI_PROF_DRAM_ACTIVE,
-  DCGM_FI_PROF_PCIE_TX_BYTES, DCGM_FI_PROF_PCIE_RX_BYTES,
-  DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL, DCGM_FI_DEV_XID_ERRORS
-
-References:
-  https://github.com/NVIDIA/dcgm-exporter
-  https://opentelemetry.io/docs/specs/semconv/hardware/gpu/
-  https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html
+E2E "Observe this project." — Tier D NVIDIA DCGM GPU Metrics Collector
+=======================================================================
+Runs `claude -p "Observe this project."` on a blank Python DCGM collector.
+The collector emits Prometheus metrics but has no OTel spans; agent must
+assign Tier D sidecar bridge to add span-level observability.
 
 Run:
     cd smoke-tests && python3 52-tier-d-dcgm-exporter/smoke.py
 """
 
-import os, sys, time, random, uuid
-from pathlib import Path
+import os, sys, time, json, shutil, subprocess, tempfile, urllib.request
+from dotenv import load_dotenv
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set"); sys.exit(0)
 
-SVC = "smoke-tier-d-dcgm-exporter"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "52-tier-d-dcgm-exporter"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-dcgm-exporter")
+SIDECAR_SRC = os.path.join(os.path.dirname(__file__), "../../otel-sidecar/otel-sidecar.py")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
+SIDECAR_PORT = 19452
 
-# ── DCGM-style metrics (mirroring dcgm-exporter field names) ──────────────────
-# Official hw.gpu.* conventions
-dcgm_gpu_util          = meter.create_gauge("hw.gpu.utilization",
-    description="DCGM_FI_DEV_GPU_UTIL — GPU utilisation fraction (0–1)")
-dcgm_mem_util          = meter.create_gauge("hw.gpu.memory.utilization",
-    description="DCGM_FI_DEV_MEM_COPY_UTIL — memory bandwidth utilisation (0–1)")
-dcgm_fb_used           = meter.create_up_down_counter("hw.gpu.memory.usage",
-    unit="By", description="DCGM_FI_DEV_FB_USED — framebuffer used (bytes)")
-dcgm_fb_limit          = meter.create_up_down_counter("hw.gpu.memory.limit",
-    unit="By", description="DCGM_FI_DEV_FB_FREE + FB_USED — total VRAM (bytes)")
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name, ok, detail=""):
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-# Supplemental DCGM fields (no official semconv yet)
-dcgm_temp              = meter.create_gauge("dcgm.gpu_temp_celsius",
-    unit="Cel", description="DCGM_FI_DEV_GPU_TEMP — GPU die temperature")
-dcgm_power             = meter.create_gauge("dcgm.power_usage_watts",
-    unit="W",   description="DCGM_FI_DEV_POWER_USAGE — board power draw")
-dcgm_sm_clock          = meter.create_gauge("dcgm.sm_clock_mhz",
-    unit="MHz", description="DCGM_FI_DEV_SM_CLOCK — streaming multiprocessor clock")
-dcgm_mem_clock         = meter.create_gauge("dcgm.mem_clock_mhz",
-    unit="MHz", description="DCGM_FI_DEV_MEM_CLOCK — memory clock")
-dcgm_tensor_active     = meter.create_gauge("dcgm.tensor_pipe_active",
-    description="DCGM_FI_PROF_PIPE_TENSOR_ACTIVE — tensor core utilisation (0–1)")
-dcgm_dram_active       = meter.create_gauge("dcgm.dram_active",
-    description="DCGM_FI_PROF_DRAM_ACTIVE — DRAM interface active fraction")
-dcgm_pcie_tx           = meter.create_counter("dcgm.pcie_tx_bytes",
-    unit="By",  description="DCGM_FI_PROF_PCIE_TX_BYTES — PCIe TX throughput")
-dcgm_pcie_rx           = meter.create_counter("dcgm.pcie_rx_bytes",
-    unit="By",  description="DCGM_FI_PROF_PCIE_RX_BYTES — PCIe RX throughput")
-dcgm_nvlink_bw         = meter.create_gauge("dcgm.nvlink_bandwidth_gbps",
-    unit="Gbit/s", description="DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL — NVLink aggregate BW")
-dcgm_xid_errors        = meter.create_counter("dcgm.xid_errors",
-    description="DCGM_FI_DEV_XID_ERRORS — NVIDIA Xid error events")
+print(f"\n{'='*62}\nEDOT-Autopilot | {SVC}\n{'='*62}")
+print("  Fixture: blank-dcgm-exporter (no OTel spans, no sidecar)\n")
 
-# Training-level metrics
-ddp_iter_time          = meter.create_histogram("training.iteration_ms", unit="ms")
-ddp_throughput         = meter.create_histogram("training.samples_per_sec")
-ddp_loss               = meter.create_histogram("training.loss")
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None)
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD))
+check("Fixture directory exists", os.path.isdir(FIXTURE_DIR))
+check("otel-sidecar.py source exists", os.path.exists(SIDECAR_SRC))
+py_path = os.path.join(FIXTURE_DIR, "dcgm_collector.py")
+if os.path.exists(py_path):
+    content = open(py_path).read()
+    check("Fixture DCGM collector has no sidecar calls yet",
+          "sidecar" not in content.lower() and "start_span" not in content.lower())
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for s, n, d in CHECKS:
+        print(f"  [{s}] {n}" + (f"\n         -> {d}" if d and s == "FAIL" else ""))
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-# ── Simulated GPU cluster ──────────────────────────────────────────────────────
-GPUS = [
-    {"index": 0, "uuid": f"GPU-{uuid.uuid4().hex[:8]}", "name": "NVIDIA H100 SXM5 80GB",
-     "vram_gib": 80, "tdp_w": 700, "nvlink_gen": 4},
-    {"index": 1, "uuid": f"GPU-{uuid.uuid4().hex[:8]}", "name": "NVIDIA H100 SXM5 80GB",
-     "vram_gib": 80, "tdp_w": 700, "nvlink_gen": 4},
-    {"index": 2, "uuid": f"GPU-{uuid.uuid4().hex[:8]}", "name": "NVIDIA H100 SXM5 80GB",
-     "vram_gib": 80, "tdp_w": 700, "nvlink_gen": 4},
-    {"index": 3, "uuid": f"GPU-{uuid.uuid4().hex[:8]}", "name": "NVIDIA H100 SXM5 80GB",
-     "vram_gib": 80, "tdp_w": 700, "nvlink_gen": 4},
-]
+print("Step 2: Setting up blank DCGM exporter workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-dcgm-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank DCGM collector, no OTel spans"],
+                   cwd=tmpdir, capture_output=True, check=True)
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}\n")
 
-TRAINING_JOB = {
-    "job_id":          f"train-{uuid.uuid4().hex[:8]}",
-    "model":           "llama-3-70b-pretrain",
-    "batch_size_global": 512,
-    "seq_length":      4096,
-    "total_steps":     100_000,
-    "current_step":    42_817,
-    "world_size":      len(GPUS),
-}
+    print("Step 3: Running claude -p 'Observe this project.' ...")
+    observe_prompt = f"Observe this project.\nMy Elastic endpoint: {ENDPOINT}\nMy Elastic API key: {API_KEY}"
+    t0 = time.time()
+    result = subprocess.run(
+        [claude_bin, "--dangerously-skip-permissions", "-p", observe_prompt,
+         "--model", "claude-sonnet-4-6", "--max-budget-usd", "2.00"],
+        cwd=tmpdir, capture_output=True, text=True, timeout=600)
+    elapsed = time.time() - t0
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        for line in result.stdout.strip().splitlines()[-20:]:
+            print(f"    {line}")
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-COLLECTION_INTERVALS = 5  # simulate 5 DCGM scrape cycles
+    print("\nStep 4: Inspecting what the agent changed")
+    diff = subprocess.run(["git", "diff", "HEAD"], cwd=tmpdir, capture_output=True, text=True).stdout
+    new_files = [f.strip() for f in subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True).stdout.splitlines() if f.strip()]
+    print(f"  Diff lines: {len(diff.splitlines())}  New files: {new_files}")
 
-def collect_dcgm_cycle(cycle: int):
-    """Simulate one DCGM Exporter scrape cycle across all GPUs."""
-    cycle_t0 = time.time()
-    gpu_snapshots = []
+    all_text = "\n".join(
+        open(os.path.join(tmpdir, f)).read()
+        for f in os.listdir(tmpdir)
+        if os.path.isfile(os.path.join(tmpdir, f)) and not f.startswith(".") and f != "CLAUDE.md"
+    )
+    sidecar_path = os.path.join(tmpdir, "otel-sidecar.py")
+    otel_slos    = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden  = os.path.join(tmpdir, ".otel", "golden-paths.md")
 
-    with tracer.start_as_current_span("dcgm.collection_cycle", kind=SpanKind.INTERNAL,
-            attributes={
-                "dcgm.cycle":         cycle,
-                "dcgm.gpu_count":     len(GPUS),
-                "training.job_id":    TRAINING_JOB["job_id"],
-                "training.model":     TRAINING_JOB["model"],
-                "training.step":      TRAINING_JOB["current_step"] + cycle,
-                "training.world_size":TRAINING_JOB["world_size"],
-            }) as span:
+    print("\nTier D (sidecar bridge) checks:")
+    check("otel-sidecar.py added to project",
+          os.path.exists(sidecar_path) or any("otel-sidecar" in f for f in new_files))
+    check("DCGM collector or helper contains HTTP sidecar calls",
+          any(kw in all_text.lower() for kw in
+              ["requests.post", "otel-sidecar", "start_span", "sidecar", "urllib"]))
+    check("Correct DCGM span names referenced",
+          any(n in all_text for n in
+              ["collection_cycle", "dcgm_collector", "dcgm.gpu",
+               "collect_metrics", "fetch_fields", "dcgm.collection"]))
+    check("Business span attributes referenced (gpu.*/dcgm.*/nvidia.*)",
+          any(a in all_text for a in
+              ["gpu.uuid", "gpu.index", "dcgm.gpu_util_pct", "gpu.temperature_c",
+               "dcgm.sm_clock_mhz", "gpu.memory_used_mb"]))
 
-        for gpu in GPUS:
-            attrs = {
-                "hw.type":   "gpu",
-                "hw.id":     gpu["uuid"],
-                "hw.name":   gpu["name"],
-                "hw.vendor": "NVIDIA",
-                "gpu.index": gpu["index"],
-                "training.job_id": TRAINING_JOB["job_id"],
-            }
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    if os.path.exists(otel_slos):
+        try:
+            check(".otel/slos.json is valid JSON", isinstance(json.load(open(otel_slos)), (list, dict)))
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
 
-            # Simulate realistic DDP training utilisation (high, sustained)
-            util_pct       = random.uniform(92, 99)
-            mem_pct        = random.uniform(85, 96)
-            tensor_active  = random.uniform(0.78, 0.95)
-            dram_active    = random.uniform(0.65, 0.88)
-            temp_c         = random.randint(72, 84)
-            power_w        = gpu["tdp_w"] * random.uniform(0.85, 0.98)
-            sm_clock       = random.randint(1830, 1980)
-            mem_clock      = random.randint(2600, 3200)
-            fb_used_gib    = gpu["vram_gib"] * random.uniform(0.88, 0.96)
-            pcie_tx        = random.randint(8_000_000, 18_000_000)
-            pcie_rx        = random.randint(4_000_000, 12_000_000)
-            nvlink_gbps    = random.uniform(380, 450)  # NVLink4 ~900 GB/s per direction
-            xid_error      = 1 if random.random() < 0.02 else 0  # rare GPU errors
+    print("\nStep 5: Starting otel-sidecar.py and sending simulated DCGM payloads")
+    sidecar_py = sidecar_path if os.path.exists(sidecar_path) else SIDECAR_SRC
+    sidecar_env = os.environ.copy()
+    sidecar_env.update({"OTEL_SERVICE_NAME": SVC, "ELASTIC_OTLP_ENDPOINT": ENDPOINT,
+                         "ELASTIC_API_KEY": API_KEY, "OTEL_DEPLOYMENT_ENVIRONMENT": "smoke-test",
+                         "SIDECAR_PORT": str(SIDECAR_PORT)})
+    sidecar_proc = subprocess.Popen(
+        [sys.executable, sidecar_py], env=sidecar_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            fb_used_bytes  = int(fb_used_gib  * (1024**3))
-            fb_total_bytes = int(gpu["vram_gib"] * (1024**3))
+    sidecar_up = False
+    for _ in range(30):
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=b'{"action":"health"}',
+                headers={"Content-Type": "application/json"}, method="POST"), timeout=1)
+            if resp.status == 200:
+                sidecar_up = True; break
+        except Exception:
+            time.sleep(0.3)
+    check("otel-sidecar started and responds to health check", sidecar_up)
 
-            # Record all DCGM-mapped OTel metrics
-            dcgm_gpu_util.set(util_pct / 100.0, attributes={**attrs, "hw.gpu.task": "general"})
-            dcgm_mem_util.set(mem_pct / 100.0,  attributes=attrs)
-            dcgm_tensor_active.set(tensor_active, attributes=attrs)
-            dcgm_dram_active.set(dram_active,   attributes=attrs)
-            dcgm_temp.set(temp_c,               attributes=attrs)
-            dcgm_power.set(power_w,             attributes=attrs)
-            dcgm_sm_clock.set(sm_clock,         attributes=attrs)
-            dcgm_mem_clock.set(mem_clock,       attributes=attrs)
-            dcgm_nvlink_bw.set(nvlink_gbps,     attributes=attrs)
-            dcgm_fb_used.add(0,                 attributes=attrs)  # gauge pattern
-            dcgm_fb_limit.add(0,                attributes=attrs)
-            dcgm_pcie_tx.add(pcie_tx,           attributes=attrs)
-            dcgm_pcie_rx.add(pcie_rx,           attributes=attrs)
-            if xid_error:
-                dcgm_xid_errors.add(xid_error, attributes={**attrs, "dcgm.xid_code": 79})
+    if sidecar_up:
+        print(f"  Sidecar running on port {SIDECAR_PORT}")
+        def post(payload):
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=data, headers={"Content-Type": "application/json"}, method="POST")
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
 
-            snap = {
-                "util_pct": round(util_pct, 1), "temp_c": temp_c,
-                "power_w": round(power_w, 0), "fb_used_gib": round(fb_used_gib, 1),
-                "tensor_active": round(tensor_active, 2), "nvlink_gbps": round(nvlink_gbps, 0),
-                "xid_error": xid_error,
-            }
-            gpu_snapshots.append(snap)
+        GPUS = [
+            {"uuid": "GPU-a1b2c3d4", "index": 0, "model": "A100-SXM4-80GB"},
+            {"uuid": "GPU-e5f6a7b8", "index": 1, "model": "A100-SXM4-80GB"},
+            {"uuid": "GPU-c9d0e1f2", "index": 2, "model": "H100-SXM5-80GB"},
+        ]
+        try:
+            r = post({"action": "start_span", "name": "dcgm.collection_cycle",
+                       "kind": "internal",
+                       "attributes": {"dcgm.host": "gpu-node-01",
+                                      "dcgm.gpu_count": len(GPUS),
+                                      "dcgm.interval_s": 30}})
+            root_id = r["span_id"]; tp = r["traceparent"]
+            check("start_span dcgm.collection_cycle → ok", r.get("ok") is True, str(r))
 
-            if xid_error:
-                logger.warning("DCGM Xid error detected",
-                               extra={"gpu.index": gpu["index"], "gpu.uuid": gpu["uuid"],
-                                      "dcgm.xid_code": 79, "dcgm.xid_description": "GPU has fallen off the bus",
-                                      "training.job_id": TRAINING_JOB["job_id"]})
-            else:
-                logger.info("DCGM GPU metrics collected",
-                            extra={"gpu.index": gpu["index"], "gpu.uuid": gpu["uuid"],
-                                   "dcgm.gpu_util_pct": snap["util_pct"],
-                                   "dcgm.temp_c": temp_c, "dcgm.power_w": snap["power_w"],
-                                   "dcgm.tensor_active": snap["tensor_active"],
-                                   "dcgm.nvlink_gbps": snap["nvlink_gbps"],
-                                   "training.job_id": TRAINING_JOB["job_id"]})
+            for gpu in GPUS:
+                rs = post({"action": "start_span", "name": "dcgm.collect_metrics",
+                           "kind": "internal", "traceparent": tp,
+                           "attributes": {"gpu.uuid": gpu["uuid"],
+                                          "gpu.index": gpu["index"],
+                                          "gpu.model": gpu["model"]}})
+                post({"action": "end_span", "span_id": rs["span_id"],
+                      "attributes": {"dcgm.gpu_util_pct": 94.2,
+                                     "gpu.temperature_c": 72,
+                                     "dcgm.sm_clock_mhz": 1410,
+                                     "gpu.memory_used_mb": 73728}})
+                check(f"dcgm.collect_metrics span for GPU {gpu['index']} → ok",
+                      rs.get("ok") is True, str(rs))
 
-        # Simulate training iteration metrics (emitted per step, not per GPU)
-        iter_ms  = random.uniform(420, 550)
-        samples_per_sec = TRAINING_JOB["batch_size_global"] / (iter_ms / 1000.0)
-        loss     = 2.1 * (0.9998 ** (TRAINING_JOB["current_step"] + cycle)) + random.uniform(-0.02, 0.02)
+            post({"action": "end_span", "span_id": root_id,
+                  "attributes": {"dcgm.fields_collected": len(GPUS) * 12,
+                                 "dcgm.errors": 0}})
+            check(f"DCGM collection cycle spans sent for {len(GPUS)} GPUs", True)
+            post({"action": "metric_counter", "name": "dcgm.collection_cycles",
+                  "value": 1, "attributes": {}})
+        except Exception as exc:
+            check("Sidecar payload simulation completed without error", False, str(exc))
 
-        ddp_iter_time.record(iter_ms,       attributes={"training.model": TRAINING_JOB["model"]})
-        ddp_throughput.record(samples_per_sec, attributes={"training.model": TRAINING_JOB["model"]})
-        ddp_loss.record(loss,               attributes={"training.model": TRAINING_JOB["model"]})
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+        check("Sidecar process still alive", sidecar_proc.poll() is None)
 
-        span.set_attribute("training.iter_ms",         round(iter_ms, 1))
-        span.set_attribute("training.samples_per_sec", round(samples_per_sec, 1))
-        span.set_attribute("training.loss",            round(loss, 4))
-        span.set_attribute("dcgm.total_power_w",
-                           round(sum(s["power_w"] for s in gpu_snapshots), 0))
+    if sidecar_proc.poll() is None:
+        sidecar_proc.terminate(); sidecar_proc.wait(timeout=5)
 
-        time.sleep(random.uniform(0.01, 0.03))  # realistic scrape overhead
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-    return gpu_snapshots, iter_ms, samples_per_sec, loss
-
-
-print(f"\n[{SVC}] Simulating DCGM Exporter + OTel Collector for DDP training job...")
-print(f"  Job:    {TRAINING_JOB['job_id']}  ({TRAINING_JOB['model']})")
-print(f"  GPUs:   {len(GPUS)}x {GPUS[0]['name']}")
-print(f"  Step:   {TRAINING_JOB['current_step']:,} / {TRAINING_JOB['total_steps']:,}")
-print(f"  BS:     {TRAINING_JOB['batch_size_global']} global  |  seq_len={TRAINING_JOB['seq_length']}")
-print()
-
-for cycle in range(1, COLLECTION_INTERVALS + 1):
-    snaps, iter_ms, sps, loss = collect_dcgm_cycle(cycle)
-    avg_util = sum(s["util_pct"] for s in snaps) / len(snaps)
-    avg_temp = sum(s["temp_c"]   for s in snaps) / len(snaps)
-    total_pw = sum(s["power_w"]  for s in snaps)
-    xid_any  = any(s["xid_error"] for s in snaps)
-    icon     = "⚠️ " if xid_any else "✅"
-    print(f"  {icon} Cycle {cycle}/{COLLECTION_INTERVALS}  "
-          f"util={avg_util:.1f}%  temp={avg_temp:.0f}°C  "
-          f"power={total_pw:.0f}W  "
-          f"iter={iter_ms:.0f}ms  {sps:.0f}samp/s  loss={loss:.4f}"
-          + ("  XID-ERROR!" if xid_any else ""))
-
-o11y.flush()
-print(f"\n[{SVC}] Done → Kibana APM → {SVC}")
-print(f"\n  Kibana Metrics Explorer:")
-print(f"    hw.gpu.utilization  (filter: hw.name: *H100*)")
-print(f"    dcgm.power_usage_watts  |  dcgm.tensor_pipe_active")
-print(f"    dcgm.nvlink_bandwidth_gbps  |  training.loss")
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+print(f"  Kibana -> APM -> {SVC}")
+if failed:
+    sys.exit(1)

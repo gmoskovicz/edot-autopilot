@@ -26,15 +26,14 @@ Run:
 
 import os, sys, uuid, time, random, threading
 from pathlib import Path
+from dotenv import load_dotenv
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
-env_file = Path(__file__).parent.parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from o11y_bootstrap import O11yBootstrap
@@ -44,9 +43,12 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from opentelemetry import baggage
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
 
-ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
-API_KEY  = os.environ["ELASTIC_API_KEY"]
-ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+ENV = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+
+CHECKS: list[tuple[str, str, str]] = []
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
 propagator = TraceContextTextMapPropagator()
 
@@ -841,12 +843,9 @@ def run_checkout_scenario(scenario_type: str, customer: dict, items: list):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"\n{'='*70}")
-    print("  E-Commerce Checkout Platform — Distributed Tracing Demo")
-    print("  Services: checkout-frontend → product-catalog, inventory-service,")
-    print("            pricing-engine, payment-service → fraud-detection,")
-    print("            payment-processor, order-service → notification-service")
-    print(f"{'='*70}")
+    print(f"\n{'='*62}")
+    print(f"EDOT-Autopilot | E-Commerce Checkout Platform")
+    print(f"{'='*62}")
 
     # Scenario distribution: 30 total
     # 18 happy, 4 fraud, 3 declined, 2 stockout, 2 pricing timeout, 1 db error
@@ -860,8 +859,7 @@ if __name__ == "__main__":
     )
     random.shuffle(scenario_pool)
 
-    stats = {"success": 0, "fraud_block": 0, "declined": 0,
-             "stockout": 0, "timeout": 0, "db_error": 0, "total": 0}
+    results = []
 
     for i, scenario in enumerate(scenario_pool):
         customer = random.choice(CUSTOMERS)
@@ -869,45 +867,64 @@ if __name__ == "__main__":
         items    = [{"sku": p["sku"], "qty": random.randint(1, 3)}
                     for p in random.sample(PRODUCTS, n_items)]
 
-        print(f"\n{'─'*70}")
+        print(f"\n{'─'*62}")
         print(f"  Scenario {i+1:02d}/30  [{scenario}]")
-        result = run_checkout_scenario(scenario, customer, items)
-        stats["total"] += 1
-        if result:
-            stats["success"] += 1
-        elif scenario == "fraud_block":
-            stats["fraud_block"] += 1
-        elif scenario == "card_declined":
-            stats["declined"] += 1
-        elif scenario == "out_of_stock":
-            stats["stockout"] += 1
-        elif scenario == "pricing_timeout":
-            stats["timeout"] += 1
-        elif scenario == "db_error":
-            stats["db_error"] += 1
+        try:
+            result = run_checkout_scenario(scenario, customer, items)
+            status = "OK" if result else "WARN"
+            results.append((f"Scenario {i+1:02d}/30 [{scenario}]", status, None))
+        except Exception as e:
+            results.append((f"Scenario {i+1:02d}/30 [{scenario}]", "ERROR", str(e)))
 
         time.sleep(random.uniform(0.1, 0.3))
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*62}")
     print("  Flushing all telemetry providers...")
     for svc in [checkout, catalog, inventory, pricing, payment, fraud, processor, orders, notify]:
         svc.flush()
 
-    print(f"\n  Results: {stats['total']} scenarios")
-    print(f"    ✅ Success:         {stats['success']}")
-    print(f"    🚫 Fraud blocked:   {stats['fraud_block']}")
-    print(f"    ❌ Card declined:   {stats['declined']}")
-    print(f"    ⚠️  Out of stock:    {stats['stockout']}")
-    print(f"    ⚠️  Pricing timeout: {stats['timeout']}")
-    print(f"    ❌ DB error:        {stats['db_error']}")
+    for scenario_name, status, error_detail in results:
+        if status in ("OK", "WARN"):
+            check(scenario_name, True)
+        else:
+            check(scenario_name, False, error_detail or "")
 
-    print(f"\n  Kibana:")
-    print(f"    Service Map → Observability → APM → Service Map")
-    print(f"    Filter: checkout-frontend (9 connected nodes expected)")
-    print(f"\n  ES|QL query:")
-    print(f'    FROM traces-apm*,logs-*')
-    print(f'    | WHERE service.name IN ("checkout-frontend","product-catalog",')
-    print(f'        "inventory-service","pricing-engine","payment-service",')
-    print(f'        "fraud-detection","payment-processor","order-service","notification-service")')
-    print(f'    | SORT @timestamp DESC | LIMIT 100')
-    print(f"{'='*70}\n")
+    # ── Span assertions: verify instrumentation correctness ──────────────────────
+    # Collect from all o11y instances in this test
+    all_spans = []
+    all_spans += checkout.get_finished_spans()
+    all_spans += catalog.get_finished_spans()
+    all_spans += inventory.get_finished_spans()
+    all_spans += pricing.get_finished_spans()
+    all_spans += payment.get_finished_spans()
+    all_spans += fraud.get_finished_spans()
+    all_spans += processor.get_finished_spans()
+    all_spans += orders.get_finished_spans()
+    all_spans += notify.get_finished_spans()
+    print("\nSpan assertions:")
+    check("At least one span captured across all services",
+          len(all_spans) > 0,
+          f"got {len(all_spans)} total spans")
+    server_spans = [s for s in all_spans if s.kind.name == "SERVER"]
+    check("At least one SERVER span emitted",
+          len(server_spans) > 0,
+          f"got {len(server_spans)} SERVER spans")
+    attrs_with_pricing = [s for s in all_spans if s.attributes and "pricing.base_total_usd" in s.attributes]
+    check("At least one span carries pricing.base_total_usd attribute",
+          len(attrs_with_pricing) > 0,
+          f"got {len(attrs_with_pricing)} spans with pricing.base_total_usd")
+    svc_names = {s.resource.attributes.get("service.name") for s in all_spans}
+    check("All 9 services emitted spans",
+          len(svc_names) >= 9,
+          f"services with spans: {svc_names}")
+
+    passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+    failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+    if failed:
+        sys.exit(1)

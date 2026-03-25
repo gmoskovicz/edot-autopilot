@@ -1,0 +1,3 @@
+{"name":"shop-client-svelte","version":"1.0.0","private":true,
+  "scripts":{"dev":"vite","build":"vite build"},
+  "devDependencies":{"@sveltejs/vite-plugin-svelte":"^3.0.0","svelte":"^4.0.0","typescript":"^5.0.0","vite":"^5.0.0"}}

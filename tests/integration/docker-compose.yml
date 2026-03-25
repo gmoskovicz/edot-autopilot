@@ -1,0 +1,82 @@
+services:
+
+  # ── OTel Collector — local telemetry backend ─────────────────────────────────
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yml:/etc/otelcol/config.yaml:ro
+      - ./output:/output
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:13133/"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  # ── Tier A: Python FastAPI ────────────────────────────────────────────────────
+  tier-a-python:
+    build:
+      context: ../tier-a-python-fastapi
+    ports:
+      - "8000:8000"
+    environment:
+      OTEL_SERVICE_NAME: inttest-fastapi
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+      OTEL_DEPLOYMENT_ENVIRONMENT: integration-test
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+    depends_on:
+      collector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── Tier A: Node.js Express ───────────────────────────────────────────────────
+  tier-a-nodejs:
+    build:
+      context: ../tier-a-nodejs-express
+    ports:
+      - "3001:3000"
+    environment:
+      OTEL_SERVICE_NAME: inttest-nodejs-express
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+      OTEL_DEPLOYMENT_ENVIRONMENT: integration-test
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+    depends_on:
+      collector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── Tier A: Java Spring Boot ──────────────────────────────────────────────────
+  # NOTE: Uses the OTel Java agent (included in the Dockerfile via JAVA_TOOL_OPTIONS).
+  # First build is slow (~2 min) due to Maven dependency resolution.
+  tier-a-java:
+    build:
+      context: ../tier-a-java-springboot
+    ports:
+      - "8080:8080"
+    environment:
+      OTEL_SERVICE_NAME: inttest-springboot
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+      OTEL_DEPLOYMENT_ENVIRONMENT: integration-test
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+    depends_on:
+      collector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 18

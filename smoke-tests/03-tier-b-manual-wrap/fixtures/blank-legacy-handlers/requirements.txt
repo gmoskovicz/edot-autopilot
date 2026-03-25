@@ -1,0 +1,2 @@
+# No external dependencies — pure Python business logic
+# (stdlib: uuid, random, logging)

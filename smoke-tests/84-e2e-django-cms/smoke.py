@@ -252,4 +252,7 @@ for status, name, detail in CHECKS:
     print(f"  [{status}] {name}" + (f"\n         -> {detail}" if detail else ""))
 print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
 if failed:
-    print("  Run: pip install opentelemetry-instrumentation-django opentelemetry-instrumentation-sqlite3")
+    print(f"  FAIL: {failed} check(s) failed")
+    print("  Required: pip install opentelemetry-instrumentation-django "
+          "opentelemetry-instrumentation-sqlite3")
+    sys.exit(1)

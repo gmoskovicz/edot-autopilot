@@ -1,153 +1,191 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — AWS SQS via boto3 (monkey-patched).
+E2E "Observe this project." — Tier C: boto3 SQS
+=================================================
+Runs `claude -p "Observe this project."` on a blank order fulfillment service
+that uses boto3 to publish and consume SQS messages.
 
-Patches SQS send_message / receive_message / delete_message.
-Business scenario: Order fulfillment queue — publish orders to SQS,
-warehouse picks them up, messages deleted after processing.
+EDOT Autopilot workflow:
+  1. Reads blank fixture — finds boto3.client("sqs") with send/receive/delete
+  2. Assigns Tier C (monkey-patch) — no official opentelemetry-instrumentation-boto3
+  3. Wraps send_message / receive_message / delete_message with spans
+  4. Adds business attributes: messaging.system=aws_sqs, messaging.destination.name
 
 Run:
     cd smoke-tests && python3 23-tier-c-boto3-sqs/smoke.py
 """
 
-import os, sys, uuid, time, json
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-SVC = "smoke-tier-c-boto3-sqs"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "23-tier-c-boto3-sqs"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-boto3-sqs")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-_msg_store = []  # simulated queue
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
-sqs_sends    = meter.create_counter("aws.sqs.messages_sent")
-sqs_receives = meter.create_counter("aws.sqs.messages_received")
-sqs_deletes  = meter.create_counter("aws.sqs.messages_deleted")
-sqs_latency  = meter.create_histogram("aws.sqs.operation_ms", unit="ms")
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-boto3-sqs (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print()
 
-class _MockSQSClient:
-    QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/123456789/order-fulfillment-prod"
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture dir exists", os.path.isdir(FIXTURE_DIR), FIXTURE_DIR)
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-    def send_message(self, **kwargs):
-        time.sleep(0.01)
-        msg_id = str(uuid.uuid4())
-        _msg_store.append({"MessageId": msg_id, "Body": kwargs.get("MessageBody", ""),
-                           "ReceiptHandle": uuid.uuid4().hex})
-        return {"MessageId": msg_id, "MD5OfMessageBody": "abc123"}
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-    def receive_message(self, **kwargs):
-        time.sleep(0.01)
-        msgs = _msg_store[:kwargs.get("MaxNumberOfMessages", 1)]
-        return {"Messages": msgs} if msgs else {}
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-boto3-sqs-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
 
-    def delete_message(self, **kwargs):
-        time.sleep(0.005)
-        handle = kwargs.get("ReceiptHandle", "")
-        global _msg_store
-        _msg_store = [m for m in _msg_store if m.get("ReceiptHandle") != handle]
-        return {}
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
-class boto3:
-    @staticmethod
-    def client(service, **kwargs):
-        return _MockSQSClient()
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-_orig_send = _MockSQSClient.send_message
-_orig_recv = _MockSQSClient.receive_message
-_orig_del  = _MockSQSClient.delete_message
-
-def _instrumented_send(self, **kwargs):
-    t0 = time.time()
-    queue = kwargs.get("QueueUrl", "").split("/")[-1]
-    with tracer.start_as_current_span(f"send {queue}", kind=SpanKind.PRODUCER,
-        attributes={"messaging.system": "aws_sqs", "messaging.destination.name": queue,
-                    "messaging.operation.name": "send", "messaging.operation.type": "send"}) as span:
-        result = _orig_send(self, **kwargs)
-        dur = (time.time() - t0) * 1000
-        span.set_attribute("messaging.message.id", result["MessageId"])
-        sqs_sends.add(1, attributes={"messaging.destination.name": queue})
-        sqs_latency.record(dur, attributes={"messaging.operation.name": "send"})
-        logger.info("SQS message sent", extra={"messaging.destination.name": queue,
-                    "messaging.message.id": result["MessageId"]})
-        return result
-
-def _instrumented_recv(self, **kwargs):
-    t0 = time.time()
-    queue = kwargs.get("QueueUrl", "").split("/")[-1]
-    with tracer.start_as_current_span(f"receive {queue}", kind=SpanKind.CLIENT,
-        attributes={"messaging.system": "aws_sqs", "messaging.destination.name": queue,
-                    "messaging.operation.name": "receive", "messaging.operation.type": "receive"}) as span:
-        result = _orig_recv(self, **kwargs)
-        msgs = result.get("Messages", [])
-        span.set_attribute("messaging.batch.message_count", len(msgs))
-        sqs_receives.add(len(msgs), attributes={"messaging.destination.name": queue})
-        sqs_latency.record((time.time() - t0) * 1000, attributes={"messaging.operation.name": "receive"})
-        return result
-
-def _instrumented_del(self, **kwargs):
-    t0 = time.time()
-    queue = kwargs.get("QueueUrl", "").split("/")[-1]
-    with tracer.start_as_current_span(f"settle {queue}", kind=SpanKind.CLIENT,
-        attributes={"messaging.system": "aws_sqs", "messaging.destination.name": queue,
-                    "messaging.operation.name": "settle", "messaging.operation.type": "settle"}) as span:
-        result = _orig_del(self, **kwargs)
-        sqs_deletes.add(1, attributes={"messaging.destination.name": queue})
-        sqs_latency.record((time.time() - t0) * 1000, attributes={"messaging.operation.name": "settle"})
-        return result
-
-_MockSQSClient.send_message    = _instrumented_send
-_MockSQSClient.receive_message = _instrumented_recv
-_MockSQSClient.delete_message  = _instrumented_del
-
-
-def publish_order(order):
-    sqs = boto3.client("sqs", region_name="us-east-1")
-    resp = sqs.send_message(
-        QueueUrl=_MockSQSClient.QUEUE_URL,
-        MessageBody=json.dumps(order),
-        MessageGroupId=order["warehouse_id"],
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
     )
-    return resp
 
-def process_orders():
-    sqs = boto3.client("sqs", region_name="us-east-1")
-    resp = sqs.receive_message(QueueUrl=_MockSQSClient.QUEUE_URL, MaxNumberOfMessages=10)
-    for msg in resp.get("Messages", []):
-        order = json.loads(msg["Body"])
-        logger.info("order dispatched to warehouse",
-                    extra={"order.id": order["id"], "fulfillment.warehouse_id": order["warehouse_id"],
-                           "order.items": order["items"], "order.value_usd": order["value_usd"]})
-        sqs.delete_message(QueueUrl=_MockSQSClient.QUEUE_URL, ReceiptHandle=msg["ReceiptHandle"])
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
-orders = [
-    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "warehouse_id": "WH-EAST-01",
-     "items": 3, "value_usd": 189.99, "customer_tier": "enterprise"},
-    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "warehouse_id": "WH-WEST-02",
-     "items": 1, "value_usd": 29.99,  "customer_tier": "free"},
-    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "warehouse_id": "WH-EAST-01",
-     "items": 7, "value_usd": 892.50, "customer_tier": "pro"},
-]
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-print(f"\n[{SVC}] Publishing + consuming orders via patched boto3 SQS...")
-for order in orders:
-    resp = publish_order(order)
-    print(f"  ✅ published {order['id']}  ${order['value_usd']:.2f}  "
-          f"warehouse={order['warehouse_id']}  msg={resp['MessageId'][:8]}...")
-process_orders()
-print(f"  ✅ processed {len(orders)} orders from queue")
+    # ── Step 4: Inspect what the agent changed ────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+    print(f"  New files: {new_files}")
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+    app_file = os.path.join(tmpdir, "app.py")
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
+
+    print("\nTier C monkey-patch checks:")
+    check("opentelemetry added to requirements.txt",
+          "opentelemetry" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SDK client method monkey-patched (Tier C)",
+          "_orig_" in app_content or "functools.wraps" in app_content
+          or "= original_" in app_content,
+          "no monkey-patch pattern found")
+    check("SpanKind.CLIENT on SDK calls",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("Business attributes on spans",
+          any(attr in app_content for attr in [
+              "aws_sqs", "messaging.system", "messaging.destination",
+              "sqs.", "QueueUrl",
+          ]),
+          "no SQS messaging attributes found in app.py")
+    check("send_message is patched",
+          "send_message" in app_content and (
+              "_orig_" in app_content or "wrap" in app_content.lower()
+          ),
+          "send_message patch not detected")
+
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ──────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

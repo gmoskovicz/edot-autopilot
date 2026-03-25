@@ -1,147 +1,289 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — redis-py client (monkey-patched).
+EVAL TEST: Tier C — Redis Session Cache Monkey-Patch (Real Agent Invocation)
+=============================================================================
+*** EVAL TEST — runs `claude -p` and costs ~$1-2 per execution ***
 
-Patches redis.Redis.get / set / delete / pipeline.
-Business scenario: Session cache for a high-traffic auth service.
+This test ACTUALLY runs `claude -p "Observe this project."` on a blank,
+uninstrumented Redis session service. It does not assume or hardcode what
+the agent will generate.
+
+What this tests:
+  1. The agent reads the blank app and understands it (redis-py with no
+     built-in OTel support — Tier C candidate)
+  2. The agent correctly assigns Tier C (monkey-patching)
+  3. The agent patches `redis.Redis.get`, `.set`, and `.delete` with CLIENT spans
+  4. Business enrichment: db.system=redis, redis.key, redis.hit,
+     redis.ttl_sec, net.peer.name
+  5. Metrics: redis.commands counter, cache hit/miss counters
+  6. Error paths use record_exception + set_status(ERROR)
+  7. The generated requirements.txt includes OTel packages
 
 Run:
     cd smoke-tests && python3 24-tier-c-redis/smoke.py
+
+Requirements (in addition to requirements.txt):
+  - `claude` CLI installed and authenticated
+  - ELASTIC_OTLP_ENDPOINT and ELASTIC_API_KEY set in .env or environment
 """
 
-import os, sys, uuid, time, json
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
+import json
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
-SVC = "smoke-tier-c-redis"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-redis_ops    = meter.create_counter("redis.commands")
-redis_hits   = meter.create_counter("redis.cache_hits")
-redis_misses = meter.create_counter("redis.cache_misses")
-redis_latency= meter.create_histogram("redis.command_ms", unit="ms")
+SVC = "24-eval-tier-c-redis"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-redis-sessions")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-_cache = {}  # in-memory mock
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-class _MockRedis:
-    def __init__(self, host="localhost", port=6379, db=0, decode_responses=True, **kwargs):
-        self.host = host
-        self.port = port
-        self.db   = db
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  *** EVAL TEST — invokes claude -p (costs ~$1-2) ***")
+print(f"  Fixture: blank-redis-sessions (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print(f"  Target:  {ENDPOINT.split('@')[-1].split('/')[0] if '@' in ENDPOINT else ENDPOINT[:40]}")
+print()
 
-    def get(self, name):
-        time.sleep(0.002)
-        return _cache.get(name)
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture app exists", os.path.isdir(FIXTURE_DIR))
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-    def set(self, name, value, ex=None):
-        time.sleep(0.002)
-        _cache[name] = value
-        return True
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    print("Prerequisites failed — cannot continue")
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
 
-    def delete(self, *names):
-        time.sleep(0.002)
-        for n in names:
-            _cache.pop(n, None)
-        return len(names)
+print("  [PASS] all prerequisites met\n")
 
-    def exists(self, *names):
-        return sum(1 for n in names if n in _cache)
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-eval-24-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        dst = os.path.join(tmpdir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
 
-class redis:
-    Redis = _MockRedis
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot Eval"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-_orig_get = _MockRedis.get
-_orig_set = _MockRedis.set
-_orig_del = _MockRedis.delete
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-def _inst_get(self, name):
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
+    )
+
     t0 = time.time()
-    with tracer.start_as_current_span("redis.get", kind=SpanKind.CLIENT,
-        attributes={"db.system": "redis", "db.operation": "GET",
-                    "redis.key": name, "net.peer.name": self.host}) as span:
-        value = _orig_get(self, name)
-        hit   = value is not None
-        span.set_attribute("redis.hit", hit)
-        dur = (time.time() - t0) * 1000
-        redis_ops.add(1,   attributes={"redis.command": "GET"})
-        redis_latency.record(dur, attributes={"redis.command": "GET"})
-        (redis_hits if hit else redis_misses).add(1, attributes={"redis.db": str(self.db)})
-        return value
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
-def _inst_set(self, name, value, ex=None):
-    t0 = time.time()
-    with tracer.start_as_current_span("redis.set", kind=SpanKind.CLIENT,
-        attributes={"db.system": "redis", "db.operation": "SET",
-                    "redis.key": name, "redis.ttl_sec": ex or -1,
-                    "net.peer.name": self.host}) as span:
-        result = _orig_set(self, name, value, ex)
-        dur = (time.time() - t0) * 1000
-        redis_ops.add(1,   attributes={"redis.command": "SET"})
-        redis_latency.record(dur, attributes={"redis.command": "SET"})
-        return result
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
-def _inst_del(self, *names):
-    t0 = time.time()
-    with tracer.start_as_current_span("redis.delete", kind=SpanKind.CLIENT,
-        attributes={"db.system": "redis", "db.operation": "DEL",
-                    "redis.keys_count": len(names), "net.peer.name": self.host}) as span:
-        result = _orig_del(self, *names)
-        redis_ops.add(1, attributes={"redis.command": "DEL"})
-        redis_latency.record((time.time() - t0) * 1000, attributes={"redis.command": "DEL"})
-        return result
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-_MockRedis.get    = _inst_get
-_MockRedis.set    = _inst_set
-_MockRedis.delete = _inst_del
+    # ── Step 4: Inspect the diff ──────────────────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    diff_result = subprocess.run(
+        ["git", "diff", "HEAD"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    diff = diff_result.stdout
 
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
 
-def login(user_id, session_data):
-    r = redis.Redis(host="redis.internal", db=1, decode_responses=True)
-    existing = r.get(f"session:{user_id}")
-    if existing:
-        logger.info("existing session found", extra={"auth.user_id": user_id,
-                    "session.reuse": True})
-        return json.loads(existing)
+    print(f"  Modified files (git diff): {len(diff.splitlines())} diff lines")
+    print(f"  New files: {new_files}")
 
-    session = {"session_id": uuid.uuid4().hex, "user_id": user_id, **session_data}
-    r.set(f"session:{user_id}", json.dumps(session), ex=3600)
-    logger.info("new session created", extra={"auth.user_id": user_id,
-                "session.id": session["session_id"], "session.ttl_sec": 3600})
-    return session
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_file = os.path.join(tmpdir, "app.py")
+    otel_slos = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
 
-def logout(user_id):
-    r = redis.Redis(host="redis.internal", db=1, decode_responses=True)
-    r.delete(f"session:{user_id}")
-    logger.info("session deleted", extra={"auth.user_id": user_id})
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
 
+    print("\nCode correctness checks (Tier C — monkey-patch):")
 
-users = [
-    ("USR-001", {"role": "admin",  "tier": "enterprise", "region": "us-east"}),
-    ("USR-002", {"role": "viewer", "tier": "free",       "region": "eu-west"}),
-    ("USR-003", {"role": "editor", "tier": "pro",        "region": "us-west"}),
-]
+    # requirements.txt checks
+    check("opentelemetry-sdk or opentelemetry-api added to requirements.txt",
+          "opentelemetry-sdk" in req_content or "opentelemetry-api" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("OTLP exporter added",
+          "opentelemetry-exporter-otlp" in req_content,
+          f"requirements.txt:\n{req_content}")
 
-print(f"\n[{SVC}] Session cache operations via patched redis-py...")
-for user_id, data in users:
-    sess = login(user_id, data)
-    print(f"  ✅ login  {user_id}  session={sess['session_id'][:12]}...")
-    login(user_id, data)  # second call — should hit cache
+    # app.py Tier C monkey-patch pattern checks
+    check("redis.Redis.get monkey-patched",
+          ("Redis.get" in app_content
+           and ("_orig" in app_content or "_original" in app_content
+                or "= redis.Redis.get" in app_content
+                or "Redis.get =" in app_content)),
+          "redis.Redis.get monkey-patch pattern not found in app.py")
+    check("redis.Redis.set monkey-patched",
+          ("Redis.set" in app_content
+           and ("_orig" in app_content or "_original" in app_content
+                or "= redis.Redis.set" in app_content
+                or "Redis.set =" in app_content)),
+          "redis.Redis.set monkey-patch pattern not found in app.py")
+    check("redis.Redis.delete monkey-patched",
+          ("Redis.delete" in app_content
+           and ("_orig" in app_content or "_original" in app_content
+                or "= redis.Redis.delete" in app_content
+                or "Redis.delete =" in app_content)),
+          "redis.Redis.delete monkey-patch pattern not found in app.py")
+    check("CLIENT span on Redis operations",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("record_exception used on error path",
+          "record_exception" in app_content,
+          "record_exception not found in app.py")
+    check("Elastic endpoint configured from env",
+          "ELASTIC_OTLP_ENDPOINT" in app_content or "OTLP_ENDPOINT" in app_content
+          or ENDPOINT.split("//")[1][:20] in app_content,
+          "endpoint not referenced in app.py")
 
-logout("USR-002")
-print(f"  ✅ logout USR-002  session deleted")
+    # Business enrichment checks
+    print("\nBusiness enrichment checks:")
+    has_redis_enrichment = any(
+        attr in app_content for attr in [
+            "db.system", "redis.key", "cache.key", "redis.hit",
+            "db.operation", "net.peer.name", "redis.ttl",
+        ]
+    )
+    check("Business span attributes added (db.system / redis.key / redis.hit)",
+          has_redis_enrichment,
+          "no Redis business enrichment attributes found in app.py")
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+    # .otel/ output files
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created",
+          os.path.exists(otel_slos),
+          f"expected at {otel_slos}")
+    if os.path.exists(otel_slos):
+        try:
+            slos_raw = json.load(open(otel_slos))
+            if isinstance(slos_raw, list):
+                check(".otel/slos.json is valid JSON with at least one SLO",
+                      len(slos_raw) > 0, "got empty list")
+            else:
+                check(".otel/slos.json is valid JSON with 'services' key",
+                      "services" in slos_raw,
+                      f"keys: {list(slos_raw.keys())}")
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+
+    check(".otel/golden-paths.md created",
+          os.path.exists(otel_golden),
+          f"expected at {otel_golden}")
+
+    # ── Step 5: Syntax check the instrumented app ─────────────────────────────
+    print("\nStep 5: Checking instrumented app compiles")
+
+    compile_result = subprocess.run(
+        [sys.executable, "-m", "py_compile", app_file],
+        capture_output=True, text=True
+    )
+    check("Instrumented app.py compiles without syntax errors",
+          compile_result.returncode == 0,
+          f"compile error: {compile_result.stderr}")
+
+    # Install requirements
+    pip_install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "-r", req_file, "--no-warn-script-location"],
+        capture_output=True, text=True
+    )
+    if pip_install.returncode != 0:
+        check("pip install of generated requirements succeeded",
+              False, pip_install.stderr[-500:])
+    else:
+        check("pip install of generated requirements succeeded", True)
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ─────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

@@ -1,148 +1,192 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier C — OpenAI Python SDK (monkey-patched).
+E2E "Observe this project." — Tier C: OpenAI
+=============================================
+Runs `claude -p "Observe this project."` on a blank support ticket classifier
+that uses the OpenAI Python SDK to classify tickets via GPT.
 
-Patches openai.ChatCompletion.create — existing call sites unchanged.
-Business scenario: Customer support ticket classification — classify incoming
-tickets by severity and category using GPT.
+EDOT Autopilot workflow:
+  1. Reads blank fixture — finds openai.ChatCompletion.create calls
+  2. Assigns Tier C (monkey-patch) — no official opentelemetry-instrumentation-openai
+  3. Wraps ChatCompletion.create with CLIENT spans
+  4. Adds business attributes: llm.model, llm.provider=openai,
+     llm.prompt_tokens, llm.completion_tokens, llm.estimated_cost_usd
 
 Run:
     cd smoke-tests && python3 32-tier-c-openai/smoke.py
 """
 
-import os, sys, uuid, time, random
-from pathlib import Path
+import os
+import sys
+import time
+import shutil
+import subprocess
+import tempfile
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind, StatusCode
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
-SVC = "smoke-tier-c-openai"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "32-tier-c-openai"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-openai")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
 
-ai_requests    = meter.create_counter("openai.requests")
-ai_tokens      = meter.create_histogram("openai.total_tokens")
-ai_latency     = meter.create_histogram("openai.response_ms", unit="ms")
-ai_cost_est    = meter.create_histogram("openai.estimated_cost_usd", unit="USD")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
 
-CATEGORIES = ["billing", "technical", "account", "feature-request", "compliance"]
-SEVERITIES = ["low", "medium", "high", "critical"]
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | {SVC}")
+print(f"{'='*62}")
+print(f"  Fixture: blank-openai (no OTel)")
+print(f"  Agent:   claude -p (non-interactive)")
+print()
 
-class _MockChoice:
-    def __init__(self, content):
-        self.message = type("Msg", (), {"content": content, "role": "assistant"})()
+# ── Step 1: Verify prerequisites ──────────────────────────────────────────────
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None,
+      "install via: npm install -g @anthropic-ai/claude-code")
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD), f"looked at {CLAUDE_MD}")
+check("Fixture dir exists", os.path.isdir(FIXTURE_DIR), FIXTURE_DIR)
+check("Fixture has no OTel", not any(
+    "opentelemetry" in open(os.path.join(FIXTURE_DIR, f)).read()
+    for f in ["app.py", "requirements.txt"]
+    if os.path.exists(os.path.join(FIXTURE_DIR, f))
+), "fixture already contains opentelemetry — test is invalid")
 
-class _MockCompletion:
-    def __init__(self, model, prompt_tokens, completion_tokens, content):
-        self.id      = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        self.model   = model
-        self.choices = [_MockChoice(content)]
-        self.usage   = type("Usage", (), {
-            "prompt_tokens":     prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens":      prompt_tokens + completion_tokens,
-        })()
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for status, name, detail in CHECKS:
+        line = f"  [{status}] {name}"
+        if detail and status == "FAIL":
+            line += f"\n         -> {detail}"
+        print(line)
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
 
-class _MockChatCompletion:
-    @staticmethod
-    def create(model, messages, temperature=0.7, max_tokens=150, **kwargs):
-        time.sleep(random.uniform(0.2, 0.8))  # realistic LLM latency
-        prompt_tokens     = sum(len(m["content"].split()) * 1.3 for m in messages)
-        completion_tokens = random.randint(20, 80)
-        category  = random.choice(CATEGORIES)
-        severity  = random.choice(SEVERITIES)
-        content   = f'{{"category": "{category}", "severity": "{severity}", "confidence": {random.uniform(0.75, 0.99):.2f}}}'
-        return _MockCompletion(model, int(prompt_tokens), completion_tokens, content)
+# ── Step 2: Set up temp workspace ─────────────────────────────────────────────
+print("Step 2: Setting up blank app workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-openai-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
 
-class openai:
-    ChatCompletion = _MockChatCompletion
-    api_key = "sk-fake-key-for-smoke-test"
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
 
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank app, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
 
-_orig_create = _MockChatCompletion.create
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}")
+    print(f"  Files: {sorted(os.listdir(tmpdir))}\n")
 
-@staticmethod
-def _inst_create(model, messages, temperature=0.7, max_tokens=150, **kwargs):
-    t0 = time.time()
-    with tracer.start_as_current_span("openai.chat_completion", kind=SpanKind.CLIENT,
-        attributes={"llm.provider":         "openai",
-                    "llm.model":            model,
-                    "llm.temperature":      temperature,
-                    "llm.max_tokens":       max_tokens,
-                    "llm.messages_count":   len(messages)}) as span:
-        result = _orig_create(model=model, messages=messages,
-                              temperature=temperature, max_tokens=max_tokens, **kwargs)
-        dur   = (time.time() - t0) * 1000
-        total = result.usage.total_tokens
-        cost  = (result.usage.prompt_tokens / 1000 * 0.03 +
-                 result.usage.completion_tokens / 1000 * 0.06)
-
-        span.set_attribute("llm.prompt_tokens",      result.usage.prompt_tokens)
-        span.set_attribute("llm.completion_tokens",  result.usage.completion_tokens)
-        span.set_attribute("llm.total_tokens",       total)
-        span.set_attribute("llm.completion_id",      result.id)
-        span.set_attribute("llm.estimated_cost_usd", round(cost, 6))
-
-        ai_requests.add(1,   attributes={"llm.model": model})
-        ai_tokens.record(total, attributes={"llm.model": model})
-        ai_latency.record(dur,  attributes={"llm.model": model})
-        ai_cost_est.record(cost, attributes={"llm.model": model})
-
-        logger.info("openai completion received",
-                    extra={"llm.model": model, "llm.total_tokens": total,
-                           "llm.completion_id": result.id, "llm.response_ms": round(dur, 2),
-                           "llm.estimated_cost_usd": round(cost, 6)})
-        return result
-
-openai.ChatCompletion.create = _inst_create
-
-
-def classify_ticket(ticket_id, subject, body, customer_tier):
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Classify support tickets by category and severity. Respond with JSON only."},
-            {"role": "user",   "content": f"Ticket: {subject}\n\nBody: {body[:200]}\n\nCustomer tier: {customer_tier}"},
-        ],
-        temperature=0.1,
-        max_tokens=100,
+    # ── Step 3: Run "Observe this project." ───────────────────────────────────
+    print("Step 3: Running claude -p 'Observe this project.' (this takes a few minutes...)")
+    observe_prompt = (
+        f"Observe this project.\n"
+        f"My Elastic endpoint: {ENDPOINT}\n"
+        f"My Elastic API key: {API_KEY}"
     )
-    import json as _json
-    try:
-        classification = _json.loads(response.choices[0].message.content)
-    except Exception:
-        classification = {"category": "unknown", "severity": "medium"}
 
-    logger.info("ticket classified",
-                extra={"ticket.id": ticket_id, "ticket.category": classification.get("category"),
-                       "ticket.severity": classification.get("severity"),
-                       "ticket.customer_tier": customer_tier,
-                       "llm.model": "gpt-4o-mini"})
-    return classification
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            claude_bin,
+            "--dangerously-skip-permissions",
+            "-p", observe_prompt,
+            "--model", "claude-sonnet-4-6",
+            "--max-budget-usd", "2.00",
+        ],
+        cwd=tmpdir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - t0
 
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        lines = result.stdout.strip().splitlines()
+        print(f"  Agent output (last 20 lines of {len(lines)} total):")
+        for line in lines[-20:]:
+            print(f"    {line}")
 
-tickets = [
-    ("TKT-001", "Billing error on invoice #4521", "I was charged twice this month...", "enterprise"),
-    ("TKT-002", "API rate limits too low for our use case", "We are hitting the rate limit...", "pro"),
-    ("TKT-003", "Cannot log into my account", "Getting 401 errors since yesterday...", "free"),
-    ("TKT-004", "GDPR data export request", "Requesting all personal data under GDPR...", "enterprise"),
-    ("TKT-005", "Feature: support for webhooks", "Would love webhook support for order events...", "pro"),
-]
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-print(f"\n[{SVC}] Classifying support tickets via patched OpenAI SDK...")
-for ticket_id, subject, body, tier in tickets:
-    cls = classify_ticket(ticket_id, subject, body, tier)
-    icon = "🚨" if cls.get("severity") == "critical" else "✅"
-    print(f"  {icon} {ticket_id}  {tier:<12}  category={cls.get('category'):<18}  severity={cls.get('severity')}")
+    # ── Step 4: Inspect what the agent changed ────────────────────────────────
+    print("\nStep 4: Inspecting what the agent changed")
+    new_files_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True
+    )
+    new_files = [f.strip() for f in new_files_result.stdout.splitlines() if f.strip()]
+    print(f"  New files: {new_files}")
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+    app_file = os.path.join(tmpdir, "app.py")
+    req_file = os.path.join(tmpdir, "requirements.txt")
+    app_content = open(app_file).read() if os.path.exists(app_file) else ""
+    req_content = open(req_file).read() if os.path.exists(req_file) else ""
+
+    print("\nTier C monkey-patch checks:")
+    check("opentelemetry added to requirements.txt",
+          "opentelemetry" in req_content,
+          f"requirements.txt:\n{req_content}")
+    check("SDK client method monkey-patched (Tier C)",
+          "_orig_" in app_content or "functools.wraps" in app_content
+          or "= original_" in app_content,
+          "no monkey-patch pattern found")
+    check("SpanKind.CLIENT on SDK calls",
+          "SpanKind.CLIENT" in app_content,
+          "SpanKind.CLIENT not found in app.py")
+    check("Business attributes on spans",
+          any(attr in app_content for attr in [
+              "openai.", "llm.model", "llm.provider", "llm.tokens",
+              "llm.prompt_tokens", "llm.completion",
+          ]),
+          "no openai/llm.* attributes found in app.py")
+    check("ChatCompletion.create is patched",
+          "create" in app_content and (
+              "_orig_" in app_content or "wrap" in app_content.lower()
+          ),
+          "ChatCompletion.create patch not detected")
+
+    otel_slos   = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden = os.path.join(tmpdir, ".otel", "golden-paths.md")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved for inspection: {tmpdir}")
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ── Final summary ──────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

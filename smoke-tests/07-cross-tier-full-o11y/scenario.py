@@ -32,15 +32,14 @@ Run:
 
 import os, sys, uuid, time, json, urllib.request
 from pathlib import Path
+from dotenv import load_dotenv
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
-env_file = Path(__file__).parent.parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from o11y_bootstrap import O11yBootstrap
@@ -48,10 +47,13 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
-API_KEY  = os.environ["ELASTIC_API_KEY"]
-ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
-SIDECAR  = os.environ.get("OTEL_SIDECAR_URL", "http://127.0.0.1:9411")
+ENV     = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+SIDECAR = os.environ.get("OTEL_SIDECAR_URL", "http://127.0.0.1:9411")
+
+CHECKS: list[tuple[str, str, str]] = []
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
 propagator = TraceContextTextMapPropagator()
 
@@ -554,18 +556,20 @@ no_credit = {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-print(f"\n{'='*70}")
-print(f"  Cross-Tier Full O11y — 8 Scenarios, 7 Tier Combinations")
-print(f"{'='*70}")
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | Cross-Tier Full O11y")
+print(f"{'='*62}")
 
 # Check sidecar
 r = sidecar({"action": "health"})
 if r.get("ok"):
-    print(f"\n  ✅ Sidecar ready at {SIDECAR}")
+    print(f"\n  Sidecar ready at {SIDECAR}")
 else:
-    print(f"\n  ⚠️  Sidecar unavailable ({r.get('error','no response')}) — Tier D spans skipped")
+    print(f"\n  Sidecar unavailable ({r.get('error','no response')}) — Tier D spans skipped")
     print(f"     Start with: OTEL_SERVICE_NAME=notification-sms-bash "
           f"python3 otel-sidecar/otel-sidecar.py &")
+
+results = []
 
 scenarios = [
     ("1. A→B→C→D",  "Full enterprise activation",               lambda: scenario_a_b_c_d(enterprise)),
@@ -579,27 +583,57 @@ scenarios = [
 ]
 
 for label, description, fn in scenarios:
-    print(f"\n{'─'*70}")
+    print(f"\n{'─'*62}")
     print(f"  Scenario {label}  —  {description}")
-    fn()
+    try:
+        fn()
+        results.append((f"Scenario {label} — {description}", "OK", None))
+    except Exception as e:
+        results.append((f"Scenario {label} — {description}", "ERROR", str(e)))
 
-print(f"\n{'─'*70}")
+print(f"\n{'─'*62}")
 print("  Flushing all providers...")
 tier_a.flush()
 tier_b.flush()
 tier_c.flush()
 
-print(f"\n{'='*70}")
-print("  ✅ Cross-tier scenarios complete")
-print()
-print("  Kibana Service Map: Observability → APM → Service Map")
-print("  Services to look for:")
-print("    activation-api · legacy-billing-engine ·")
-print("    payment-gateway-stripe · notification-sms-bash")
-print()
-print("  ES|QL — all cross-tier traces:")
-print('    FROM traces-apm*,logs-*')
-print('    | WHERE service.name IN ("activation-api","legacy-billing-engine",')
-print('                             "payment-gateway-stripe","notification-sms-bash")')
-print('    | SORT @timestamp DESC | LIMIT 100')
-print(f"{'='*70}\n")
+# ── Span assertions: verify instrumentation correctness ──────────────────────
+spans_a = tier_a.get_finished_spans()
+spans_b = tier_b.get_finished_spans()
+spans_c = tier_c.get_finished_spans()
+all_spans = list(spans_a) + list(spans_b) + list(spans_c)
+span_names = [s.name for s in all_spans]
+
+print("\nSpan assertions (instrumentation correctness):")
+check("At least one span captured across all tiers",
+      len(all_spans) > 0,
+      f"got {len(all_spans)} total spans")
+check("Tier A activation.receive SERVER span present",
+      any(s.name == "activation.receive" and s.kind == SpanKind.SERVER for s in spans_a),
+      f"tier_a span names: {[s.name for s in spans_a]}")
+check("Tier B billing.credit_check CLIENT span present",
+      any(s.name == "billing.credit_check" and s.kind == SpanKind.CLIENT for s in spans_b),
+      f"tier_b span names: {[s.name for s in spans_b]}")
+check("Tier C stripe.charge.create CLIENT span present",
+      any(s.name == "stripe.charge.create" and s.kind == SpanKind.CLIENT for s in spans_c),
+      f"tier_c span names: {[s.name for s in spans_c]}")
+check("Spans from multiple tiers captured",
+      len(spans_a) > 0 and len(spans_b) > 0 and len(spans_c) > 0,
+      f"tier_a={len(spans_a)} tier_b={len(spans_b)} tier_c={len(spans_c)}")
+
+for scenario_name, status, error_detail in results:
+    if status in ("OK", "WARN"):
+        check(scenario_name, True)
+    else:
+        check(scenario_name, False, error_detail or "")
+
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)

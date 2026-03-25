@@ -1,111 +1,219 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier D — Lua / game server scripting (sidecar simulation).
-
-Simulates a Lua game server script submitting observability via the HTTP sidecar.
-Business scenario: multiplayer game session management — player matchmaking,
-in-game economy transactions, achievement unlock events.
+E2E "Observe this project." — Tier D Lua Game Server
+=====================================================
+Runs `claude -p "Observe this project."` on a blank Lua game server
+script.  Lua/LuaJIT has no OTel SDK; agent must assign Tier D.
 
 Run:
     cd smoke-tests && python3 41-tier-d-lua/smoke.py
 """
 
-import os, sys, time, random, uuid
-from pathlib import Path
+import os, sys, time, json, shutil, subprocess, tempfile, urllib.request
+from dotenv import load_dotenv
 
-env_file = Path(__file__).parent.parent / ".env"
-for line in env_file.read_text().splitlines():
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1); os.environ.setdefault(k, v)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from o11y_bootstrap import O11yBootstrap
-from opentelemetry.trace import SpanKind
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set"); sys.exit(0)
 
-SVC = "smoke-tier-d-lua"
-o11y   = O11yBootstrap(SVC, os.environ["ELASTIC_OTLP_ENDPOINT"], os.environ["ELASTIC_API_KEY"],
-                       os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test"))
-tracer, logger, meter = o11y.tracer, o11y.logger, o11y.meter
+SVC         = "41-tier-d-lua"
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "blank-lua")
+SIDECAR_SRC = os.path.join(os.path.dirname(__file__), "../../otel-sidecar/otel-sidecar.py")
+CLAUDE_MD   = os.path.join(os.path.dirname(__file__), "../../CLAUDE.md")
+if not os.path.exists(CLAUDE_MD):
+    CLAUDE_MD = os.path.join(os.path.dirname(__file__), "../../../CLAUDE.md")
+SIDECAR_PORT = 19441
 
-matches_created    = meter.create_counter("lua.matches_created")
-transactions       = meter.create_counter("lua.economy_transactions")
-achievements_fired = meter.create_counter("lua.achievements_unlocked")
-matchmake_ms       = meter.create_histogram("lua.matchmake_duration_ms", unit="ms")
-economy_coins      = meter.create_histogram("lua.transaction_coins")
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name, ok, detail=""):
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
-GAME_EVENTS = [
-    {"type": "match_create",  "player_ids": ["P-7711", "P-3344", "P-9922", "P-1156"], "map": "Crossroads",  "mode": "ranked"},
-    {"type": "purchase",      "player_id": "P-7711", "item": "legendary_sword",        "coins": 2500,        "currency": "gold"},
-    {"type": "achievement",   "player_id": "P-3344", "achievement": "first_blood",     "xp_reward": 500,     "rare": False},
-    {"type": "match_create",  "player_ids": ["P-5544", "P-8823"],                      "map": "Desert_Dune", "mode": "casual"},
-    {"type": "purchase",      "player_id": "P-9922", "item": "battle_pass",            "coins": 0,           "currency": "premium", "usd": 9.99},
-    {"type": "achievement",   "player_id": "P-9922", "achievement": "sharpshooter",    "xp_reward": 1500,    "rare": True},
-]
+print(f"\n{'='*62}\nEDOT-Autopilot | {SVC}\n{'='*62}")
+print("  Fixture: blank-lua (no OTel, no sidecar)\n")
 
-def process_game_event(event):
+print("Step 1: Prerequisites")
+claude_bin = shutil.which("claude")
+check("claude CLI is installed", claude_bin is not None)
+check("CLAUDE.md exists", os.path.exists(CLAUDE_MD))
+check("Fixture directory exists", os.path.isdir(FIXTURE_DIR))
+check("otel-sidecar.py source exists", os.path.exists(SIDECAR_SRC))
+lua_path = os.path.join(FIXTURE_DIR, "game_server.lua")
+if os.path.exists(lua_path):
+    content = open(lua_path).read()
+    check("Fixture Lua has no sidecar calls yet",
+          "sidecar" not in content.lower() and "otel" not in content.lower())
+if any(s == "FAIL" for s, _, _ in CHECKS):
+    for s, n, d in CHECKS:
+        print(f"  [{s}] {n}" + (f"\n         -> {d}" if d and s == "FAIL" else ""))
+    sys.exit(1)
+print("  [PASS] all prerequisites met\n")
+
+print("Step 2: Setting up blank Lua workspace")
+tmpdir = tempfile.mkdtemp(prefix="edot-autopilot-lua-")
+try:
+    for fname in os.listdir(FIXTURE_DIR):
+        src = os.path.join(FIXTURE_DIR, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
+    shutil.copy2(CLAUDE_MD, os.path.join(tmpdir, "CLAUDE.md"))
+    subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@edot-autopilot"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "EDOT Autopilot E2E"], cwd=tmpdir, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial: blank Lua, no observability"],
+                   cwd=tmpdir, capture_output=True, check=True)
+    check("Temp workspace created", True, tmpdir)
+    print(f"  Workspace: {tmpdir}\n")
+
+    print("Step 3: Running claude -p 'Observe this project.' ...")
+    observe_prompt = f"Observe this project.\nMy Elastic endpoint: {ENDPOINT}\nMy Elastic API key: {API_KEY}"
     t0 = time.time()
+    result = subprocess.run(
+        [claude_bin, "--dangerously-skip-permissions", "-p", observe_prompt,
+         "--model", "claude-sonnet-4-6", "--max-budget-usd", "2.00"],
+        cwd=tmpdir, capture_output=True, text=True, timeout=600)
+    elapsed = time.time() - t0
+    print(f"  Agent finished in {elapsed:.0f}s (exit code {result.returncode})")
+    if result.stdout:
+        for line in result.stdout.strip().splitlines()[-20:]:
+            print(f"    {line}")
+    check("Agent exited cleanly", result.returncode == 0,
+          f"stderr: {result.stderr[-500:] if result.stderr else ''}")
 
-    if event["type"] == "match_create":
-        session_id = f"MATCH-{uuid.uuid4().hex[:8].upper()}"
-        with tracer.start_as_current_span("lua.matchmaker.create_session", kind=SpanKind.INTERNAL,
-                attributes={"game.event_type": "match_create", "game.map": event["map"],
-                            "game.mode": event["mode"], "game.player_count": len(event["player_ids"]),
-                            "game.session_id": session_id}) as span:
-            with tracer.start_as_current_span("lua.matchmaker.verify_players", kind=SpanKind.CLIENT,
-                    attributes={"db.operation": "HGET", "db.system": "redis"}):
-                time.sleep(random.uniform(0.005, 0.015))
-            with tracer.start_as_current_span("lua.matchmaker.allocate_server", kind=SpanKind.CLIENT,
-                    attributes={"game.region": "us-east-1"}):
-                time.sleep(random.uniform(0.02, 0.06))
-            dur = (time.time() - t0) * 1000
-            matches_created.add(1, attributes={"game.mode": event["mode"], "game.map": event["map"]})
-            matchmake_ms.record(dur, attributes={"game.mode": event["mode"]})
-            logger.info("match created", extra={"game.session_id": session_id, "game.map": event["map"],
-                                                 "game.mode": event["mode"],
-                                                 "game.player_count": len(event["player_ids"])})
-        return session_id
+    print("\nStep 4: Inspecting what the agent changed")
+    diff = subprocess.run(["git", "diff", "HEAD"], cwd=tmpdir, capture_output=True, text=True).stdout
+    new_files = [f.strip() for f in subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=tmpdir, capture_output=True, text=True).stdout.splitlines() if f.strip()]
+    print(f"  Diff lines: {len(diff.splitlines())}  New files: {new_files}")
 
-    elif event["type"] == "purchase":
-        tx_id = f"TX-{uuid.uuid4().hex[:10].upper()}"
-        with tracer.start_as_current_span("lua.economy.process_purchase", kind=SpanKind.INTERNAL,
-                attributes={"game.event_type": "purchase", "game.player_id": event["player_id"],
-                            "economy.item": event["item"], "economy.currency": event["currency"],
-                            "economy.coins": event["coins"]}) as span:
-            time.sleep(random.uniform(0.01, 0.04))
-            span.set_attribute("economy.tx_id", tx_id)
-            transactions.add(1, attributes={"economy.currency": event["currency"], "economy.item": event["item"]})
-            if event["coins"] > 0:
-                economy_coins.record(event["coins"], attributes={"economy.currency": event["currency"]})
-            logger.info("purchase processed", extra={"game.player_id": event["player_id"],
-                                                      "economy.item": event["item"],
-                                                      "economy.tx_id": tx_id, "economy.coins": event["coins"]})
-        return tx_id
+    all_text = "\n".join(
+        open(os.path.join(tmpdir, f)).read()
+        for f in os.listdir(tmpdir)
+        if os.path.isfile(os.path.join(tmpdir, f)) and not f.startswith(".") and f != "CLAUDE.md"
+    )
+    sidecar_path = os.path.join(tmpdir, "otel-sidecar.py")
+    otel_slos    = os.path.join(tmpdir, ".otel", "slos.json")
+    otel_golden  = os.path.join(tmpdir, ".otel", "golden-paths.md")
 
-    elif event["type"] == "achievement":
-        with tracer.start_as_current_span("lua.achievements.unlock", kind=SpanKind.INTERNAL,
-                attributes={"game.event_type": "achievement", "game.player_id": event["player_id"],
-                            "achievement.name": event["achievement"], "achievement.xp_reward": event["xp_reward"],
-                            "achievement.rare": event["rare"]}) as span:
-            time.sleep(random.uniform(0.005, 0.02))
-            achievements_fired.add(1, attributes={"achievement.name": event["achievement"],
-                                                   "achievement.rare": str(event["rare"])})
-            logger.info("achievement unlocked", extra={"game.player_id": event["player_id"],
-                                                        "achievement.name": event["achievement"],
-                                                        "achievement.xp_reward": event["xp_reward"],
-                                                        "achievement.rare": event["rare"]})
+    print("\nTier D (sidecar bridge) checks:")
+    check("otel-sidecar.py added to project",
+          os.path.exists(sidecar_path) or any("otel-sidecar" in f for f in new_files))
+    check("Lua or helper contains HTTP sidecar calls",
+          any(kw in all_text.lower() for kw in
+              ["socket.http", "lua-requests", "otel-sidecar", "start_span", "sidecar", "curl"]))
+    check("Correct Lua span names referenced",
+          any(n in all_text for n in
+              ["matchmaker.create_session", "economy.process_purchase",
+               "achievements.unlock", "lua.matchmaker", "game_server"]))
+    check("Business span attributes referenced (game.*/economy.*/achievement.*)",
+          any(a in all_text for a in
+              ["game.event_type", "game.map", "economy.item", "achievement.name",
+               "game.session_id"]))
 
-print(f"\n[{SVC}] Simulating Lua game server event processing...")
-for event in GAME_EVENTS:
-    result = process_game_event(event)
-    if event["type"] == "match_create":
-        print(f"  ✅ MATCH  map={event['map']:<15}  mode={event['mode']:<8}  players={len(event['player_ids'])}  id={result}")
-    elif event["type"] == "purchase":
-        coins = f"{event['coins']} {event['currency']}" if event["coins"] else f"${event.get('usd', 0):.2f} USD"
-        print(f"  ✅ PURCHASE  player={event['player_id']}  item={event['item']:<20}  cost={coins}")
+    print("\n.otel/ output file checks:")
+    check(".otel/slos.json created", os.path.exists(otel_slos))
+    if os.path.exists(otel_slos):
+        try:
+            check(".otel/slos.json is valid JSON", isinstance(json.load(open(otel_slos)), (list, dict)))
+        except json.JSONDecodeError as e:
+            check(".otel/slos.json is valid JSON", False, str(e))
+    check(".otel/golden-paths.md created", os.path.exists(otel_golden))
+
+    print("\nStep 5: Starting otel-sidecar.py and sending simulated Lua payloads")
+    sidecar_py = sidecar_path if os.path.exists(sidecar_path) else SIDECAR_SRC
+    sidecar_env = os.environ.copy()
+    sidecar_env.update({"OTEL_SERVICE_NAME": SVC, "ELASTIC_OTLP_ENDPOINT": ENDPOINT,
+                         "ELASTIC_API_KEY": API_KEY, "OTEL_DEPLOYMENT_ENVIRONMENT": "smoke-test",
+                         "SIDECAR_PORT": str(SIDECAR_PORT)})
+    sidecar_proc = subprocess.Popen(
+        [sys.executable, sidecar_py], env=sidecar_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    sidecar_up = False
+    for _ in range(30):
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=b'{"action":"health"}',
+                headers={"Content-Type": "application/json"}, method="POST"), timeout=1)
+            if resp.status == 200:
+                sidecar_up = True; break
+        except Exception:
+            time.sleep(0.3)
+    check("otel-sidecar started and responds to health check", sidecar_up)
+
+    if sidecar_up:
+        print(f"  Sidecar running on port {SIDECAR_PORT}")
+        def post(payload):
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{SIDECAR_PORT}/",
+                data=data, headers={"Content-Type": "application/json"}, method="POST")
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
+
+        try:
+            r = post({"action": "start_span", "name": "lua.matchmaker.create_session",
+                       "kind": "internal",
+                       "attributes": {"game.event_type": "match_create",
+                                      "game.map": "Crossroads", "game.mode": "ranked",
+                                      "game.player_count": 4}})
+            match_id = r["span_id"]; tp = r["traceparent"]
+            check("start_span lua.matchmaker.create_session → ok", r.get("ok") is True, str(r))
+            for step in ["lua.matchmaker.verify_players", "lua.matchmaker.allocate_server"]:
+                rs = post({"action": "start_span", "name": step, "kind": "client",
+                           "traceparent": tp, "attributes": {"game.region": "us-east-1"}})
+                post({"action": "end_span", "span_id": rs["span_id"]})
+            post({"action": "end_span", "span_id": match_id,
+                  "attributes": {"game.session_id": "MATCH-ABCD1234"}})
+
+            r2 = post({"action": "start_span", "name": "lua.economy.process_purchase",
+                        "kind": "internal",
+                        "attributes": {"game.player_id": "P-7711", "economy.item": "legendary_sword",
+                                       "economy.coins": 2500}})
+            post({"action": "end_span", "span_id": r2["span_id"],
+                  "attributes": {"economy.tx_id": "TX-ABCDE12345"}})
+            check("lua.economy.process_purchase span round-trip", r2.get("ok") is True, str(r2))
+
+            r3 = post({"action": "start_span", "name": "lua.achievements.unlock",
+                        "kind": "internal",
+                        "attributes": {"game.player_id": "P-3344",
+                                       "achievement.name": "first_blood",
+                                       "achievement.xp_reward": 500}})
+            post({"action": "end_span", "span_id": r3["span_id"]})
+            check("lua.achievements.unlock span round-trip", r3.get("ok") is True, str(r3))
+
+            post({"action": "metric_counter", "name": "lua.matches_created",
+                  "value": 1, "attributes": {}})
+        except Exception as exc:
+            check("Sidecar payload simulation completed without error", False, str(exc))
+
+        print("\n  Waiting 3s for OTLP export to Elastic...")
+        time.sleep(3)
+        check("Sidecar process still alive", sidecar_proc.poll() is None)
+
+    if sidecar_proc.poll() is None:
+        sidecar_proc.terminate(); sidecar_proc.wait(timeout=5)
+
+finally:
+    failed_checks = [n for s, n, _ in CHECKS if s == "FAIL"]
+    if failed_checks:
+        print(f"\n  NOTE: Workspace preserved: {tmpdir}")
     else:
-        icon = "🏆" if event["rare"] else "✅"
-        print(f"  {icon} ACHIEVEMENT  player={event['player_id']}  {event['achievement']:<20}  xp=+{event['xp_reward']}")
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-o11y.flush()
-print(f"[{SVC}] Done → Kibana APM → {SVC}")
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+print(f"\n{'='*62}")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+print(f"  Kibana -> APM -> {SVC}")
+if failed:
+    sys.exit(1)

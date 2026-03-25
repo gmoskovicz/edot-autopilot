@@ -25,18 +25,17 @@ Run:
 """
 
 import os, sys, uuid, time, random, threading, hashlib
-from pathlib import Path
+from dotenv import load_dotenv
 
-# ── Load .env ─────────────────────────────────────────────────────────────────
-env_file = Path(__file__).parent.parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+ENDPOINT = os.environ.get("ELASTIC_OTLP_ENDPOINT", "").rstrip("/")
+API_KEY  = os.environ.get("ELASTIC_API_KEY", "")
+if not ENDPOINT or not API_KEY:
+    print("SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not set")
+    sys.exit(0)
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from o11y_bootstrap import O11yBootstrap
 
 from opentelemetry.trace import SpanKind, StatusCode, Link
@@ -44,9 +43,11 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from opentelemetry import baggage
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
 
-ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
-API_KEY  = os.environ["ELASTIC_API_KEY"]
-ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+ENV = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
+
+CHECKS: list[tuple[str, bool, str]] = []
+def check(name: str, ok: bool, detail: str = "") -> None:
+    CHECKS.append(("PASS" if ok else "FAIL", name, detail))
 
 propagator = TraceContextTextMapPropagator()
 
@@ -1062,7 +1063,7 @@ def scen_app_crash_oom(session_id, customer, device):
     return False, f"OOM crash during image loading — mobile.crashes +1"
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Scenario tables ───────────────────────────────────────────────────────────
 
 HAPPY_SCENARIOS = [
     ("App launch + home feed",          scen_app_launch_home_feed),
@@ -1090,73 +1091,79 @@ ERROR_SCENARIOS = [
     ("App crash: OOM during image loading",       scen_app_crash_oom),
 ]
 
-if __name__ == "__main__":
-    print(f"\n{'='*70}")
-    print("  Mobile E-Commerce Scenario — 9 Services, 20 Scenarios")
-    print("  mobile-shopapp → api-gateway-mobile")
-    print("    → catalog-service, inventory-service-go, user-profile-service")
-    print("    → payment-mobile-service → fraud-detection-mobile")
-    print("                             → payment-processor-mobile")
-    print("    → push-notification-service")
-    print("    → analytics-ingest")
-    print(f"{'='*70}")
+# ── Banner ────────────────────────────────────────────────────────────────────
+print(f"\n{'='*62}")
+print(f"EDOT-Autopilot | mobile-ecommerce-shopapp")
+print(f"{'='*62}")
 
-    happy_pass  = 0
-    happy_fail  = 0
-    error_pass  = 0
-    error_fail  = 0
+# ── Happy-path flows ──────────────────────────────────────────────────────────
+print(f"\n-- Happy Path Flows --")
+for label, fn in HAPPY_SCENARIOS:
+    customer = random.choice([c for c in CUSTOMERS if c["tier"] != "guest"])
+    device   = random.choice(DEVICES)
+    try:
+        ok, detail = run_scenario(label, customer, device, fn)
+        check(f"[happy] {label}", ok, detail if not ok else "")
+    except Exception as exc:
+        check(f"[happy] {label}", False, str(exc))
+    time.sleep(random.uniform(0.05, 0.15))
 
-    print(f"\n── Happy Path Flows {'─'*41}")
-    for label, fn in HAPPY_SCENARIOS:
-        customer = random.choice([c for c in CUSTOMERS if c["tier"] != "guest"])
-        device   = random.choice(DEVICES)
-        try:
-            ok, detail = run_scenario(label, customer, device, fn)
-            if ok:
-                print(f"  \u2705 {label}: {detail}")
-                happy_pass += 1
-            else:
-                print(f"  \u274c {label}: {detail}")
-                happy_fail += 1
-        except Exception as exc:
-            print(f"  \u274c {label}: exception — {exc}")
-            happy_fail += 1
-        time.sleep(random.uniform(0.05, 0.15))
+# ── Error / degraded flows ────────────────────────────────────────────────────
+print(f"\n-- Error / Degraded Flows --")
+for label, fn in ERROR_SCENARIOS:
+    customer = random.choice(CUSTOMERS)
+    device   = random.choice(DEVICES)
+    try:
+        ok, detail = run_scenario(label, customer, device, fn)
+        # Error scenarios are expected failures — scenario completing is a PASS
+        check(f"[error] {label}", True, detail)
+    except Exception as exc:
+        check(f"[error] {label}", False, str(exc))
+    time.sleep(random.uniform(0.05, 0.15))
 
-    print(f"\n── Error / Degraded Flows {'─'*35}")
-    for label, fn in ERROR_SCENARIOS:
-        customer = random.choice(CUSTOMERS)
-        device   = random.choice(DEVICES)
-        try:
-            ok, detail = run_scenario(label, customer, device, fn)
-            # Error scenarios are "expected" failures — reported with ❌
-            print(f"  \u274c {label}: {detail}")
-            error_fail += 1
-        except Exception as exc:
-            print(f"  \u274c {label}: exception — {exc}")
-            error_fail += 1
-        time.sleep(random.uniform(0.05, 0.15))
+# ── Flush all telemetry providers ─────────────────────────────────────────────
+for svc in [mobile_client, gateway, catalog_svc, inventory_svc, profile_svc,
+            payment_svc, fraud_svc, processor_svc, push_svc, analytics_svc]:
+    svc.flush()
 
-    total_happy  = len(HAPPY_SCENARIOS)
-    total_errors = len(ERROR_SCENARIOS)
+# ── Span assertions: verify instrumentation correctness ──────────────────────
+# Collect from all o11y instances in this test
+all_spans = []
+all_spans += mobile_client.get_finished_spans()
+all_spans += gateway.get_finished_spans()
+all_spans += catalog_svc.get_finished_spans()
+all_spans += inventory_svc.get_finished_spans()
+all_spans += profile_svc.get_finished_spans()
+all_spans += payment_svc.get_finished_spans()
+all_spans += fraud_svc.get_finished_spans()
+all_spans += processor_svc.get_finished_spans()
+all_spans += push_svc.get_finished_spans()
+all_spans += analytics_svc.get_finished_spans()
+print("\nSpan assertions:")
+check("At least one span captured across all services",
+      len(all_spans) > 0,
+      f"got {len(all_spans)} total spans")
+server_spans = [s for s in all_spans if s.kind.name == "SERVER"]
+check("At least one SERVER span emitted",
+      len(server_spans) > 0,
+      f"got {len(server_spans)} SERVER spans")
+attrs_with_gateway = [s for s in all_spans if s.attributes and "gateway.latency_ms" in s.attributes]
+check("At least one span carries gateway.latency_ms attribute",
+      len(attrs_with_gateway) > 0,
+      f"got {len(attrs_with_gateway)} spans with gateway.latency_ms")
+svc_names = {s.resource.attributes.get("service.name") for s in all_spans}
+check("All 10 mobile ecommerce services emitted spans",
+      len(svc_names) >= 10,
+      f"services with spans: {svc_names}")
 
-    print(f"\n{'='*70}")
-    print("  Flushing all telemetry providers...")
-    for svc in [mobile_client, gateway, catalog_svc, inventory_svc, profile_svc,
-                payment_svc, fraud_svc, processor_svc, push_svc, analytics_svc]:
-        svc.flush()
-
-    print(f"\nSummary:")
-    print(f"  \u2705 Happy:   {happy_pass}/{total_happy}")
-    print(f"  \u274c Errors:  {error_fail}/{total_errors}")
-    print(f"\n  Kibana:")
-    print(f"    Service Map → Observability → APM → Service Map")
-    print(f"    Filter: mobile-shopapp (9 connected nodes expected)")
-    print(f"\n  ES|QL query:")
-    print(f'    FROM traces-apm*,logs-*')
-    print(f'    | WHERE service.name IN ("mobile-shopapp","api-gateway-mobile",')
-    print(f'        "catalog-service","inventory-service-go","user-profile-service",')
-    print(f'        "payment-mobile-service","fraud-detection-mobile",')
-    print(f'        "payment-processor-mobile","push-notification-service","analytics-ingest")')
-    print(f'    | SORT @timestamp DESC | LIMIT 100')
-    print(f"{'='*70}\n")
+# ── Summary ───────────────────────────────────────────────────────────────────
+passed = sum(1 for s, _, _ in CHECKS if s == "PASS")
+failed = sum(1 for s, _, _ in CHECKS if s == "FAIL")
+for status, name, detail in CHECKS:
+    line = f"  [{status}] {name}"
+    if detail and status == "FAIL":
+        line += f"\n         -> {detail}"
+    print(line)
+print(f"\n  Result: {passed}/{len(CHECKS)} checks passed")
+if failed:
+    sys.exit(1)
