@@ -1,0 +1,16 @@
+name: edot_flutter_tier_d
+description: Tier D — Flutter app with OTEL Sidecar (no native EDOT support)
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: '>=3.19.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.1
+  uuid: ^4.4.0
+
+flutter:
+  uses-material-design: true

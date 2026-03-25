@@ -1,0 +1,17 @@
+{
+  "name": "edot-test-nodejs-express",
+  "version": "1.0.0",
+  "description": "Tier A — Node.js Express with native EDOT auto-instrumentation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --require ./instrumentation.js server.js",
+    "dev": "node --require ./instrumentation.js server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "@elastic/opentelemetry-node": "^0.5.0",
+    "@opentelemetry/api": "^1.8.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.51.0",
+    "@opentelemetry/exporter-metrics-otlp-proto": "^0.51.0"
+  }
+}

@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      OTEL_SERVICE_NAME: edot-fastapi-tier-a
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${ELASTIC_OTLP_ENDPOINT}
+      OTEL_EXPORTER_OTLP_HEADERS: Authorization=ApiKey ${ELASTIC_API_KEY}
+      OTEL_DEPLOYMENT_ENVIRONMENT: ${OTEL_DEPLOYMENT_ENVIRONMENT:-development}
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp

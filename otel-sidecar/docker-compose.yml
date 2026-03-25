@@ -1,0 +1,30 @@
+services:
+  # ── Example legacy app (replace with your actual legacy service) ─────────────
+  legacy-app:
+    image: ubuntu:22.04
+    command: sleep infinity          # replace with your actual command
+    depends_on: [otel-sidecar]
+    environment:
+      OTEL_SIDECAR_URL: http://127.0.0.1:9411
+    # network_mode: "service:otel-sidecar"  # uncomment to share network namespace
+
+  # ── OTEL Sidecar — telemetry bridge ──────────────────────────────────────────
+  otel-sidecar:
+    build: .
+    environment:
+      OTEL_SERVICE_NAME:           ${OTEL_SERVICE_NAME:-my-legacy-service}
+      ELASTIC_OTLP_ENDPOINT:       ${ELASTIC_OTLP_ENDPOINT}
+      ELASTIC_API_KEY:             ${ELASTIC_API_KEY}
+      OTEL_DEPLOYMENT_ENVIRONMENT: ${OTEL_DEPLOYMENT_ENVIRONMENT:-production}
+      SERVICE_VERSION:             ${SERVICE_VERSION:-unknown}
+      SIDECAR_HOST:                0.0.0.0    # listen on all interfaces inside container
+      SIDECAR_PORT:                9411
+    ports:
+      - "9411:9411"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:9411').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
