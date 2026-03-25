@@ -35,6 +35,7 @@ COMMON_ATTRS = {
     "app.version":           "2.8.0",
     "telemetry.sdk.name":    "opentelemetry-js",
     "telemetry.sdk.version": "1.18.0",
+    "telemetry.sdk.language": "javascript",
 }
 
 # ── Bootstrap: iOS ────────────────────────────────────────────────────────────
@@ -46,6 +47,8 @@ o11y_ios = O11yBootstrap(
         "device.model.name":       "iPhone 12",
         "os.name":                 "iOS",
         "os.version":              "15.8",
+        "os.type":                 "darwin",
+        "os.description":          "iOS 15.8 (19H370)",
     },
 )
 
@@ -58,6 +61,8 @@ o11y_android = O11yBootstrap(
         "device.model.name":       "Nord",
         "os.name":                 "Android",
         "os.version":              "12.0",
+        "os.type":                 "linux",
+        "os.description":          "Android 12 (API 32)",
     },
 )
 
@@ -70,6 +75,8 @@ o11y_pwa = O11yBootstrap(
         "browser.version":  "120.0",
         "browser.platform": "Win32",
         "os.name":          "Windows",
+        "os.type":          "windows",
+        "os.description":   "Windows 11 (10.0.22631)",
     },
 )
 
@@ -107,11 +114,13 @@ def run_scenarios(o11y, platform, instruments):
             # Airport query
             with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as req:
                 req.set_attributes(base_attrs())
-                req.set_attribute("http.method", "GET")
-                req.set_attribute("http.url", f"https://api.travelapp.io/v2/airports/nearest?lat={lat}&lon={lon}&radius=200")
+                req.set_attribute("http.request.method", "GET")
+                req.set_attribute("url.full", f"https://api.travelapp.io/v2/airports/nearest?lat={lat}&lon={lon}&radius=200")
+                req.set_attribute("server.address", "api.travelapp.io")
+                req.set_attribute("service.peer.name", "travelapp-api")
                 dur_ms = random.uniform(100, 400)
                 time.sleep(dur_ms / 1000)
-                req.set_attribute("http.status_code", 200)
+                req.set_attribute("http.response.status_code", 200)
                 req.set_attribute("airports.count", random.randint(3, 12))
             instruments["query_count"].add(1, attributes={"query_type": "nearest_airports", "platform": platform})
         logger.info("GPS location and airport query complete", extra={"lat": lat, "lon": lon, "platform": platform})
@@ -143,13 +152,13 @@ def run_scenarios(o11y, platform, instruments):
             span.set_attribute("ocr.engine", "tesseract")
             span.set_attribute("ocr.target", "passport_mrz")
             # Camera capture
-            with tracer.start_as_current_span("capacitor.camera") as cam:
+            with tracer.start_as_current_span("capacitor.camera", kind=SpanKind.INTERNAL) as cam:
                 cam.set_attributes(base_attrs())
                 cam.set_attribute("capacitor.plugin", "Camera")
                 cam.set_attribute("camera.quality", 90)
                 time.sleep(random.uniform(0.15, 0.4))
             # Tesseract OCR
-            with tracer.start_as_current_span("ocr.process") as ocr:
+            with tracer.start_as_current_span("ocr.process", kind=SpanKind.INTERNAL) as ocr:
                 ocr.set_attributes(base_attrs())
                 ocr.set_attribute("ocr.page_seg_mode", 6)
                 ocr.set_attribute("ocr.language", "eng")
@@ -175,11 +184,13 @@ def run_scenarios(o11y, platform, instruments):
             # Navigate to flight details
             with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as req:
                 req.set_attributes(base_attrs())
-                req.set_attribute("http.method", "GET")
-                req.set_attribute("http.url", "https://api.travelapp.io/v2/flights/JFK-LAX-2024-03-28")
+                req.set_attribute("http.request.method", "GET")
+                req.set_attribute("url.full", "https://api.travelapp.io/v2/flights/JFK-LAX-2024-03-28")
+                req.set_attribute("server.address", "api.travelapp.io")
+                req.set_attribute("service.peer.name", "travelapp-api")
                 dur_ms = random.uniform(80, 300)
                 time.sleep(dur_ms / 1000)
-                req.set_attribute("http.status_code", 200)
+                req.set_attribute("http.response.status_code", 200)
             instruments["query_count"].add(1, attributes={"query_type": "flight_detail", "platform": platform})
         logger.info("Price drop push notification handled", extra={"notification_id": notification_id, "platform": platform})
         results.append(("Push notification: price drop alert → flight details deep link", "OK", None))
@@ -198,20 +209,24 @@ def run_scenarios(o11y, platform, instruments):
             # Stripe payment widget
             with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as pay:
                 pay.set_attributes(base_attrs())
-                pay.set_attribute("http.method", "POST")
-                pay.set_attribute("http.url", "https://api.stripe.com/v1/payment_intents")
+                pay.set_attribute("http.request.method", "POST")
+                pay.set_attribute("url.full", "https://api.stripe.com/v1/payment_intents")
+                pay.set_attribute("server.address", "api.stripe.com")
+                pay.set_attribute("service.peer.name", "stripe-api")
                 pay.set_attribute("payment.amount_usd", booking_value)
                 dur_ms = random.uniform(300, 800)
                 time.sleep(dur_ms / 1000)
-                pay.set_attribute("http.status_code", 200)
+                pay.set_attribute("http.response.status_code", 200)
                 pay.set_attribute("payment.intent_id", f"pi_{uuid.uuid4().hex[:24]}")
             # Webhook confirmation
             with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as webhook:
                 webhook.set_attributes(base_attrs())
-                webhook.set_attribute("http.method", "POST")
-                webhook.set_attribute("http.url", "https://api.travelapp.io/v2/webhooks/stripe")
+                webhook.set_attribute("http.request.method", "POST")
+                webhook.set_attribute("url.full", "https://api.travelapp.io/v2/webhooks/stripe")
+                webhook.set_attribute("server.address", "api.travelapp.io")
+                webhook.set_attribute("service.peer.name", "travelapp-api")
                 time.sleep(random.uniform(0.05, 0.15))
-                webhook.set_attribute("http.status_code", 200)
+                webhook.set_attribute("http.response.status_code", 200)
             span.set_attribute("booking.value_usd", booking_value)
             span.set_attribute("booking.confirmed", True)
             instruments["booking_val"].record(booking_value, attributes={"booking_type": "hotel", "platform": platform})

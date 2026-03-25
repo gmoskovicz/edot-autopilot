@@ -306,8 +306,10 @@ _orig_execute = _redis.client.Redis.execute_command
 def _traced_execute(self, *args, **kwargs):
     cmd = args[0] if args else "UNKNOWN"
     with tracer.start_as_current_span(f"redis.{cmd}", kind=SpanKind.CLIENT) as span:
-        span.set_attribute("db.system", "redis")
-        span.set_attribute("db.operation", cmd)
+        span.set_attribute("db.system.name", "redis")
+        span.set_attribute("db.operation.name", cmd)
+        span.set_attribute("server.address", "redis")
+        span.set_attribute("service.peer.name", "redis")
         if len(args) > 1: span.set_attribute("db.redis.key", str(args[1])[:100])
         try:
             return _orig_execute(self, *args, **kwargs)

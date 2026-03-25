@@ -29,6 +29,7 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry import propagate, context
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.sdk.metrics.view import View, ExplicitBucketHistogramAggregation
 
 ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
 API_KEY  = os.environ["ELASTIC_API_KEY"]
@@ -36,12 +37,14 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 
 # ── Angular client bootstrap ───────────────────────────────────────────────────
 angular_attrs = {
-    "browser.name":       "Edge",
-    "browser.version":    "120.0",
-    "browser.platform":   "Win32",
-    "framework":          "angular",
-    "angular.version":    "17.0.0",
-    "telemetry.sdk.name": "opentelemetry-js-web",
+    "browser.name":           "Edge",
+    "browser.version":        "120.0",
+    "browser.platform":       "Win32",
+    "browser.mobile":         False,
+    "framework":              "angular",
+    "angular.version":        "17.0.0",
+    "telemetry.sdk.name":     "opentelemetry-js-web",
+    "telemetry.sdk.language": "javascript",
 }
 o11y_angular = O11yBootstrap(
     "web-angular-crm-client", ENDPOINT, API_KEY, ENV,
@@ -50,19 +53,34 @@ o11y_angular = O11yBootstrap(
 
 # ── Spring Boot API bootstrap ──────────────────────────────────────────────────
 spring_attrs = {
-    "telemetry.sdk.name": "opentelemetry-java",
-    "framework":          "spring-boot",
-    "spring.version":     "3.2.0",
-    "java.version":       "21",
+    "telemetry.sdk.name":     "opentelemetry-java",
+    "telemetry.sdk.language": "java",
+    "framework":              "spring-boot",
+    "spring.version":         "3.2.0",
+    "java.version":           "21",
 }
 o11y_api = O11yBootstrap(
     "web-angular-crm-api", ENDPOINT, API_KEY, ENV,
     extra_resource_attrs=spring_attrs,
 )
 
+# Views configure histogram bucket boundaries aligned with CWV thresholds
+cwv_views = [
+    View(instrument_name="webvitals.lcp",
+         aggregation=ExplicitBucketHistogramAggregation([200, 500, 1000, 2500, 4000, 10000])),
+    View(instrument_name="webvitals.inp",
+         aggregation=ExplicitBucketHistogramAggregation([50, 100, 200, 500, 1000])),
+    View(instrument_name="webvitals.cls",
+         aggregation=ExplicitBucketHistogramAggregation([0.01, 0.05, 0.1, 0.15, 0.25, 0.4])),
+    View(instrument_name="webvitals.ttfb",
+         aggregation=ExplicitBucketHistogramAggregation([100, 200, 500, 800, 1800, 3000])),
+    View(instrument_name="webvitals.fcp",
+         aggregation=ExplicitBucketHistogramAggregation([500, 1000, 1800, 3000, 5000])),
+]
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 lcp_hist       = o11y_angular.meter.create_histogram("webvitals.lcp",      description="Largest Contentful Paint",  unit="ms")
-fid_hist       = o11y_angular.meter.create_histogram("webvitals.fid",      description="First Input Delay",         unit="ms")
+inp_hist       = o11y_angular.meter.create_histogram("webvitals.inp",      description="Interaction to Next Paint", unit="ms")
 cls_hist       = o11y_angular.meter.create_histogram("webvitals.cls",      description="Cumulative Layout Shift")
 ttfb_hist      = o11y_angular.meter.create_histogram("webvitals.ttfb",     description="Time to First Byte",        unit="ms")
 page_views     = o11y_angular.meter.create_counter("page.view",            description="Page view count")
@@ -128,16 +146,17 @@ except Exception as e:
 
 # ── Scenario 2: HTTP Interceptor — auth header → API call → transform ──────────
 try:
-    fid_ms = random.uniform(10, 500)
+    inp_ms = random.uniform(10, 500)
     with o11y_angular.tracer.start_as_current_span("angular.http.GET", kind=SpanKind.CLIENT) as http_span:
         attrs = session_attrs("ContactListComponent", "/contacts")
         http_span.set_attributes(attrs)
-        http_span.set_attribute("angular.interceptor",  "AuthInterceptor")
-        http_span.set_attribute("http.url",             "https://api.crm.example.com/api/contacts")
-        http_span.set_attribute("http.method",          "GET")
-        http_span.set_attribute("http.status_code",     200)
-        http_span.set_attribute("auth.header_injected", True)
-        http_span.set_attribute("webvitals.fid_ms",     round(fid_ms, 2))
+        http_span.set_attribute("angular.interceptor",        "AuthInterceptor")
+        http_span.set_attribute("url.full",                   "https://api.crm.example.com/api/contacts")
+        http_span.set_attribute("http.request.method",        "GET")
+        http_span.set_attribute("http.response.status_code",  200)
+        http_span.set_attribute("auth.header_injected",       True)
+        http_span.set_attribute("webvitals.inp_ms",           round(inp_ms, 2))
+        http_span.set_attribute("service.peer.name",          "web-angular-crm-api")
         carrier = inject_traceparent(http_span)
 
         fetch_start = time.time()
@@ -150,16 +169,16 @@ try:
     with o11y_api.tracer.start_as_current_span(
         "GET /api/contacts", kind=SpanKind.SERVER, context=remote_ctx
     ) as srv_span:
-        srv_span.set_attribute("http.route",       "/api/contacts")
-        srv_span.set_attribute("http.method",      "GET")
-        srv_span.set_attribute("http.status_code", 200)
-        srv_span.set_attribute("framework.name",   "spring-boot")
+        srv_span.set_attribute("http.route",                  "/api/contacts")
+        srv_span.set_attribute("http.request.method",         "GET")
+        srv_span.set_attribute("http.response.status_code",   200)
+        srv_span.set_attribute("framework.name",              "spring-boot")
         with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "SELECT c.id, c.name, c.email, c.phone FROM contacts c WHERE c.account_id = ? ORDER BY c.name")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "SELECT c.id, c.name, c.email, c.phone FROM contacts c WHERE c.account_id = ? ORDER BY c.name")
             time.sleep(random.uniform(0.01, 0.04))
 
-    fid_hist.record(fid_ms, attributes={"page.route": "/contacts"})
+    inp_hist.record(inp_ms, attributes={"page.route": "/contacts"})
     o11y_angular.logger.info("HTTP interceptor call complete", extra={"route": "/api/contacts", "interceptor": "AuthInterceptor"})
     results.append(("HTTP Interceptor: attach auth header → API call → response transform", "OK", None))
 except Exception as e:
@@ -171,15 +190,15 @@ try:
 
     # SSR render (runs on Node server)
     with o11y_api.tracer.start_as_current_span("angular.ssr.render", kind=SpanKind.SERVER) as ssr_span:
-        ssr_span.set_attribute("angular.module",   "AppServerModule")
-        ssr_span.set_attribute("http.route",       "/contacts/456")
-        ssr_span.set_attribute("http.method",      "GET")
-        ssr_span.set_attribute("http.status_code", 200)
-        ssr_span.set_attribute("ssr.transfer_state", True)
+        ssr_span.set_attribute("angular.module",              "AppServerModule")
+        ssr_span.set_attribute("http.route",                  "/contacts/456")
+        ssr_span.set_attribute("http.request.method",         "GET")
+        ssr_span.set_attribute("http.response.status_code",   200)
+        ssr_span.set_attribute("ssr.transfer_state",          True)
         carrier = inject_traceparent(ssr_span)
         with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "SELECT * FROM contacts WHERE id = ?")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "SELECT * FROM contacts WHERE id = ?")
             time.sleep(random.uniform(0.01, 0.03))
         time.sleep(render_ms / 1000)
 
@@ -207,11 +226,12 @@ try:
     with o11y_angular.tracer.start_as_current_span("angular.http.GET", kind=SpanKind.CLIENT) as validator_span:
         attrs = session_attrs("ContactFormComponent", "/contacts/new")
         validator_span.set_attributes(attrs)
-        validator_span.set_attribute("angular.interceptor", "AuthInterceptor")
-        validator_span.set_attribute("http.url",            "https://api.crm.example.com/api/contacts/check-email")
-        validator_span.set_attribute("http.method",         "GET")
-        validator_span.set_attribute("http.status_code",    200)
-        validator_span.set_attribute("form.validator",      "emailUnique")
+        validator_span.set_attribute("angular.interceptor",       "AuthInterceptor")
+        validator_span.set_attribute("url.full",                  "https://api.crm.example.com/api/contacts/check-email")
+        validator_span.set_attribute("http.request.method",       "GET")
+        validator_span.set_attribute("http.response.status_code", 200)
+        validator_span.set_attribute("form.validator",            "emailUnique")
+        validator_span.set_attribute("service.peer.name",         "web-angular-crm-api")
         carrier = inject_traceparent(validator_span)
         time.sleep(random.uniform(0.04, 0.12))
 
@@ -220,13 +240,13 @@ try:
     with o11y_api.tracer.start_as_current_span(
         "GET /api/contacts/check-email", kind=SpanKind.SERVER, context=remote_ctx
     ) as srv_span:
-        srv_span.set_attribute("http.route",       "/api/contacts/check-email")
-        srv_span.set_attribute("http.method",      "GET")
-        srv_span.set_attribute("http.status_code", 200)
-        srv_span.set_attribute("framework.name",   "spring-boot")
+        srv_span.set_attribute("http.route",                  "/api/contacts/check-email")
+        srv_span.set_attribute("http.request.method",         "GET")
+        srv_span.set_attribute("http.response.status_code",   200)
+        srv_span.set_attribute("framework.name",              "spring-boot")
         with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "SELECT COUNT(*) FROM contacts WHERE email = ?")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "SELECT COUNT(*) FROM contacts WHERE email = ?")
             time.sleep(random.uniform(0.005, 0.02))
 
     # Form submit
@@ -236,10 +256,11 @@ try:
         form_span.set_attribute("angular.route",     "/contacts/new")
 
         with o11y_angular.tracer.start_as_current_span("angular.http.POST", kind=SpanKind.CLIENT) as post_span:
-            post_span.set_attribute("angular.interceptor", "AuthInterceptor")
-            post_span.set_attribute("http.url",            "https://api.crm.example.com/api/contacts")
-            post_span.set_attribute("http.method",         "POST")
-            post_span.set_attribute("http.status_code",    201)
+            post_span.set_attribute("angular.interceptor",        "AuthInterceptor")
+            post_span.set_attribute("url.full",                   "https://api.crm.example.com/api/contacts")
+            post_span.set_attribute("http.request.method",        "POST")
+            post_span.set_attribute("http.response.status_code",  201)
+            post_span.set_attribute("service.peer.name",          "web-angular-crm-api")
             carrier2 = inject_traceparent(post_span)
             time.sleep(random.uniform(0.06, 0.15))
 
@@ -247,13 +268,13 @@ try:
         with o11y_api.tracer.start_as_current_span(
             "POST /api/contacts", kind=SpanKind.SERVER, context=remote_ctx2
         ) as srv_span:
-            srv_span.set_attribute("http.route",       "/api/contacts")
-            srv_span.set_attribute("http.method",      "POST")
-            srv_span.set_attribute("http.status_code", 201)
-            srv_span.set_attribute("framework.name",   "spring-boot")
+            srv_span.set_attribute("http.route",                  "/api/contacts")
+            srv_span.set_attribute("http.request.method",         "POST")
+            srv_span.set_attribute("http.response.status_code",   201)
+            srv_span.set_attribute("framework.name",              "spring-boot")
             with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "postgresql")
-                db_span.set_attribute("db.statement", "INSERT INTO contacts (account_id, name, email, phone) VALUES (?, ?, ?, ?) RETURNING id")
+                db_span.set_attribute("db.system.name",   "postgresql")
+                db_span.set_attribute("db.query.text",    "INSERT INTO contacts (account_id, name, email, phone) VALUES (?, ?, ?, ?) RETURNING id")
                 time.sleep(random.uniform(0.01, 0.04))
 
     o11y_angular.logger.info("Contact form submitted", extra={"route": "/contacts/new", "validator": "emailUnique"})
@@ -296,13 +317,14 @@ try:
 
         # Signal computed triggers OnPush re-render
         with o11y_angular.tracer.start_as_current_span("angular.http.GET", kind=SpanKind.CLIENT) as sig_span:
-            sig_span.set_attribute("angular.component",      "ContactListComponent")
-            sig_span.set_attribute("angular.signals",        True)
+            sig_span.set_attribute("angular.component",       "ContactListComponent")
+            sig_span.set_attribute("angular.signals",         True)
             sig_span.set_attribute("angular.change_detection", "OnPush")
-            sig_span.set_attribute("http.url",               "https://api.crm.example.com/api/contacts?page=2")
-            sig_span.set_attribute("http.method",            "GET")
-            sig_span.set_attribute("http.status_code",       200)
-            sig_span.set_attribute("angular.interceptor",    "AuthInterceptor")
+            sig_span.set_attribute("url.full",                "https://api.crm.example.com/api/contacts?page=2")
+            sig_span.set_attribute("http.request.method",     "GET")
+            sig_span.set_attribute("http.response.status_code", 200)
+            sig_span.set_attribute("angular.interceptor",     "AuthInterceptor")
+            sig_span.set_attribute("service.peer.name",       "web-angular-crm-api")
             carrier = inject_traceparent(sig_span)
             time.sleep(random.uniform(0.04, 0.12))
 
@@ -310,13 +332,13 @@ try:
         with o11y_api.tracer.start_as_current_span(
             "GET /api/contacts", kind=SpanKind.SERVER, context=remote_ctx
         ) as srv_span:
-            srv_span.set_attribute("http.route",       "/api/contacts")
-            srv_span.set_attribute("http.method",      "GET")
-            srv_span.set_attribute("http.status_code", 200)
-            srv_span.set_attribute("framework.name",   "spring-boot")
+            srv_span.set_attribute("http.route",                  "/api/contacts")
+            srv_span.set_attribute("http.request.method",         "GET")
+            srv_span.set_attribute("http.response.status_code",   200)
+            srv_span.set_attribute("framework.name",              "spring-boot")
             with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "postgresql")
-                db_span.set_attribute("db.statement", "SELECT c.id, c.name, c.email FROM contacts c WHERE c.account_id = ? ORDER BY c.name LIMIT ? OFFSET ?")
+                db_span.set_attribute("db.system.name",   "postgresql")
+                db_span.set_attribute("db.query.text",    "SELECT c.id, c.name, c.email FROM contacts c WHERE c.account_id = ? ORDER BY c.name LIMIT ? OFFSET ?")
                 time.sleep(random.uniform(0.01, 0.03))
 
     o11y_angular.logger.info("Signals OnPush re-render complete", extra={"component": "ContactListComponent", "signals": True})
@@ -340,4 +362,4 @@ for scenario, status, note in results:
 
 print(f"\n[web-angular-crm] Done. {ok} OK | {warn} WARN | {err} ERROR")
 print(f"  Kibana → APM → web-angular-crm-client | web-angular-crm-api")
-print(f"  Metrics: webvitals.lcp | webvitals.fid | webvitals.cls | page.view | fetch.duration_ms | angular.bootstrap_ms")
+print(f"  Metrics: webvitals.lcp | webvitals.inp | webvitals.cls | page.view | fetch.duration_ms | angular.bootstrap_ms")

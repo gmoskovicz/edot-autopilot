@@ -29,6 +29,7 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry import propagate, context
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.sdk.metrics.view import View, ExplicitBucketHistogramAggregation
 
 ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
 API_KEY  = os.environ["ELASTIC_API_KEY"]
@@ -36,12 +37,14 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 
 # ── Vue client bootstrap ───────────────────────────────────────────────────────
 vue_attrs = {
-    "browser.name":       "Firefox",
-    "browser.version":    "121.0",
-    "browser.platform":   "Linux",
-    "framework":          "vue",
-    "vue.version":        "3.4.0",
-    "telemetry.sdk.name": "opentelemetry-js-web",
+    "browser.name":           "Firefox",
+    "browser.version":        "121.0",
+    "browser.platform":       "Linux",
+    "browser.mobile":         False,
+    "framework":              "vue",
+    "vue.version":            "3.4.0",
+    "telemetry.sdk.name":     "opentelemetry-js-web",
+    "telemetry.sdk.language": "javascript",
 }
 o11y_vue = O11yBootstrap(
     "web-vue-dashboard-client", ENDPOINT, API_KEY, ENV,
@@ -50,18 +53,33 @@ o11y_vue = O11yBootstrap(
 
 # ── Laravel API bootstrap ──────────────────────────────────────────────────────
 laravel_attrs = {
-    "telemetry.sdk.name": "opentelemetry-php",
-    "framework":          "laravel",
-    "php.version":        "8.2.0",
+    "telemetry.sdk.name":     "opentelemetry-php",
+    "telemetry.sdk.language": "php",
+    "framework":              "laravel",
+    "php.version":            "8.2.0",
 }
 o11y_api = O11yBootstrap(
     "web-vue-dashboard-api", ENDPOINT, API_KEY, ENV,
     extra_resource_attrs=laravel_attrs,
 )
 
+# Views configure histogram bucket boundaries aligned with CWV thresholds
+cwv_views = [
+    View(instrument_name="webvitals.lcp",
+         aggregation=ExplicitBucketHistogramAggregation([200, 500, 1000, 2500, 4000, 10000])),
+    View(instrument_name="webvitals.inp",
+         aggregation=ExplicitBucketHistogramAggregation([50, 100, 200, 500, 1000])),
+    View(instrument_name="webvitals.cls",
+         aggregation=ExplicitBucketHistogramAggregation([0.01, 0.05, 0.1, 0.15, 0.25, 0.4])),
+    View(instrument_name="webvitals.ttfb",
+         aggregation=ExplicitBucketHistogramAggregation([100, 200, 500, 800, 1800, 3000])),
+    View(instrument_name="webvitals.fcp",
+         aggregation=ExplicitBucketHistogramAggregation([500, 1000, 1800, 3000, 5000])),
+]
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 lcp_hist       = o11y_vue.meter.create_histogram("webvitals.lcp",         description="Largest Contentful Paint",  unit="ms")
-fid_hist       = o11y_vue.meter.create_histogram("webvitals.fid",         description="First Input Delay",         unit="ms")
+inp_hist       = o11y_vue.meter.create_histogram("webvitals.inp",         description="Interaction to Next Paint", unit="ms")
 cls_hist       = o11y_vue.meter.create_histogram("webvitals.cls",         description="Cumulative Layout Shift")
 ttfb_hist      = o11y_vue.meter.create_histogram("webvitals.ttfb",        description="Time to First Byte",        unit="ms")
 page_views     = o11y_vue.meter.create_counter("page.view",               description="Page view count")
@@ -120,9 +138,10 @@ try:
         # Initial API call from dashboard
         fetch_start = time.time()
         with o11y_vue.tracer.start_as_current_span("fetch.GET /api/dashboard", kind=SpanKind.CLIENT) as fetch_span:
-            fetch_span.set_attribute("http.url",         "https://api.dashboard.example.com/api/dashboard")
-            fetch_span.set_attribute("http.method",      "GET")
-            fetch_span.set_attribute("http.status_code", 200)
+            fetch_span.set_attribute("url.full",                  "https://api.dashboard.example.com/api/dashboard")
+            fetch_span.set_attribute("http.request.method",       "GET")
+            fetch_span.set_attribute("http.response.status_code", 200)
+            fetch_span.set_attribute("service.peer.name",         "web-vue-dashboard-api")
             carrier = inject_traceparent(fetch_span)
             time.sleep(random.uniform(0.06, 0.18))
         fetch_ms = (time.time() - fetch_start) * 1000
@@ -133,13 +152,13 @@ try:
         with o11y_api.tracer.start_as_current_span(
             "GET /api/dashboard", kind=SpanKind.SERVER, context=remote_ctx
         ) as srv_span:
-            srv_span.set_attribute("http.route",       "/api/dashboard")
-            srv_span.set_attribute("http.method",      "GET")
-            srv_span.set_attribute("http.status_code", 200)
-            srv_span.set_attribute("framework.name",   "laravel")
+            srv_span.set_attribute("http.route",                  "/api/dashboard")
+            srv_span.set_attribute("http.request.method",         "GET")
+            srv_span.set_attribute("http.response.status_code",   200)
+            srv_span.set_attribute("framework.name",              "laravel")
             with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "mysql")
-                db_span.set_attribute("db.statement", "SELECT * FROM dashboard_widgets WHERE user_id = ? ORDER BY position")
+                db_span.set_attribute("db.system.name",   "mysql")
+                db_span.set_attribute("db.query.text",    "SELECT * FROM dashboard_widgets WHERE user_id = ? ORDER BY position")
                 time.sleep(random.uniform(0.01, 0.04))
 
     page_views.add(1, attributes={"page.route": "/dashboard"})
@@ -162,9 +181,10 @@ try:
 
         fetch_start = time.time()
         with o11y_vue.tracer.start_as_current_span("fetch.GET /api/user", kind=SpanKind.CLIENT) as fetch_span:
-            fetch_span.set_attribute("http.url",         "https://api.dashboard.example.com/api/user")
-            fetch_span.set_attribute("http.method",      "GET")
-            fetch_span.set_attribute("http.status_code", 200)
+            fetch_span.set_attribute("url.full",                  "https://api.dashboard.example.com/api/user")
+            fetch_span.set_attribute("http.request.method",       "GET")
+            fetch_span.set_attribute("http.response.status_code", 200)
+            fetch_span.set_attribute("service.peer.name",         "web-vue-dashboard-api")
             carrier = inject_traceparent(fetch_span)
             time.sleep(random.uniform(0.04, 0.12))
         fetch_ms = (time.time() - fetch_start) * 1000
@@ -175,13 +195,13 @@ try:
         with o11y_api.tracer.start_as_current_span(
             "GET /api/user", kind=SpanKind.SERVER, context=remote_ctx
         ) as srv_span:
-            srv_span.set_attribute("http.route",       "/api/user")
-            srv_span.set_attribute("http.method",      "GET")
-            srv_span.set_attribute("http.status_code", 200)
-            srv_span.set_attribute("framework.name",   "laravel")
+            srv_span.set_attribute("http.route",                  "/api/user")
+            srv_span.set_attribute("http.request.method",         "GET")
+            srv_span.set_attribute("http.response.status_code",   200)
+            srv_span.set_attribute("framework.name",              "laravel")
             with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "mysql")
-                db_span.set_attribute("db.statement", "SELECT id, name, email, avatar FROM users WHERE id = ?")
+                db_span.set_attribute("db.system.name",   "mysql")
+                db_span.set_attribute("db.query.text",    "SELECT id, name, email, avatar FROM users WHERE id = ?")
                 time.sleep(random.uniform(0.008, 0.025))
 
         # Commit mutation (reactive update)
@@ -259,8 +279,9 @@ try:
         setup_span.set_attribute("vue.component.name", "ChartWidget")
         time.sleep(random.uniform(0.01, 0.03))
         err = RuntimeError("Cannot read properties of undefined (reading 'data')")
-        setup_span.record_exception(err, attributes={"exception.escaped": True})
+        setup_span.record_exception(err, attributes={"exception.escaped": False})
         setup_span.set_status(StatusCode.ERROR, str(err))
+        setup_span.set_attribute("error.type", type(err).__name__)
 
     # onErrorCaptured boundary catches it
     with o11y_vue.tracer.start_as_current_span("vue.component.setup", kind=SpanKind.INTERNAL) as boundary_span:
@@ -290,9 +311,10 @@ try:
         # Async data load
         fetch_start = time.time()
         with o11y_vue.tracer.start_as_current_span("fetch.GET /api/dashboard", kind=SpanKind.CLIENT) as fetch_span:
-            fetch_span.set_attribute("http.url",         "https://api.dashboard.example.com/api/analytics")
-            fetch_span.set_attribute("http.method",      "GET")
-            fetch_span.set_attribute("http.status_code", 200)
+            fetch_span.set_attribute("url.full",                  "https://api.dashboard.example.com/api/analytics")
+            fetch_span.set_attribute("http.request.method",       "GET")
+            fetch_span.set_attribute("http.response.status_code", 200)
+            fetch_span.set_attribute("service.peer.name",         "web-vue-dashboard-api")
             carrier = inject_traceparent(fetch_span)
             time.sleep(random.uniform(0.08, 0.22))
         fetch_ms = (time.time() - fetch_start) * 1000
@@ -303,13 +325,13 @@ try:
         with o11y_api.tracer.start_as_current_span(
             "GET /api/analytics", kind=SpanKind.SERVER, context=remote_ctx
         ) as srv_span:
-            srv_span.set_attribute("http.route",       "/api/analytics")
-            srv_span.set_attribute("http.method",      "GET")
-            srv_span.set_attribute("http.status_code", 200)
-            srv_span.set_attribute("framework.name",   "laravel")
+            srv_span.set_attribute("http.route",                  "/api/analytics")
+            srv_span.set_attribute("http.request.method",         "GET")
+            srv_span.set_attribute("http.response.status_code",   200)
+            srv_span.set_attribute("framework.name",              "laravel")
             with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "mysql")
-                db_span.set_attribute("db.statement", "SELECT date, metric, value FROM analytics WHERE user_id = ? AND date >= ? ORDER BY date DESC")
+                db_span.set_attribute("db.system.name",   "mysql")
+                db_span.set_attribute("db.query.text",    "SELECT date, metric, value FROM analytics WHERE user_id = ? AND date >= ? ORDER BY date DESC")
                 time.sleep(random.uniform(0.02, 0.06))
 
         suspense_span.set_attribute("vue.loading_state", "resolved")
@@ -335,4 +357,4 @@ for scenario, status, note in results:
 
 print(f"\n[web-vue-dashboard] Done. {ok} OK | {warn} WARN | {err} ERROR")
 print(f"  Kibana → APM → web-vue-dashboard-client | web-vue-dashboard-api")
-print(f"  Metrics: webvitals.lcp | webvitals.fid | webvitals.cls | page.view | fetch.duration_ms | websocket.messages")
+print(f"  Metrics: webvitals.lcp | webvitals.inp | webvitals.cls | page.view | fetch.duration_ms | websocket.messages")

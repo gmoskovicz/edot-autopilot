@@ -9,6 +9,7 @@ Run:
     cd smoke-tests && python3 65-mobile-react-native/smoke.py
 """
 
+import hashlib
 import os, sys, time, random, uuid
 from pathlib import Path
 
@@ -36,6 +37,7 @@ COMMON_ATTRS = {
     "app.build_number":         "841",
     "telemetry.sdk.name":       "opentelemetry-react-native",
     "telemetry.sdk.version":    "0.4.0",
+    "telemetry.sdk.language":   "javascript",
 }
 
 # ── Bootstrap: iOS variant ────────────────────────────────────────────────────
@@ -44,8 +46,11 @@ ios_attrs = {
     "device.manufacturer":       "Apple",
     "device.model.name":         "iPhone 15 Pro",
     "device.model.identifier":   "iPhone16,1",
+    "device.id":                 hashlib.sha256("iphone15pro-uuid-abc123".encode()).hexdigest()[:16],
     "os.name":                   "iOS",
     "os.version":                "17.2.1",
+    "os.type":                   "darwin",
+    "os.description":            "iOS 17.2.1 (21C66)",
 }
 o11y_ios = O11yBootstrap(
     "mobile-rn-shopapp-ios", ENDPOINT, API_KEY, ENV,
@@ -58,8 +63,11 @@ android_attrs = {
     "device.manufacturer":       "Google",
     "device.model.name":         "Pixel 8",
     "device.model.identifier":   "GC3VE",
+    "device.id":                 hashlib.sha256("pixel8-uuid-def456".encode()).hexdigest()[:16],
     "os.name":                   "Android",
     "os.version":                "14.0",
+    "os.type":                   "linux",
+    "os.description":            "Android 14 (API 34)",
 }
 o11y_android = O11yBootstrap(
     "mobile-rn-shopapp-android", ENDPOINT, API_KEY, ENV,
@@ -108,7 +116,7 @@ def run_scenarios(o11y, platform_label, crashes, render, net_dur, sessions):
             bundle_ms = random.uniform(180, 320)
             span.set_attribute("js.bundle_parse_ms", round(bundle_ms, 2))
             time.sleep(bundle_ms / 1000)
-            with tracer.start_as_current_span("screen.view.HomeScreen") as s2:
+            with tracer.start_as_current_span("screen.view.HomeScreen", kind=SpanKind.INTERNAL) as s2:
                 s2.set_attributes(make_session_attrs("HomeScreen"))
                 s2.set_attribute("screen.first_render", True)
                 native_ms = random.uniform(40, 90)
@@ -144,8 +152,9 @@ def run_scenarios(o11y, platform_label, crashes, render, net_dur, sessions):
         with tracer.start_as_current_span("network.fetch", kind=SpanKind.CLIENT) as span:
             attrs = make_session_attrs("HomeScreen", conn="cellular", carrier="Verizon")
             span.set_attributes(attrs)
-            span.set_attribute("http.method", "GET")
-            span.set_attribute("http.url", "https://api.shopapp.io/v2/recommendations")
+            span.set_attribute("http.request.method", "GET")
+            span.set_attribute("url.full", "https://api.shopapp.io/v2/recommendations")
+            span.set_attribute("service.peer.name", "shopapp-api")
             attempt = 0
             success = False
             while attempt < 3 and not success:
@@ -156,8 +165,8 @@ def run_scenarios(o11y, platform_label, crashes, render, net_dur, sessions):
                     logger.warning("Network timeout, retrying", extra={"attempt": attempt, "platform": platform_label})
                 else:
                     success = True
-            span.set_attribute("http.status_code", 200 if success else 504)
-            span.set_attribute("http.retry_count", attempt - 1)
+            span.set_attribute("http.response.status_code", 200 if success else 504)
+            span.set_attribute("http.request.resend_count", attempt - 1)
             net_dur.record(dur_ms, attributes={"endpoint": "recommendations", "platform": platform_label})
         logger.info("Recommendations fetch complete", extra={"attempts": attempt, "platform": platform_label})
         results.append(("Network fetch: product recommendations", "OK", None))
@@ -217,8 +226,9 @@ def run_scenarios(o11y, platform_label, crashes, render, net_dur, sessions):
             try:
                 time.sleep(random.uniform(0.02, 0.06))
                 err = TypeError("Cannot read property 'token' of undefined")
-                span.record_exception(err, attributes={"exception.escaped": True})
+                span.record_exception(err, attributes={"exception.escaped": False})
                 span.set_status(StatusCode.ERROR, str(err))
+                span.set_attribute("error.type", type(err).__name__)
                 crashes.add(1, attributes={"crash.type": "TypeError", "platform": platform_label})
                 logger.error(
                     "JS crash in payment handler — caught by error boundary",

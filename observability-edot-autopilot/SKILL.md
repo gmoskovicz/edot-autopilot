@@ -41,6 +41,42 @@ metadata:
 
 ---
 
+## OTel Semantic Convention Rules
+
+These rules are enforced in all generated instrumentation. AI agents using this skill MUST apply them.
+
+### HTTP attributes (stable, semconv 1.20+)
+- Use `http.request.method`, `http.response.status_code`, `url.full`, `url.path`, `url.scheme`
+- Do NOT use deprecated: `http.method`, `http.status_code`, `http.url`, `http.target`, `net.peer.name`
+
+### Database attributes (stable, semconv 1.22+)
+- Use `db.system.name`, `db.query.text`, `db.operation.name`, `db.collection.name`, `db.namespace`
+- Do NOT use deprecated: `db.system`, `db.statement`, `db.operation`, `db.sql.table`, `db.name`
+
+### SpanKind — always explicit
+- `SpanKind.SERVER` for HTTP handlers; `SpanKind.CLIENT` for outbound calls and DB; `SpanKind.PRODUCER/CONSUMER` for queues
+
+### `service.peer.name` — required on CLIENT spans
+- Set `service.peer.name` to the name of the downstream service on every outbound call. Required for Elastic APM service maps.
+
+### Metric names — no `_total`
+- OTel counters never include `_total`. Use `http.server.request` not `http.server.requests_total`.
+- Currency units: `{USD}` not `USD`
+
+### `exception.escaped`
+- `False` for caught/handled exceptions. `True` only when the exception propagates past span boundary (`raise`).
+
+### Mobile OS — `os.type` is Required
+- Always set `os.type`: `"darwin"` for iOS/macOS, `"linux"` for Android, `"windows"` for Windows.
+
+### Core Web Vitals — use INP not FID
+- FID was deprecated in Chrome March 2024. Use `webvitals.inp` (Interaction to Next Paint).
+
+### Full reference
+See [`references/semconv-conventions.md`](references/semconv-conventions.md) for complete cheatsheet with examples.
+
+---
+
 ## What you need from the user
 
 Before starting, confirm these two values are available:

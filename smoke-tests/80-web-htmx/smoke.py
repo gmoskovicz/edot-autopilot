@@ -46,11 +46,12 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 propagator = TraceContextTextMapPropagator()
 
 HTMX_ATTRS = {
-    "framework":          "htmx",
-    "htmx.version":       "1.9.10",
-    "python.version":     "3.11.6",
-    "backend.framework":  "flask",
-    "telemetry.sdk.name": "opentelemetry-python",
+    "framework":              "htmx",
+    "htmx.version":           "1.9.10",
+    "python.version":         "3.11.6",
+    "backend.framework":      "flask",
+    "telemetry.sdk.name":     "opentelemetry-python",
+    "telemetry.sdk.language": "python",
 }
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -85,7 +86,7 @@ try:
         span.set_attribute("htmx.target", "#contacts-table tbody")
         span.set_attribute("htmx.swap", "beforeend")
         span.set_attribute("htmx.request.partial", True)
-        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.request.method", "GET")
         span.set_attribute("http.route", "/crm/contacts/rows")
         span.set_attribute("http.request_header.hx_request", "true")
         span.set_attribute("http.request_header.hx_trigger", "contacts-table")
@@ -93,16 +94,17 @@ try:
         with db_svc.tracer.start_as_current_span(
             "flask.db.query", kind=SpanKind.CLIENT
         ) as db_span:
-            db_span.set_attribute("db.system", "postgresql")
-            db_span.set_attribute("db.operation", "SELECT")
-            db_span.set_attribute("db.statement", "SELECT contacts.id, contacts.name, contacts.email, contacts.status FROM contacts ORDER BY updated_at DESC LIMIT 20")
-            db_span.set_attribute("db.sql.table", "contacts")
+            db_span.set_attribute("db.system.name", "postgresql")
+            db_span.set_attribute("db.operation.name", "SELECT")
+            db_span.set_attribute("db.query.text", "SELECT contacts.id, contacts.name, contacts.email, contacts.status FROM contacts ORDER BY updated_at DESC LIMIT 20")
+            db_span.set_attribute("db.collection.name", "contacts")
+            db_span.set_attribute("service.peer.name", "postgresql")
             time.sleep(random.uniform(0.01, 0.04))
 
         fragment_bytes = random.randint(512, 4096)
         span.set_attribute("response.content_type", "text/html")
         span.set_attribute("response.fragment_size_bytes", fragment_bytes)
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
 
     dur_ms = (time.time() - t0) * 1000
     req_total.add(1, {"htmx.trigger": "hx-get", "htmx.partial": "true"})
@@ -127,7 +129,7 @@ try:
         span.set_attribute("htmx.target", "#contact-form-container")
         span.set_attribute("htmx.swap", "outerHTML")
         span.set_attribute("htmx.request.partial", True)
-        span.set_attribute("http.method", "POST")
+        span.set_attribute("http.request.method", "POST")
         span.set_attribute("http.route", "/crm/contacts")
         span.set_attribute("form.name", "new-contact-form")
 
@@ -142,16 +144,17 @@ try:
             with db_svc.tracer.start_as_current_span(
                 "flask.db.query", kind=SpanKind.CLIENT
             ) as db_span:
-                db_span.set_attribute("db.system", "postgresql")
-                db_span.set_attribute("db.operation", "INSERT")
-                db_span.set_attribute("db.statement", "INSERT INTO contacts (name, email, phone, status, created_at) VALUES ($1, $2, $3, 'new', NOW()) RETURNING id")
-                db_span.set_attribute("db.sql.table", "contacts")
+                db_span.set_attribute("db.system.name", "postgresql")
+                db_span.set_attribute("db.operation.name", "INSERT")
+                db_span.set_attribute("db.query.text", "INSERT INTO contacts (name, email, phone, status, created_at) VALUES ($1, $2, $3, 'new', NOW()) RETURNING id")
+                db_span.set_attribute("db.collection.name", "contacts")
+                db_span.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.01, 0.04))
 
         fragment_bytes = random.randint(128, 512)
         span.set_attribute("response.content_type", "text/html")
         span.set_attribute("response.fragment_size_bytes", fragment_bytes)
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
         span.set_attribute("contact.id", new_contact_id)
 
     dur_ms = (time.time() - t0) * 1000
@@ -180,7 +183,7 @@ try:
             span.set_attribute("htmx.target", "#queue-badge")
             span.set_attribute("htmx.swap", "innerHTML")
             span.set_attribute("htmx.request.partial", True)
-            span.set_attribute("http.method", "GET")
+            span.set_attribute("http.request.method", "GET")
             span.set_attribute("http.route", "/api/queue-status")
             span.set_attribute("poll.interval_ms", 2000)
             span.set_attribute("poll.iteration", i + 1)
@@ -188,17 +191,18 @@ try:
             with db_svc.tracer.start_as_current_span(
                 "flask.db.query", kind=SpanKind.CLIENT
             ) as db_span:
-                db_span.set_attribute("db.system", "postgresql")
-                db_span.set_attribute("db.operation", "SELECT")
-                db_span.set_attribute("db.statement", "SELECT COUNT(*) FROM task_queue WHERE status = 'pending'")
-                db_span.set_attribute("db.sql.table", "task_queue")
+                db_span.set_attribute("db.system.name", "postgresql")
+                db_span.set_attribute("db.operation.name", "SELECT")
+                db_span.set_attribute("db.query.text", "SELECT COUNT(*) FROM task_queue WHERE status = 'pending'")
+                db_span.set_attribute("db.collection.name", "task_queue")
+                db_span.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.003, 0.012))
 
             fragment_bytes = random.randint(32, 128)
             span.set_attribute("response.content_type", "text/html")
             span.set_attribute("response.fragment_size_bytes", fragment_bytes)
             span.set_attribute("queue.depth", queue_depth)
-            span.set_attribute("http.status_code", 200)
+            span.set_attribute("http.response.status_code", 200)
 
         dur_ms = (time.time() - t0) * 1000
         req_total.add(1, {"htmx.trigger": "hx-trigger-poll", "htmx.partial": "true"})
@@ -230,7 +234,7 @@ try:
             "websocket.upgrade", kind=SpanKind.INTERNAL
         ) as up_span:
             up_span.set_attribute("websocket.id", ws_id)
-            up_span.set_attribute("http.status_code", 101)
+            up_span.set_attribute("http.response.status_code", 101)
             time.sleep(random.uniform(0.002, 0.008))
 
         for i in range(n_events):
@@ -266,23 +270,24 @@ try:
         span.set_attribute("htmx.swap", "outerHTML")
         span.set_attribute("htmx.request.boosted", True)
         span.set_attribute("htmx.request.partial", False)
-        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.request.method", "GET")
         span.set_attribute("http.route", target_path)
         span.set_attribute("http.request_header.hx_boosted", "true")
 
         with db_svc.tracer.start_as_current_span(
             "flask.db.query", kind=SpanKind.CLIENT
         ) as db_span:
-            db_span.set_attribute("db.system", "postgresql")
-            db_span.set_attribute("db.operation", "SELECT")
-            db_span.set_attribute("db.statement", "SELECT contacts.*, notes.*, tasks.* FROM contacts LEFT JOIN notes ON notes.contact_id = contacts.id LEFT JOIN tasks ON tasks.contact_id = contacts.id WHERE contacts.id = $1")
-            db_span.set_attribute("db.sql.table", "contacts")
+            db_span.set_attribute("db.system.name", "postgresql")
+            db_span.set_attribute("db.operation.name", "SELECT")
+            db_span.set_attribute("db.query.text", "SELECT contacts.*, notes.*, tasks.* FROM contacts LEFT JOIN notes ON notes.contact_id = contacts.id LEFT JOIN tasks ON tasks.contact_id = contacts.id WHERE contacts.id = $1")
+            db_span.set_attribute("db.collection.name", "contacts")
+            db_span.set_attribute("service.peer.name", "postgresql")
             time.sleep(random.uniform(0.015, 0.06))
 
         page_bytes = random.randint(8192, 32768)
         span.set_attribute("response.content_type", "text/html")
         span.set_attribute("response.fragment_size_bytes", page_bytes)
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
 
     dur_ms = (time.time() - t0) * 1000
     req_total.add(1, {"htmx.trigger": "hx-boost", "htmx.partial": "false"})
@@ -306,16 +311,17 @@ try:
         span.set_attribute("htmx.target", "#deal-list")
         span.set_attribute("htmx.swap", "outerHTML")
         span.set_attribute("htmx.request.partial", True)
-        span.set_attribute("http.method", "POST")
+        span.set_attribute("http.request.method", "POST")
         span.set_attribute("http.route", "/crm/deals")
 
         with db_svc.tracer.start_as_current_span(
             "flask.db.query", kind=SpanKind.CLIENT
         ) as db_span:
-            db_span.set_attribute("db.system", "postgresql")
-            db_span.set_attribute("db.operation", "INSERT")
-            db_span.set_attribute("db.statement", "INSERT INTO deals (title, value, stage, contact_id, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id")
-            db_span.set_attribute("db.sql.table", "deals")
+            db_span.set_attribute("db.system.name", "postgresql")
+            db_span.set_attribute("db.operation.name", "INSERT")
+            db_span.set_attribute("db.query.text", "INSERT INTO deals (title, value, stage, contact_id, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id")
+            db_span.set_attribute("db.collection.name", "deals")
+            db_span.set_attribute("service.peer.name", "postgresql")
             time.sleep(random.uniform(0.01, 0.04))
 
         # Main fragment (updated deal list)
@@ -341,7 +347,7 @@ try:
 
         span.set_attribute("response.content_type", "text/html")
         span.set_attribute("response.oob_swap", True)
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
 
     dur_ms = (time.time() - t0) * 1000
     req_total.add(1, {"htmx.trigger": "hx-post", "htmx.partial": "true"})

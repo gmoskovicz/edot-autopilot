@@ -17,6 +17,7 @@ import logging
 import os
 import platform
 import socket
+import uuid
 
 from opentelemetry import trace, metrics
 from opentelemetry.sdk.trace import TracerProvider
@@ -48,11 +49,14 @@ class O11yBootstrap:
         base_attrs = {
             "service.name":                service_name,
             "service.version":             version,
-            "deployment.environment.name": env,
+            "deployment.environment":      env,   # Elastic APM / older OTel semconv
+            "deployment.environment.name": env,   # OTel semconv 1.24+
+            "service.instance.id":         str(uuid.uuid4()),
             "host.name":                   socket.gethostname(),
             "process.pid":                 os.getpid(),
             "os.name":                     platform.system(),
             "telemetry.sdk.name":          "edot-autopilot",
+            "telemetry.sdk.language":      "python",
         }
         if extra_resource_attrs:
             base_attrs.update(extra_resource_attrs)

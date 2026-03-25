@@ -29,6 +29,7 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry import propagate, context
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.sdk.metrics.view import View, ExplicitBucketHistogramAggregation
 
 ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
 API_KEY  = os.environ["ELASTIC_API_KEY"]
@@ -36,10 +37,11 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 
 # ── SSR server bootstrap ───────────────────────────────────────────────────────
 ssr_attrs = {
-    "telemetry.sdk.name": "opentelemetry-node",
-    "framework":          "nextjs",
-    "nextjs.version":     "14.0.4",
-    "node.version":       "20.10.0",
+    "telemetry.sdk.name":     "opentelemetry-node",
+    "telemetry.sdk.language": "javascript",
+    "framework":              "nextjs",
+    "nextjs.version":         "14.0.4",
+    "node.version":           "20.10.0",
 }
 o11y_ssr = O11yBootstrap(
     "web-nextjs-saas-ssr", ENDPOINT, API_KEY, ENV,
@@ -48,10 +50,12 @@ o11y_ssr = O11yBootstrap(
 
 # ── Client-side hydration bootstrap ───────────────────────────────────────────
 client_attrs = {
-    "browser.name":       "Safari",
-    "browser.version":    "17.2",
-    "browser.platform":   "MacIntel",
-    "telemetry.sdk.name": "opentelemetry-js-web",
+    "browser.name":           "Safari",
+    "browser.version":        "17.2",
+    "browser.platform":       "MacIntel",
+    "browser.mobile":         False,
+    "telemetry.sdk.name":     "opentelemetry-js-web",
+    "telemetry.sdk.language": "javascript",
 }
 o11y_client = O11yBootstrap(
     "web-nextjs-saas-client", ENDPOINT, API_KEY, ENV,
@@ -60,15 +64,30 @@ o11y_client = O11yBootstrap(
 
 # ── API routes bootstrap ───────────────────────────────────────────────────────
 api_attrs = {
-    "telemetry.sdk.name": "opentelemetry-node",
-    "framework":          "nextjs",
-    "nextjs.version":     "14.0.4",
-    "node.version":       "20.10.0",
+    "telemetry.sdk.name":     "opentelemetry-node",
+    "telemetry.sdk.language": "javascript",
+    "framework":              "nextjs",
+    "nextjs.version":         "14.0.4",
+    "node.version":           "20.10.0",
 }
 o11y_api = O11yBootstrap(
     "web-nextjs-api-routes", ENDPOINT, API_KEY, ENV,
     extra_resource_attrs=api_attrs,
 )
+
+# Views configure histogram bucket boundaries aligned with CWV thresholds
+cwv_views = [
+    View(instrument_name="webvitals.lcp",
+         aggregation=ExplicitBucketHistogramAggregation([200, 500, 1000, 2500, 4000, 10000])),
+    View(instrument_name="webvitals.inp",
+         aggregation=ExplicitBucketHistogramAggregation([50, 100, 200, 500, 1000])),
+    View(instrument_name="webvitals.cls",
+         aggregation=ExplicitBucketHistogramAggregation([0.01, 0.05, 0.1, 0.15, 0.25, 0.4])),
+    View(instrument_name="webvitals.ttfb",
+         aggregation=ExplicitBucketHistogramAggregation([100, 200, 500, 800, 1800, 3000])),
+    View(instrument_name="webvitals.fcp",
+         aggregation=ExplicitBucketHistogramAggregation([500, 1000, 1800, 3000, 5000])),
+]
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
 ssr_dur_hist    = o11y_ssr.meter.create_histogram("ssr.render_time_ms",  description="SSR render duration",       unit="ms")
@@ -103,19 +122,20 @@ try:
 
     # SSR server span
     with o11y_ssr.tracer.start_as_current_span("next.server.render", kind=SpanKind.SERVER) as ssr_span:
-        ssr_span.set_attribute("nextjs.page",        "/products/[id]")
-        ssr_span.set_attribute("nextjs.route_type",  "ssr")
-        ssr_span.set_attribute("nextjs.dynamic",     True)
-        ssr_span.set_attribute("http.method",        "GET")
-        ssr_span.set_attribute("http.status_code",   200)
-        ssr_span.set_attribute("vercel.region",      "iad1")
+        ssr_span.set_attribute("nextjs.page",                 "/products/[id]")
+        ssr_span.set_attribute("nextjs.route_type",           "ssr")
+        ssr_span.set_attribute("nextjs.dynamic",              True)
+        ssr_span.set_attribute("http.request.method",         "GET")
+        ssr_span.set_attribute("http.response.status_code",   200)
+        ssr_span.set_attribute("vercel.region",               "iad1")
+        ssr_span.set_attribute("service.peer.name",           "web-nextjs-saas-api")
         carrier = inject_traceparent(ssr_span)
 
         with o11y_ssr.tracer.start_as_current_span("next.getServerSideProps", kind=SpanKind.INTERNAL) as gssp:
             gssp.set_attribute("nextjs.page", "/products/[id]")
             with o11y_ssr.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "postgresql")
-                db_span.set_attribute("db.statement", "SELECT * FROM products WHERE id = $1")
+                db_span.set_attribute("db.system.name",   "postgresql")
+                db_span.set_attribute("db.query.text",    "SELECT * FROM products WHERE id = $1")
                 time.sleep(random.uniform(0.01, 0.04))
             time.sleep(random.uniform(0.02, 0.06))
 
@@ -148,14 +168,14 @@ except Exception as e:
 # ── Scenario 2: Server Action (form submit) ───────────────────────────────────
 try:
     with o11y_ssr.tracer.start_as_current_span("next.server_action", kind=SpanKind.SERVER) as span:
-        span.set_attribute("nextjs.route_type",         "server_action")
-        span.set_attribute("nextjs.page",               "/settings/profile")
-        span.set_attribute("http.method",               "POST")
-        span.set_attribute("http.status_code",          200)
-        span.set_attribute("vercel.region",             "iad1")
+        span.set_attribute("nextjs.route_type",               "server_action")
+        span.set_attribute("nextjs.page",                     "/settings/profile")
+        span.set_attribute("http.request.method",             "POST")
+        span.set_attribute("http.response.status_code",       200)
+        span.set_attribute("vercel.region",                   "iad1")
         with o11y_ssr.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "UPDATE users SET display_name = $1, avatar_url = $2 WHERE id = $3")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "UPDATE users SET display_name = $1, avatar_url = $2 WHERE id = $3")
             time.sleep(random.uniform(0.01, 0.04))
         # revalidatePath
         with o11y_ssr.tracer.start_as_current_span("next.cache.revalidate", kind=SpanKind.INTERNAL) as cache_span:
@@ -169,17 +189,17 @@ except Exception as e:
 # ── Scenario 3: API Route — Stripe webhook ────────────────────────────────────
 try:
     with o11y_api.tracer.start_as_current_span("next.api_route", kind=SpanKind.SERVER) as span:
-        span.set_attribute("nextjs.route_type",  "api")
-        span.set_attribute("http.route",         "/api/webhooks/stripe")
-        span.set_attribute("http.method",        "POST")
-        span.set_attribute("http.status_code",   200)
-        span.set_attribute("nextjs.dynamic",     True)
+        span.set_attribute("nextjs.route_type",               "api")
+        span.set_attribute("http.route",                      "/api/webhooks/stripe")
+        span.set_attribute("http.request.method",             "POST")
+        span.set_attribute("http.response.status_code",       200)
+        span.set_attribute("nextjs.dynamic",                  True)
         with o11y_api.tracer.start_as_current_span("stripe.webhook.verify", kind=SpanKind.INTERNAL) as vspan:
             vspan.set_attribute("stripe.event_type", "payment_intent.succeeded")
             time.sleep(random.uniform(0.005, 0.02))
         with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "UPDATE orders SET status = $1, paid_at = NOW() WHERE stripe_payment_intent = $2")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "UPDATE orders SET status = $1, paid_at = NOW() WHERE stripe_payment_intent = $2")
             time.sleep(random.uniform(0.01, 0.03))
     api_req_counter.add(1, attributes={"http.route": "/api/webhooks/stripe"})
     o11y_api.logger.info("Stripe webhook processed", extra={"event": "payment_intent.succeeded"})
@@ -198,8 +218,8 @@ try:
         with o11y_ssr.tracer.start_as_current_span("next.getServerSideProps", kind=SpanKind.INTERNAL) as gssp:
             gssp.set_attribute("nextjs.page", "/blog/[slug]")
             with o11y_ssr.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "postgresql")
-                db_span.set_attribute("db.statement", "SELECT title, content, updated_at FROM posts WHERE slug = $1")
+                db_span.set_attribute("db.system.name",   "postgresql")
+                db_span.set_attribute("db.query.text",    "SELECT title, content, updated_at FROM posts WHERE slug = $1")
                 time.sleep(random.uniform(0.01, 0.04))
         time.sleep(random.uniform(0.04, 0.12))
     o11y_ssr.logger.info("ISR revalidation complete", extra={"page": "/blog/[slug]", "revalidate_seconds": 60})
@@ -211,42 +231,42 @@ except Exception as e:
 try:
     # Middleware span — unauthenticated request gets redirected
     with o11y_ssr.tracer.start_as_current_span("next.middleware", kind=SpanKind.SERVER) as mw_span:
-        mw_span.set_attribute("nextjs.route_type",  "middleware")
-        mw_span.set_attribute("http.route",         "/dashboard")
-        mw_span.set_attribute("http.method",        "GET")
-        mw_span.set_attribute("http.status_code",   307)
-        mw_span.set_attribute("middleware.action",  "auth_redirect")
-        mw_span.set_attribute("redirect.target",    "/login")
+        mw_span.set_attribute("nextjs.route_type",            "middleware")
+        mw_span.set_attribute("http.route",                   "/dashboard")
+        mw_span.set_attribute("http.request.method",          "GET")
+        mw_span.set_attribute("http.response.status_code",    307)
+        mw_span.set_attribute("middleware.action",            "auth_redirect")
+        mw_span.set_attribute("redirect.target",              "/login")
         time.sleep(random.uniform(0.002, 0.01))
 
     # Login page SSR
     with o11y_ssr.tracer.start_as_current_span("next.server.render", kind=SpanKind.SERVER) as login_span:
-        login_span.set_attribute("nextjs.page",       "/login")
-        login_span.set_attribute("nextjs.route_type", "ssr")
-        login_span.set_attribute("http.method",       "GET")
-        login_span.set_attribute("http.status_code",  200)
+        login_span.set_attribute("nextjs.page",               "/login")
+        login_span.set_attribute("nextjs.route_type",         "ssr")
+        login_span.set_attribute("http.request.method",       "GET")
+        login_span.set_attribute("http.response.status_code", 200)
         time.sleep(random.uniform(0.01, 0.04))
 
     # Login form submit (Server Action)
     with o11y_ssr.tracer.start_as_current_span("next.server_action", kind=SpanKind.SERVER) as login_action:
-        login_action.set_attribute("nextjs.route_type", "server_action")
-        login_action.set_attribute("nextjs.page",       "/login")
-        login_action.set_attribute("http.method",       "POST")
-        login_action.set_attribute("http.status_code",  200)
-        login_action.set_attribute("auth.provider",     "credentials")
+        login_action.set_attribute("nextjs.route_type",           "server_action")
+        login_action.set_attribute("nextjs.page",                 "/login")
+        login_action.set_attribute("http.request.method",         "POST")
+        login_action.set_attribute("http.response.status_code",   200)
+        login_action.set_attribute("auth.provider",               "credentials")
         with o11y_ssr.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "SELECT id, password_hash FROM users WHERE email = $1")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "SELECT id, password_hash FROM users WHERE email = $1")
             time.sleep(random.uniform(0.01, 0.03))
         time.sleep(random.uniform(0.02, 0.06))
 
     # Redirect back to /dashboard after login
     with o11y_ssr.tracer.start_as_current_span("next.middleware", kind=SpanKind.SERVER) as mw2_span:
-        mw2_span.set_attribute("nextjs.route_type", "middleware")
-        mw2_span.set_attribute("http.route",        "/dashboard")
-        mw2_span.set_attribute("http.method",       "GET")
-        mw2_span.set_attribute("http.status_code",  200)
-        mw2_span.set_attribute("middleware.action", "auth_pass")
+        mw2_span.set_attribute("nextjs.route_type",           "middleware")
+        mw2_span.set_attribute("http.route",                  "/dashboard")
+        mw2_span.set_attribute("http.request.method",         "GET")
+        mw2_span.set_attribute("http.response.status_code",   200)
+        mw2_span.set_attribute("middleware.action",           "auth_pass")
         time.sleep(random.uniform(0.002, 0.008))
 
     o11y_ssr.logger.info("Auth middleware flow complete", extra={"flow": "redirect→login→redirect_back"})
@@ -257,16 +277,16 @@ except Exception as e:
 # ── Scenario 6: Edge runtime geolocation middleware ──────────────────────────
 try:
     with o11y_ssr.tracer.start_as_current_span("next.middleware", kind=SpanKind.SERVER) as edge_span:
-        edge_span.set_attribute("nextjs.route_type",    "middleware")
-        edge_span.set_attribute("http.route",           "/")
-        edge_span.set_attribute("http.method",          "GET")
-        edge_span.set_attribute("http.status_code",     200)
-        edge_span.set_attribute("edge.runtime",         True)
-        edge_span.set_attribute("vercel.region",        "cdg1")
-        edge_span.set_attribute("geo.country",          "FR")
-        edge_span.set_attribute("geo.city",             "Paris")
-        edge_span.set_attribute("content.locale",       "fr-FR")
-        edge_span.set_attribute("middleware.action",    "geo_redirect")
+        edge_span.set_attribute("nextjs.route_type",          "middleware")
+        edge_span.set_attribute("http.route",                 "/")
+        edge_span.set_attribute("http.request.method",        "GET")
+        edge_span.set_attribute("http.response.status_code",  200)
+        edge_span.set_attribute("edge.runtime",               True)
+        edge_span.set_attribute("vercel.region",              "cdg1")
+        edge_span.set_attribute("geo.country",                "FR")
+        edge_span.set_attribute("geo.city",                   "Paris")
+        edge_span.set_attribute("content.locale",             "fr-FR")
+        edge_span.set_attribute("middleware.action",          "geo_redirect")
         time.sleep(random.uniform(0.001, 0.006))
 
     o11y_ssr.logger.info("Edge geolocation middleware", extra={"country": "FR", "locale": "fr-FR", "region": "cdg1"})

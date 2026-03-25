@@ -44,10 +44,11 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 propagator = TraceContextTextMapPropagator()
 
 NESTJS_ATTRS = {
-    "framework":          "nestjs",
-    "nestjs.version":     "10.3.0",
-    "node.version":       "20.10.0",
-    "telemetry.sdk.name": "opentelemetry-node",
+    "framework":              "nestjs",
+    "nestjs.version":         "10.3.0",
+    "node.version":           "20.10.0",
+    "telemetry.sdk.name":     "opentelemetry-node",
+    "telemetry.sdk.language": "javascript",
 }
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -84,9 +85,9 @@ try:
     ) as span:
         span.set_attribute("nestjs.controller", "UsersController")
         span.set_attribute("nestjs.handler", "findOne")
-        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.request.method", "GET")
         span.set_attribute("http.route", "/users/:id")
-        span.set_attribute("http.target", f"/users/{user_id}")
+        span.set_attribute("url.path", f"/users/{user_id}")
         span.set_attribute("user.id", user_id)
 
         propagator.inject(carrier)
@@ -109,17 +110,18 @@ try:
             with users_svc.tracer.start_as_current_span(
                 "nestjs.typeorm.query", kind=SpanKind.CLIENT
             ) as db_span:
-                db_span.set_attribute("db.system", "postgresql")
-                db_span.set_attribute("db.operation", "SELECT")
-                db_span.set_attribute("db.statement", "SELECT * FROM users WHERE id = $1")
-                db_span.set_attribute("db.sql.table", "users")
+                db_span.set_attribute("db.system.name", "postgresql")
+                db_span.set_attribute("db.operation.name", "SELECT")
+                db_span.set_attribute("db.query.text", "SELECT * FROM users WHERE id = $1")
+                db_span.set_attribute("db.collection.name", "users")
+                db_span.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.01, 0.05))
 
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
 
     dur_ms = (time.time() - t0) * 1000
-    req_counter.add(1, {"http.method": "GET", "http.route": "/users/:id", "http.status_code": "200"})
-    req_duration.record(dur_ms, {"http.method": "GET", "http.route": "/users/:id"})
+    req_counter.add(1, {"http.request.method": "GET", "http.route": "/users/:id", "http.response.status_code": "200"})
+    req_duration.record(dur_ms, {"http.request.method": "GET", "http.route": "/users/:id"})
     gateway.logger.info("REST GET /users/:id completed", extra={"user.id": user_id, "duration_ms": round(dur_ms, 2)})
     print("  ✅ Scenario 1 — REST controller GET /users/:id")
 except Exception as exc:
@@ -150,24 +152,26 @@ try:
             with users_svc.tracer.start_as_current_span(
                 "nestjs.typeorm.query", kind=SpanKind.CLIENT
             ) as db1:
-                db1.set_attribute("db.system", "postgresql")
-                db1.set_attribute("db.operation", "SELECT")
-                db1.set_attribute("db.statement", "SELECT * FROM user_profiles WHERE user_id = ANY($1)")
-                db1.set_attribute("db.sql.table", "user_profiles")
+                db1.set_attribute("db.system.name", "postgresql")
+                db1.set_attribute("db.operation.name", "SELECT")
+                db1.set_attribute("db.query.text", "SELECT * FROM user_profiles WHERE user_id = ANY($1)")
+                db1.set_attribute("db.collection.name", "user_profiles")
                 db1.set_attribute("dataloader.batch_size", random.randint(1, 10))
+                db1.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.01, 0.04))
 
             with users_svc.tracer.start_as_current_span(
                 "nestjs.typeorm.query", kind=SpanKind.CLIENT
             ) as db2:
-                db2.set_attribute("db.system", "postgresql")
-                db2.set_attribute("db.operation", "SELECT")
-                db2.set_attribute("db.statement", "SELECT * FROM orders WHERE user_id = ANY($1)")
-                db2.set_attribute("db.sql.table", "orders")
+                db2.set_attribute("db.system.name", "postgresql")
+                db2.set_attribute("db.operation.name", "SELECT")
+                db2.set_attribute("db.query.text", "SELECT * FROM orders WHERE user_id = ANY($1)")
+                db2.set_attribute("db.collection.name", "orders")
                 db2.set_attribute("dataloader.batch_size", random.randint(1, 10))
+                db2.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.01, 0.06))
 
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
 
     gql_ms = (time.time() - t0) * 1000
     gql_duration.record(gql_ms, {"graphql.operation.type": "query", "graphql.operation.name": "GetUser"})
@@ -190,8 +194,9 @@ try:
         span.set_attribute("nestjs.microservice.transport", "TCP")
         span.set_attribute("nestjs.microservice.pattern", pattern)
         span.set_attribute("messaging.system", "nestjs-tcp")
-        span.set_attribute("messaging.operation", "send")
-        span.set_attribute("message.id", msg_id)
+        span.set_attribute("messaging.operation.type", "publish")
+        span.set_attribute("messaging.message.id", msg_id)
+        span.add_event("cqrs.command.dispatched", {"command.name": "CreateUserCommand"})
         propagator.inject(carrier)
         time.sleep(random.uniform(0.005, 0.02))
 
@@ -201,7 +206,8 @@ try:
         span.set_attribute("nestjs.microservice.transport", "TCP")
         span.set_attribute("nestjs.microservice.pattern", pattern)
         span.set_attribute("nestjs.handler", "handleUserFind")
-        span.set_attribute("message.id", msg_id)
+        span.set_attribute("messaging.message.id", msg_id)
+        span.add_event("cqrs.event.published", {"event.name": "UserCreatedEvent"})
 
         with users_svc.tracer.start_as_current_span(
             "nestjs.event_emitter.emit", kind=SpanKind.INTERNAL
@@ -268,10 +274,11 @@ try:
         with users_svc.tracer.start_as_current_span(
             "nestjs.typeorm.query", kind=SpanKind.CLIENT
         ) as db_span:
-            db_span.set_attribute("db.system", "postgresql")
-            db_span.set_attribute("db.operation", "INSERT")
-            db_span.set_attribute("db.statement", "INSERT INTO users (id, email, created_at) VALUES ($1, $2, $3)")
-            db_span.set_attribute("db.sql.table", "users")
+            db_span.set_attribute("db.system.name", "postgresql")
+            db_span.set_attribute("db.operation.name", "INSERT")
+            db_span.set_attribute("db.query.text", "INSERT INTO users (id, email, created_at) VALUES ($1, $2, $3)")
+            db_span.set_attribute("db.collection.name", "users")
+            db_span.set_attribute("service.peer.name", "postgresql")
             time.sleep(random.uniform(0.01, 0.04))
 
         with gateway.tracer.start_as_current_span(
@@ -306,7 +313,7 @@ try:
     ) as span:
         span.set_attribute("nestjs.controller", "UsersController")
         span.set_attribute("nestjs.handler", "findOne")
-        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.request.method", "GET")
         span.set_attribute("http.route", "/users/:id")
         span.set_attribute("user.id", route_user_id)
 
@@ -323,10 +330,11 @@ try:
             with users_svc.tracer.start_as_current_span(
                 "nestjs.typeorm.query", kind=SpanKind.CLIENT
             ) as db_span:
-                db_span.set_attribute("db.system", "postgresql")
-                db_span.set_attribute("db.operation", "SELECT")
-                db_span.set_attribute("db.statement", "SELECT * FROM users WHERE id = $1")
+                db_span.set_attribute("db.system.name", "postgresql")
+                db_span.set_attribute("db.operation.name", "SELECT")
+                db_span.set_attribute("db.query.text", "SELECT * FROM users WHERE id = $1")
                 db_span.set_attribute("cache.hit", False)
+                db_span.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.01, 0.05))
         else:
             with gateway.tracer.start_as_current_span(
@@ -336,12 +344,12 @@ try:
                 cache_span.set_attribute("cache.key", f"user:{route_user_id}")
                 time.sleep(random.uniform(0.001, 0.005))
 
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
         span.set_attribute("cache.hit", cache_hit)
 
     dur_ms = (time.time() - t0) * 1000
-    req_counter.add(1, {"http.method": "GET", "http.route": "/users/:id", "http.status_code": "200"})
-    req_duration.record(dur_ms, {"http.method": "GET", "http.route": "/users/:id"})
+    req_counter.add(1, {"http.request.method": "GET", "http.route": "/users/:id", "http.response.status_code": "200"})
+    req_duration.record(dur_ms, {"http.request.method": "GET", "http.route": "/users/:id"})
     gateway.logger.info("Interceptor chain request completed",
                         extra={"user.id": route_user_id, "cache_hit": cache_hit, "duration_ms": round(dur_ms, 2)})
     print(f"  ✅ Scenario 6 — Interceptor chain (Logging→Transform→Cache) cache_hit={cache_hit}")

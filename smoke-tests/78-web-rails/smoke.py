@@ -43,10 +43,11 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 propagator = TraceContextTextMapPropagator()
 
 RAILS_ATTRS = {
-    "framework":          "rails",
-    "rails.version":      "7.1.2",
-    "ruby.version":       "3.2.2",
-    "telemetry.sdk.name": "opentelemetry-ruby",
+    "framework":              "rails",
+    "rails.version":          "7.1.2",
+    "ruby.version":           "3.2.2",
+    "telemetry.sdk.name":     "opentelemetry-ruby",
+    "telemetry.sdk.language": "ruby",
 }
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -54,9 +55,9 @@ rails   = O11yBootstrap("web-rails-cms-api",      ENDPOINT, API_KEY, ENV, extra_
 sidekiq = O11yBootstrap("web-rails-sidekiq-worker",ENDPOINT, API_KEY, ENV, extra_resource_attrs=RAILS_ATTRS)
 
 # ── Metrics instruments ───────────────────────────────────────────────────────
-req_total    = rails.meter.create_counter("rails.requests_total",           description="Total Rails requests")
-req_duration = rails.meter.create_histogram("rails.request_duration_ms",    description="Rails request latency", unit="ms")
-ar_queries   = rails.meter.create_counter("rails.active_record.query_count",description="Active Record query count")
+req_total    = rails.meter.create_counter("rails.request",             description="Total Rails requests")
+req_duration = rails.meter.create_histogram("rails.request.duration",  description="Rails request latency", unit="ms")
+ar_queries   = rails.meter.create_counter("rails.db.query",            description="Active Record query count")
 
 def _sidekiq_queue_depth_cb(options):
     yield Observation(random.randint(0, 120), {"queue": "default"})
@@ -81,7 +82,7 @@ try:
         span.set_attribute("rails.controller", "PostsController")
         span.set_attribute("rails.action", "index")
         span.set_attribute("rails.format", "json")
-        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.request.method", "GET")
         span.set_attribute("http.route", "/api/v1/posts")
 
         with rails.tracer.start_as_current_span(
@@ -95,20 +96,21 @@ try:
         with rails.tracer.start_as_current_span(
             "rails.active_record.SELECT", kind=SpanKind.CLIENT
         ) as ar_span:
-            ar_span.set_attribute("db.system", "postgresql")
-            ar_span.set_attribute("db.operation", "SELECT")
-            ar_span.set_attribute("db.statement", "SELECT posts.* FROM posts WHERE published = $1 ORDER BY created_at DESC LIMIT $2")
+            ar_span.set_attribute("db.system.name", "postgresql")
+            ar_span.set_attribute("db.operation.name", "SELECT")
+            ar_span.set_attribute("db.query.text", "SELECT posts.* FROM posts WHERE published = $1 ORDER BY created_at DESC LIMIT $2")
             ar_span.set_attribute("active_record.table", "posts")
             ar_span.set_attribute("rails.db.adapter", "postgresql")
+            ar_span.set_attribute("service.peer.name", "postgresql")
             t_ar = time.time()
             time.sleep(random.uniform(0.01, 0.05))
             ar_queries.add(1, {"table": "posts", "operation": "SELECT"})
 
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
         span.set_attribute("response.record_count", random.randint(10, 50))
 
     dur_ms = (time.time() - t0) * 1000
-    req_total.add(1, {"http.method": "GET", "rails.controller": "PostsController", "rails.action": "index"})
+    req_total.add(1, {"http.request.method": "GET", "rails.controller": "PostsController", "rails.action": "index"})
     req_duration.record(dur_ms, {"rails.controller": "PostsController"})
     rails.logger.info("PostsController#index rendered JSON", extra={"duration_ms": round(dur_ms, 2)})
     print("  ✅ Scenario 1 — Action Controller before_action → action → Active Record → JSON")
@@ -128,16 +130,17 @@ try:
         span.set_attribute("rails.controller", "PostsController")
         span.set_attribute("rails.action", "show_feed")
         span.set_attribute("rails.format", "json")
-        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.request.method", "GET")
 
         # Initial posts query
         with rails.tracer.start_as_current_span(
             "rails.active_record.SELECT", kind=SpanKind.CLIENT
         ) as ar_span:
-            ar_span.set_attribute("db.system", "postgresql")
-            ar_span.set_attribute("db.operation", "SELECT")
-            ar_span.set_attribute("db.statement", "SELECT posts.* FROM posts LIMIT $1")
+            ar_span.set_attribute("db.system.name", "postgresql")
+            ar_span.set_attribute("db.operation.name", "SELECT")
+            ar_span.set_attribute("db.query.text", "SELECT posts.* FROM posts LIMIT $1")
             ar_span.set_attribute("active_record.table", "posts")
+            ar_span.set_attribute("service.peer.name", "postgresql")
             time.sleep(random.uniform(0.005, 0.015))
             ar_queries.add(1, {"table": "posts", "operation": "SELECT"})
 
@@ -160,18 +163,19 @@ try:
             with rails.tracer.start_as_current_span(
                 "rails.active_record.SELECT", kind=SpanKind.CLIENT
             ) as n1_span:
-                n1_span.set_attribute("db.system", "postgresql")
-                n1_span.set_attribute("db.operation", "SELECT")
-                n1_span.set_attribute("db.statement", "SELECT users.* FROM users WHERE users.id = $1 LIMIT 1")
+                n1_span.set_attribute("db.system.name", "postgresql")
+                n1_span.set_attribute("db.operation.name", "SELECT")
+                n1_span.set_attribute("db.query.text", "SELECT users.* FROM users WHERE users.id = $1 LIMIT 1")
                 n1_span.set_attribute("active_record.table", "users")
                 n1_span.set_attribute("active_record.n_plus_one", True)
+                n1_span.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.003, 0.01))
                 ar_queries.add(1, {"table": "users", "operation": "SELECT"})
 
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
 
     dur_ms = (time.time() - t0) * 1000
-    req_total.add(1, {"http.method": "GET", "rails.controller": "PostsController", "rails.action": "show_feed"})
+    req_total.add(1, {"http.request.method": "GET", "rails.controller": "PostsController", "rails.action": "show_feed"})
     req_duration.record(dur_ms, {"rails.controller": "PostsController"})
     print(f"  ⚠️  Scenario 2 — Active Record N+1 detected ({n_posts} extra queries for Post#author)")
 except Exception as exc:
@@ -189,11 +193,13 @@ try:
         "rails.active_job.enqueue", kind=SpanKind.PRODUCER
     ) as span:
         span.set_attribute("messaging.system", "sidekiq")
-        span.set_attribute("messaging.destination", "default")
+        span.set_attribute("messaging.destination.name", "default")
+        span.set_attribute("messaging.operation.type", "publish")
         span.set_attribute("active_job.job_class", "ImageProcessJob")
         span.set_attribute("active_job.job_id", job_id)
         span.set_attribute("active_job.queue_name", "default")
         span.set_attribute("post.id", post_id)
+        span.set_attribute("service.peer.name", "sidekiq")
         propagator.inject(carrier)
         time.sleep(random.uniform(0.002, 0.008))
 
@@ -203,6 +209,7 @@ try:
         "sidekiq.perform", kind=SpanKind.CONSUMER
     ) as span:
         span.set_attribute("messaging.system", "sidekiq")
+        span.set_attribute("messaging.operation.type", "process")
         span.set_attribute("sidekiq.queue", "default")
         span.set_attribute("sidekiq.retry_count", 0)
         span.set_attribute("active_job.job_class", "ImageProcessJob")
@@ -225,6 +232,7 @@ try:
             s3_span.set_attribute("aws.s3.key", f"posts/{post_id}/cover.jpg")
             s3_span.set_attribute("rpc.system", "aws-api")
             s3_span.set_attribute("rpc.service", "S3")
+            s3_span.set_attribute("service.peer.name", "s3")
             time.sleep(random.uniform(0.03, 0.08))
 
     sidekiq.logger.info("ImageProcessJob completed", extra={"job_id": job_id, "post_id": post_id})
@@ -255,6 +263,7 @@ try:
         span.set_attribute("action_cable.channel", channel)
         span.set_attribute("action_cable.room", room_id)
         span.set_attribute("messaging.system", "websocket")
+        span.set_attribute("messaging.operation.type", "publish")
         span.set_attribute("broadcast.recipients", random.randint(1, 20))
         span.set_attribute("broadcast.payload_bytes", random.randint(128, 2048))
         time.sleep(random.uniform(0.002, 0.01))
@@ -279,7 +288,7 @@ try:
     ) as span:
         span.set_attribute("rails.controller", "PostsController")
         span.set_attribute("rails.action", "batch")
-        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.request.method", "GET")
 
         with rails.tracer.start_as_current_span(
             "rails.cache.read_multi", kind=SpanKind.CLIENT
@@ -288,17 +297,19 @@ try:
             cache_span.set_attribute("cache.hits", len(hit_ids))
             cache_span.set_attribute("cache.misses", len(miss_ids))
             cache_span.set_attribute("cache.backend", "redis")
+            cache_span.set_attribute("service.peer.name", "redis")
             time.sleep(random.uniform(0.005, 0.015))
 
         if miss_ids:
             with rails.tracer.start_as_current_span(
                 "rails.active_record.SELECT", kind=SpanKind.CLIENT
             ) as ar_span:
-                ar_span.set_attribute("db.system", "postgresql")
-                ar_span.set_attribute("db.operation", "SELECT")
-                ar_span.set_attribute("db.statement", "SELECT posts.* FROM posts WHERE posts.id IN ($1, $2, $3)")
+                ar_span.set_attribute("db.system.name", "postgresql")
+                ar_span.set_attribute("db.operation.name", "SELECT")
+                ar_span.set_attribute("db.query.text", "SELECT posts.* FROM posts WHERE posts.id IN ($1, $2, $3)")
                 ar_span.set_attribute("active_record.table", "posts")
                 ar_span.set_attribute("active_record.ids_fetched", len(miss_ids))
+                ar_span.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.01, 0.04))
                 ar_queries.add(1, {"table": "posts", "operation": "SELECT"})
 
@@ -308,12 +319,13 @@ try:
                 write_span.set_attribute("cache.keys_written", len(miss_ids))
                 write_span.set_attribute("cache.backend", "redis")
                 write_span.set_attribute("cache.ttl_seconds", 300)
+                write_span.set_attribute("service.peer.name", "redis")
                 time.sleep(random.uniform(0.003, 0.01))
 
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
 
     dur_ms = (time.time() - t0) * 1000
-    req_total.add(1, {"http.method": "GET", "rails.controller": "PostsController", "rails.action": "batch"})
+    req_total.add(1, {"http.request.method": "GET", "rails.controller": "PostsController", "rails.action": "batch"})
     req_duration.record(dur_ms, {"rails.controller": "PostsController"})
     rails.logger.info("Cache read_multi/write_multi completed",
                       extra={"hits": len(hit_ids), "misses": len(miss_ids)})
@@ -333,7 +345,7 @@ try:
         span.set_attribute("rails.controller", "PostsController")
         span.set_attribute("rails.action", "create")
         span.set_attribute("rails.format", "json")
-        span.set_attribute("http.method", "POST")
+        span.set_attribute("http.request.method", "POST")
 
         with rails.tracer.start_as_current_span(
             "rails.active_model.callback.before_save", kind=SpanKind.INTERNAL
@@ -346,10 +358,11 @@ try:
         with rails.tracer.start_as_current_span(
             "rails.active_record.SELECT", kind=SpanKind.CLIENT
         ) as ar_span:
-            ar_span.set_attribute("db.system", "postgresql")
-            ar_span.set_attribute("db.operation", "INSERT")
-            ar_span.set_attribute("db.statement", "INSERT INTO posts (title, body, slug, author_id, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id")
+            ar_span.set_attribute("db.system.name", "postgresql")
+            ar_span.set_attribute("db.operation.name", "INSERT")
+            ar_span.set_attribute("db.query.text", "INSERT INTO posts (title, body, slug, author_id, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id")
             ar_span.set_attribute("active_record.table", "posts")
+            ar_span.set_attribute("service.peer.name", "postgresql")
             time.sleep(random.uniform(0.01, 0.03))
             ar_queries.add(1, {"table": "posts", "operation": "INSERT"})
 
@@ -362,22 +375,24 @@ try:
             with rails.tracer.start_as_current_span(
                 "rails.active_record.touch", kind=SpanKind.CLIENT
             ) as touch_span:
-                touch_span.set_attribute("db.system", "postgresql")
-                touch_span.set_attribute("db.operation", "UPDATE")
+                touch_span.set_attribute("db.system.name", "postgresql")
+                touch_span.set_attribute("db.operation.name", "UPDATE")
                 touch_span.set_attribute("active_record.table", "users")
                 touch_span.set_attribute("active_record.association", "Post#author")
+                touch_span.set_attribute("service.peer.name", "postgresql")
                 time.sleep(random.uniform(0.003, 0.01))
 
             with rails.tracer.start_as_current_span(
                 "elasticsearch.index", kind=SpanKind.CLIENT
             ) as es_span:
-                es_span.set_attribute("db.system", "elasticsearch")
-                es_span.set_attribute("db.operation", "index")
+                es_span.set_attribute("db.system.name", "elasticsearch")
+                es_span.set_attribute("db.operation.name", "index")
                 es_span.set_attribute("elasticsearch.index", "posts_v2")
                 es_span.set_attribute("elasticsearch.document_id", str(record_id))
+                es_span.set_attribute("service.peer.name", "elasticsearch")
                 time.sleep(random.uniform(0.01, 0.04))
 
-        span.set_attribute("http.status_code", 201)
+        span.set_attribute("http.response.status_code", 201)
         span.set_attribute("post.id", record_id)
 
     rails.logger.info("Post created with full callback chain", extra={"post_id": record_id})
@@ -389,4 +404,4 @@ except Exception as exc:
 rails.flush()
 sidekiq.flush()
 
-print(f"\n[{SVC}] Done. APM → {SVC} | Metrics: rails.requests_total, sidekiq.queue_depth")
+print(f"\n[{SVC}] Done. APM → {SVC} | Metrics: rails.request, sidekiq.queue_depth")

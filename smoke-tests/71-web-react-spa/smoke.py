@@ -29,6 +29,7 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry import propagate, context
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.sdk.metrics.view import View, ExplicitBucketHistogramAggregation
 
 ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
 API_KEY  = os.environ["ELASTIC_API_KEY"]
@@ -36,13 +37,15 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 
 # ── Browser (client-side RUM) bootstrap ───────────────────────────────────────
 browser_attrs = {
-    "browser.name":          "Chrome",
-    "browser.version":       "120.0",
-    "browser.platform":      "Win32",
-    "browser.language":      "en-US",
-    "telemetry.sdk.name":    "opentelemetry-js-web",
-    "telemetry.sdk.version": "1.18.0",
-    "user_agent.original":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
+    "browser.name":             "Chrome",
+    "browser.version":          "120.0",
+    "browser.platform":         "Win32",
+    "browser.language":         "en-US",
+    "browser.mobile":           False,
+    "telemetry.sdk.name":       "opentelemetry-js-web",
+    "telemetry.sdk.version":    "1.18.0",
+    "telemetry.sdk.language":   "javascript",
+    "user_agent.original":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
 }
 o11y_browser = O11yBootstrap(
     "web-react-shop-client", ENDPOINT, API_KEY, ENV,
@@ -51,18 +54,33 @@ o11y_browser = O11yBootstrap(
 
 # ── API backend (Express) bootstrap ───────────────────────────────────────────
 api_attrs = {
-    "telemetry.sdk.name": "opentelemetry-node",
-    "framework":          "express",
-    "node.version":       "20.10.0",
+    "telemetry.sdk.name":     "opentelemetry-node",
+    "telemetry.sdk.language": "javascript",
+    "framework":              "express",
+    "node.version":           "20.10.0",
 }
 o11y_api = O11yBootstrap(
     "web-react-shop-api", ENDPOINT, API_KEY, ENV,
     extra_resource_attrs=api_attrs,
 )
 
+# Views configure histogram bucket boundaries aligned with CWV thresholds
+cwv_views = [
+    View(instrument_name="webvitals.lcp",
+         aggregation=ExplicitBucketHistogramAggregation([200, 500, 1000, 2500, 4000, 10000])),
+    View(instrument_name="webvitals.inp",
+         aggregation=ExplicitBucketHistogramAggregation([50, 100, 200, 500, 1000])),
+    View(instrument_name="webvitals.cls",
+         aggregation=ExplicitBucketHistogramAggregation([0.01, 0.05, 0.1, 0.15, 0.25, 0.4])),
+    View(instrument_name="webvitals.ttfb",
+         aggregation=ExplicitBucketHistogramAggregation([100, 200, 500, 800, 1800, 3000])),
+    View(instrument_name="webvitals.fcp",
+         aggregation=ExplicitBucketHistogramAggregation([500, 1000, 1800, 3000, 5000])),
+]
+
 # ── Metric instruments (browser) ──────────────────────────────────────────────
 lcp_hist       = o11y_browser.meter.create_histogram("webvitals.lcp",        description="Largest Contentful Paint",    unit="ms")
-fid_hist       = o11y_browser.meter.create_histogram("webvitals.fid",        description="First Input Delay",           unit="ms")
+inp_hist       = o11y_browser.meter.create_histogram("webvitals.inp",        description="Interaction to Next Paint",   unit="ms")
 cls_hist       = o11y_browser.meter.create_histogram("webvitals.cls",        description="Cumulative Layout Shift")
 ttfb_hist      = o11y_browser.meter.create_histogram("webvitals.ttfb",       description="Time to First Byte",          unit="ms")
 fcp_hist       = o11y_browser.meter.create_histogram("webvitals.fcp",        description="First Contentful Paint",      unit="ms")
@@ -107,9 +125,9 @@ try:
     with o11y_browser.tracer.start_as_current_span("documentLoad", kind=SpanKind.INTERNAL) as span:
         attrs = session_attrs("https://shop.example.com/products")
         span.set_attributes(attrs)
-        span.set_attribute("http.url",              "https://shop.example.com/products")
-        span.set_attribute("http.method",           "GET")
-        span.set_attribute("http.status_code",      200)
+        span.set_attribute("url.full",              "https://shop.example.com/products")
+        span.set_attribute("http.request.method",   "GET")
+        span.set_attribute("http.response.status_code", 200)
         span.set_attribute("webvitals.lcp_ms",      round(lcp_ms, 2))
         span.set_attribute("webvitals.fcp_ms",      round(fcp_ms, 2))
         span.set_attribute("webvitals.ttfb_ms",     round(ttfb_ms, 2))
@@ -131,49 +149,50 @@ try:
 except Exception as e:
     results.append(("Initial page load: document.load → React hydration → LCP", "ERROR", str(e)))
 
-# ── Scenario 2: Product search (FID measured) ─────────────────────────────────
+# ── Scenario 2: Product search (INP measured) ─────────────────────────────────
 try:
-    fid_ms = random.uniform(10, 500)
+    inp_ms = random.uniform(10, 500)
     with o11y_browser.tracer.start_as_current_span("user.interaction.click", kind=SpanKind.INTERNAL) as ui_span:
         s_attrs = session_attrs("https://shop.example.com/products")
         ui_span.set_attributes(s_attrs)
         ui_span.set_attribute("ui.element",          "search-input")
         ui_span.set_attribute("ui.event_type",       "keydown")
-        ui_span.set_attribute("webvitals.fid_ms",    round(fid_ms, 2))
-        time.sleep(fid_ms / 1000)
+        ui_span.set_attribute("webvitals.inp_ms",    round(inp_ms, 2))
+        time.sleep(inp_ms / 1000)
 
         # Debounced fetch after user types
         carrier = inject_traceparent(ui_span)
         fetch_start = time.time()
         with o11y_browser.tracer.start_as_current_span("fetch.GET /api/products", kind=SpanKind.CLIENT) as fetch_span:
             fetch_span.set_attributes(s_attrs)
-            fetch_span.set_attribute("http.url",         "https://api.shop.example.com/api/products?q=sneakers")
-            fetch_span.set_attribute("http.method",      "GET")
-            fetch_span.set_attribute("http.status_code", 200)
+            fetch_span.set_attribute("url.full",              "https://api.shop.example.com/api/products?q=sneakers")
+            fetch_span.set_attribute("http.request.method",   "GET")
+            fetch_span.set_attribute("http.response.status_code", 200)
+            fetch_span.set_attribute("service.peer.name",    "web-react-shop-api")
             carrier2 = inject_traceparent(fetch_span)
             time.sleep(random.uniform(0.08, 0.25))
         fetch_ms = (time.time() - fetch_start) * 1000
-        fetch_dur_hist.record(fetch_ms, attributes={"http.route": "/api/products", "http.method": "GET"})
+        fetch_dur_hist.record(fetch_ms, attributes={"http.route": "/api/products", "http.request.method": "GET"})
 
         # Server-side Express handler (linked via traceparent)
         remote_ctx = extract_context(carrier2)
         with o11y_api.tracer.start_as_current_span(
             "GET /api/products", kind=SpanKind.SERVER, context=remote_ctx
         ) as srv_span:
-            srv_span.set_attribute("http.route",       "/api/products")
-            srv_span.set_attribute("http.method",      "GET")
-            srv_span.set_attribute("http.status_code", 200)
-            srv_span.set_attribute("framework.name",   "express")
+            srv_span.set_attribute("http.route",                  "/api/products")
+            srv_span.set_attribute("http.request.method",         "GET")
+            srv_span.set_attribute("http.response.status_code",   200)
+            srv_span.set_attribute("framework.name",              "express")
             with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "postgresql")
-                db_span.set_attribute("db.statement", "SELECT id, name, price FROM products WHERE name ILIKE $1 LIMIT 20")
+                db_span.set_attribute("db.system.name",   "postgresql")
+                db_span.set_attribute("db.query.text",    "SELECT id, name, price FROM products WHERE name ILIKE $1 LIMIT 20")
                 time.sleep(random.uniform(0.01, 0.04))
 
-    fid_hist.record(fid_ms, attributes={"page.route": "/products"})
-    o11y_browser.logger.info("Product search fetch complete", extra={"query": "sneakers", "fid_ms": round(fid_ms, 2)})
-    results.append(("Product search: user types → debounced fetch → results rendered (FID)", "OK", None))
+    inp_hist.record(inp_ms, attributes={"page.route": "/products"})
+    o11y_browser.logger.info("Product search fetch complete", extra={"query": "sneakers", "inp_ms": round(inp_ms, 2)})
+    results.append(("Product search: user types → debounced fetch → results rendered (INP)", "OK", None))
 except Exception as e:
-    results.append(("Product search: user types → debounced fetch → results rendered (FID)", "ERROR", str(e)))
+    results.append(("Product search: user types → debounced fetch → results rendered (INP)", "ERROR", str(e)))
 
 # ── Scenario 3: Add to cart ───────────────────────────────────────────────────
 try:
@@ -190,26 +209,27 @@ try:
         fetch_start = time.time()
         with o11y_browser.tracer.start_as_current_span("fetch.POST /api/cart", kind=SpanKind.CLIENT) as fetch_span:
             fetch_span.set_attributes(s_attrs)
-            fetch_span.set_attribute("http.url",         "https://api.shop.example.com/api/cart")
-            fetch_span.set_attribute("http.method",      "POST")
-            fetch_span.set_attribute("http.status_code", 201)
+            fetch_span.set_attribute("url.full",                  "https://api.shop.example.com/api/cart")
+            fetch_span.set_attribute("http.request.method",       "POST")
+            fetch_span.set_attribute("http.response.status_code", 201)
+            fetch_span.set_attribute("service.peer.name",         "web-react-shop-api")
             carrier2 = inject_traceparent(fetch_span)
             time.sleep(random.uniform(0.06, 0.18))
         fetch_ms = (time.time() - fetch_start) * 1000
-        fetch_dur_hist.record(fetch_ms, attributes={"http.route": "/api/cart", "http.method": "POST"})
+        fetch_dur_hist.record(fetch_ms, attributes={"http.route": "/api/cart", "http.request.method": "POST"})
 
         # Express handler
         remote_ctx = extract_context(carrier2)
         with o11y_api.tracer.start_as_current_span(
             "POST /api/cart", kind=SpanKind.SERVER, context=remote_ctx
         ) as srv_span:
-            srv_span.set_attribute("http.route",       "/api/cart")
-            srv_span.set_attribute("http.method",      "POST")
-            srv_span.set_attribute("http.status_code", 201)
-            srv_span.set_attribute("framework.name",   "express")
+            srv_span.set_attribute("http.route",                  "/api/cart")
+            srv_span.set_attribute("http.request.method",         "POST")
+            srv_span.set_attribute("http.response.status_code",   201)
+            srv_span.set_attribute("framework.name",              "express")
             with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "postgresql")
-                db_span.set_attribute("db.statement", "INSERT INTO cart_items (session_id, product_id, qty) VALUES ($1, $2, $3)")
+                db_span.set_attribute("db.system.name",   "postgresql")
+                db_span.set_attribute("db.query.text",    "INSERT INTO cart_items (session_id, product_id, qty) VALUES ($1, $2, $3)")
                 time.sleep(random.uniform(0.01, 0.03))
 
     o11y_browser.logger.info("Add to cart success", extra={"product.id": product_id})
@@ -262,25 +282,26 @@ try:
 
         fetch_start = time.time()
         with o11y_browser.tracer.start_as_current_span("fetch.POST /api/checkout", kind=SpanKind.CLIENT) as fetch_span:
-            fetch_span.set_attribute("http.url",         "https://api.shop.example.com/api/checkout")
-            fetch_span.set_attribute("http.method",      "POST")
-            fetch_span.set_attribute("http.status_code", 201)
+            fetch_span.set_attribute("url.full",                  "https://api.shop.example.com/api/checkout")
+            fetch_span.set_attribute("http.request.method",       "POST")
+            fetch_span.set_attribute("http.response.status_code", 201)
+            fetch_span.set_attribute("service.peer.name",         "web-react-shop-api")
             carrier2 = inject_traceparent(fetch_span)
             time.sleep(random.uniform(0.12, 0.35))
         fetch_ms = (time.time() - fetch_start) * 1000
-        fetch_dur_hist.record(fetch_ms, attributes={"http.route": "/api/checkout", "http.method": "POST"})
+        fetch_dur_hist.record(fetch_ms, attributes={"http.route": "/api/checkout", "http.request.method": "POST"})
 
         remote_ctx = extract_context(carrier2)
         with o11y_api.tracer.start_as_current_span(
             "POST /api/checkout", kind=SpanKind.SERVER, context=remote_ctx
         ) as srv_span:
-            srv_span.set_attribute("http.route",       "/api/checkout")
-            srv_span.set_attribute("http.method",      "POST")
-            srv_span.set_attribute("http.status_code", 201)
-            srv_span.set_attribute("framework.name",   "express")
+            srv_span.set_attribute("http.route",                  "/api/checkout")
+            srv_span.set_attribute("http.request.method",         "POST")
+            srv_span.set_attribute("http.response.status_code",   201)
+            srv_span.set_attribute("framework.name",              "express")
             with o11y_api.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "postgresql")
-                db_span.set_attribute("db.statement", "INSERT INTO orders (user_id, total_usd, status) VALUES ($1, $2, $3) RETURNING id")
+                db_span.set_attribute("db.system.name",   "postgresql")
+                db_span.set_attribute("db.query.text",    "INSERT INTO orders (user_id, total_usd, status) VALUES ($1, $2, $3) RETURNING id")
                 time.sleep(random.uniform(0.02, 0.06))
 
     page_views.add(1, attributes={"page.route": "/checkout/success"})
@@ -326,4 +347,4 @@ for scenario, status, note in results:
 
 print(f"\n[web-react-shop] Done. {ok} OK | {warn} WARN | {err} ERROR")
 print(f"  Kibana → APM → web-react-shop-client | web-react-shop-api")
-print(f"  Metrics: webvitals.lcp | webvitals.fid | webvitals.cls | page.view | fetch.duration_ms")
+print(f"  Metrics: webvitals.lcp | webvitals.inp | webvitals.cls | page.view | fetch.duration_ms")

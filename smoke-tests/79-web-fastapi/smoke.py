@@ -44,10 +44,11 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 propagator = TraceContextTextMapPropagator()
 
 FASTAPI_ATTRS = {
-    "framework":          "fastapi",
-    "fastapi.version":    "0.109.0",
-    "python.version":     "3.11.6",
-    "telemetry.sdk.name": "opentelemetry-python",
+    "framework":              "fastapi",
+    "fastapi.version":        "0.109.0",
+    "python.version":         "3.11.6",
+    "telemetry.sdk.name":     "opentelemetry-python",
+    "telemetry.sdk.language": "python",
 }
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -56,8 +57,8 @@ celery  = O11yBootstrap("web-fastapi-celery-worker",ENDPOINT, API_KEY, ENV, extr
 pg_svc  = O11yBootstrap("web-fastapi-postgres",    ENDPOINT, API_KEY, ENV, extra_resource_attrs=FASTAPI_ATTRS)
 
 # ── Metrics instruments ───────────────────────────────────────────────────────
-req_total    = api.meter.create_counter("fastapi.requests_total",       description="Total FastAPI requests")
-req_duration = api.meter.create_histogram("fastapi.request_duration_ms",description="FastAPI request latency", unit="ms")
+req_total    = api.meter.create_counter("fastapi.request",              description="Total FastAPI requests")
+req_duration = api.meter.create_histogram("fastapi.request.duration",   description="FastAPI request latency", unit="ms")
 ml_duration  = api.meter.create_histogram("ml.inference_duration_ms",   description="ML model inference latency", unit="ms")
 
 def _active_ws_cb(options):
@@ -83,14 +84,14 @@ try:
     ) as span:
         span.set_attribute("fastapi.route", "/api/v1/predict")
         span.set_attribute("fastapi.response_model", "PredictionResponse")
-        span.set_attribute("http.method", "POST")
+        span.set_attribute("http.request.method", "POST")
         span.set_attribute("http.route", "/api/v1/predict")
 
         with api.tracer.start_as_current_span(
             "fastapi.dependency.get_db", kind=SpanKind.INTERNAL
         ) as dep_span:
             dep_span.set_attribute("fastapi.dependency", "get_db")
-            dep_span.set_attribute("db.system", "postgresql")
+            dep_span.set_attribute("db.system.name", "postgresql")
             dep_span.set_attribute("sqlalchemy.pool.checkout", True)
             time.sleep(random.uniform(0.002, 0.008))
 
@@ -114,18 +115,20 @@ try:
         with api.tracer.start_as_current_span(
             "ml.inference", kind=SpanKind.INTERNAL
         ) as ml_span:
-            ml_span.set_attribute("ml.model_name", "bert-classifier")
+            ml_span.set_attribute("ml.model_name", "fraud-detection-v3")
             ml_span.set_attribute("ml.model_version", "1.2.0")
             ml_span.set_attribute("ml.input_tokens", random.randint(10, 512))
             inf_ms = random.uniform(20, 120)
             time.sleep(inf_ms / 1000)
             ml_span.set_attribute("ml.inference_time_ms", round(inf_ms, 2))
+            ml_span.add_event("ml.model.loaded", {"ml.model_name": "fraud-detection-v3", "ml.load_ms": 340})
+            ml_span.add_event("ml.inference.complete", {"ml.output_tokens": 128, "ml.inference_ms": 45})
 
-        ml_duration.record(inf_ms, {"ml.model_name": "bert-classifier"})
-        span.set_attribute("http.status_code", 200)
+        ml_duration.record(inf_ms, {"ml.model_name": "fraud-detection-v3"})
+        span.set_attribute("http.response.status_code", 200)
 
     dur_ms = (time.time() - t0) * 1000
-    req_total.add(1, {"http.method": "POST", "fastapi.route": "/api/v1/predict", "http.status_code": "200"})
+    req_total.add(1, {"http.request.method": "POST", "fastapi.route": "/api/v1/predict", "http.response.status_code": "200"})
     req_duration.record(dur_ms, {"fastapi.route": "/api/v1/predict"})
     api.logger.info("ML prediction served", extra={"user_id": user_id, "inference_ms": round(inf_ms, 2)})
     print("  ✅ Scenario 1 — Dependency injection Depends(get_db) → Depends(get_current_user) → predict")
@@ -146,14 +149,14 @@ try:
     ) as span:
         span.set_attribute("fastapi.route", "/api/v1/predict/async")
         span.set_attribute("fastapi.response_model", "AsyncPredictionResponse")
-        span.set_attribute("http.method", "POST")
+        span.set_attribute("http.request.method", "POST")
         span.set_attribute("task.id", task_id)
         time.sleep(random.uniform(0.002, 0.008))
-        span.set_attribute("http.status_code", 202)
+        span.set_attribute("http.response.status_code", 202)
         propagator.inject(carrier)
 
     dur_ms = (time.time() - t0) * 1000
-    req_total.add(1, {"http.method": "POST", "fastapi.route": "/api/v1/predict/async", "http.status_code": "202"})
+    req_total.add(1, {"http.request.method": "POST", "fastapi.route": "/api/v1/predict/async", "http.response.status_code": "202"})
     req_duration.record(dur_ms, {"fastapi.route": "/api/v1/predict/async"})
     api.logger.info("Async prediction accepted, background task enqueued", extra={"task_id": task_id})
 
@@ -170,19 +173,21 @@ try:
             cel_span.set_attribute("celery.task_id", task_id)
             cel_span.set_attribute("celery.task_name", "tasks.run_prediction")
             cel_span.set_attribute("celery.queue", "predictions")
-            cel_span.set_attribute("ml.model_name", "bert-classifier")
+            cel_span.set_attribute("messaging.operation.type", "process")
+            cel_span.set_attribute("ml.model_name", "fraud-detection-v3")
             t_inf = time.time()
             time.sleep(random.uniform(0.05, 0.15))
             inf_ms = (time.time() - t_inf) * 1000
             cel_span.set_attribute("ml.inference_time_ms", round(inf_ms, 2))
-            ml_duration.record(inf_ms, {"ml.model_name": "bert-classifier"})
+            ml_duration.record(inf_ms, {"ml.model_name": "fraud-detection-v3"})
 
         with api.tracer.start_as_current_span(
             "http.client.POST webhook", kind=SpanKind.CLIENT
         ) as wh_span:
-            wh_span.set_attribute("http.method", "POST")
-            wh_span.set_attribute("http.url", webhook_url)
+            wh_span.set_attribute("http.request.method", "POST")
+            wh_span.set_attribute("url.full", webhook_url)
             wh_span.set_attribute("task.id", task_id)
+            wh_span.set_attribute("service.peer.name", "hooks.example.com")
             time.sleep(random.uniform(0.01, 0.04))
 
     api.logger.info("Background task completed, webhook sent", extra={"task_id": task_id})
@@ -216,7 +221,7 @@ try:
             ) as fr_span:
                 fr_span.set_attribute("websocket.id", ws_id)
                 fr_span.set_attribute("websocket.frame_index", i)
-                fr_span.set_attribute("ml.model_name", "bert-classifier")
+                fr_span.set_attribute("ml.model_name", "fraud-detection-v3")
                 fr_span.set_attribute("ml.inference_time_ms", round(random.uniform(15, 80), 2))
                 time.sleep(random.uniform(0.01, 0.03))
 
@@ -244,7 +249,7 @@ try:
         "fastapi.request.POST /api/v1/predict", kind=SpanKind.SERVER
     ) as span:
         span.set_attribute("fastapi.route", "/api/v1/predict")
-        span.set_attribute("http.method", "POST")
+        span.set_attribute("http.request.method", "POST")
 
         with api.tracer.start_as_current_span(
             "pydantic.validation", kind=SpanKind.INTERNAL
@@ -256,15 +261,16 @@ try:
             val_err = ValueError("Value error: text field must be between 1 and 512 characters [type=value_error]")
             val_span.set_attribute("pydantic.validation_error", "text")
             val_span.set_attribute("pydantic.error_count", 1)
-            val_span.record_exception(val_err, attributes={"exception.escaped": True})
+            val_span.record_exception(val_err, attributes={"exception.escaped": False})
             val_span.set_status(StatusCode.ERROR, "Pydantic validation failed")
+            val_span.set_attribute("error.type", type(val_err).__name__)
             time.sleep(random.uniform(0.001, 0.005))
 
-        span.set_attribute("http.status_code", 422)
+        span.set_attribute("http.response.status_code", 422)
         span.set_status(StatusCode.ERROR, "Unprocessable Entity")
 
     dur_ms = (time.time() - t0) * 1000
-    req_total.add(1, {"http.method": "POST", "fastapi.route": "/api/v1/predict", "http.status_code": "422"})
+    req_total.add(1, {"http.request.method": "POST", "fastapi.route": "/api/v1/predict", "http.response.status_code": "422"})
     req_duration.record(dur_ms, {"fastapi.route": "/api/v1/predict"})
     api.logger.warning("Pydantic v2 validation error on POST /api/v1/predict",
                        extra={"field": "text", "error_count": 1})
@@ -283,32 +289,34 @@ try:
         "fastapi.request.GET /api/v1/models", kind=SpanKind.SERVER
     ) as span:
         span.set_attribute("fastapi.route", "/api/v1/models")
-        span.set_attribute("http.method", "GET")
+        span.set_attribute("http.request.method", "GET")
 
         with pg_svc.tracer.start_as_current_span(
             "sqlalchemy.async.select", kind=SpanKind.CLIENT
         ) as sa_span:
-            sa_span.set_attribute("db.system", "postgresql")
-            sa_span.set_attribute("db.operation", "SELECT")
-            sa_span.set_attribute("sqlalchemy.query", "SELECT ml_models.id, ml_models.name, ml_models.version FROM ml_models WHERE is_active = true")
+            sa_span.set_attribute("db.system.name", "postgresql")
+            sa_span.set_attribute("db.operation.name", "SELECT")
+            sa_span.set_attribute("db.query.text", "SELECT ml_models.id, ml_models.name, ml_models.version FROM ml_models WHERE is_active = true")
             sa_span.set_attribute("sqlalchemy.orm_mode", "async")
             sa_span.set_attribute("sqlalchemy.awaits", 2)
+            sa_span.set_attribute("service.peer.name", "postgresql")
             time.sleep(random.uniform(0.01, 0.04))
 
         with pg_svc.tracer.start_as_current_span(
             "sqlalchemy.async.select", kind=SpanKind.CLIENT
         ) as sa_span2:
-            sa_span2.set_attribute("db.system", "postgresql")
-            sa_span2.set_attribute("db.operation", "SELECT")
-            sa_span2.set_attribute("sqlalchemy.query", "SELECT model_metrics.* FROM model_metrics WHERE model_id = :model_id ORDER BY evaluated_at DESC LIMIT 10")
+            sa_span2.set_attribute("db.system.name", "postgresql")
+            sa_span2.set_attribute("db.operation.name", "SELECT")
+            sa_span2.set_attribute("db.query.text", "SELECT model_metrics.* FROM model_metrics WHERE model_id = :model_id ORDER BY evaluated_at DESC LIMIT 10")
             sa_span2.set_attribute("sqlalchemy.orm_mode", "async")
             sa_span2.set_attribute("sqlalchemy.awaits", 1)
+            sa_span2.set_attribute("service.peer.name", "postgresql")
             time.sleep(random.uniform(0.008, 0.03))
 
-        span.set_attribute("http.status_code", 200)
+        span.set_attribute("http.response.status_code", 200)
 
     dur_ms = (time.time() - t0) * 1000
-    req_total.add(1, {"http.method": "GET", "fastapi.route": "/api/v1/models", "http.status_code": "200"})
+    req_total.add(1, {"http.request.method": "GET", "fastapi.route": "/api/v1/models", "http.response.status_code": "200"})
     req_duration.record(dur_ms, {"fastapi.route": "/api/v1/models"})
     api.logger.info("async SQLAlchemy queries completed", extra={"duration_ms": round(dur_ms, 2)})
     print("  ✅ Scenario 5 — async SQLAlchemy: async with session → select() → scalars() → multiple awaits")
@@ -323,20 +331,20 @@ try:
         "fastapi.lifespan.startup", kind=SpanKind.INTERNAL
     ) as span:
         span.set_attribute("lifespan.event", "startup")
-        span.set_attribute("ml.model_name", "bert-classifier")
+        span.set_attribute("ml.model_name", "fraud-detection-v3")
 
         with api.tracer.start_as_current_span(
             "ml.load_model", kind=SpanKind.INTERNAL
         ) as load_span:
-            load_span.set_attribute("ml.model_name", "bert-classifier")
-            load_span.set_attribute("ml.model_path", "/models/bert-classifier-v1.2.0.pt")
+            load_span.set_attribute("ml.model_name", "fraud-detection-v3")
+            load_span.set_attribute("ml.model_path", "/models/fraud-detection-v3.pt")
             load_span.set_attribute("ml.model_size_mb", 438)
             time.sleep(random.uniform(0.05, 0.15))
 
         with api.tracer.start_as_current_span(
             "ml.warmup", kind=SpanKind.INTERNAL
         ) as wu_span:
-            wu_span.set_attribute("ml.model_name", "bert-classifier")
+            wu_span.set_attribute("ml.model_name", "fraud-detection-v3")
             wu_span.set_attribute("ml.warmup_batches", 3)
             t_wu = time.time()
             time.sleep(random.uniform(0.03, 0.08))
@@ -345,7 +353,7 @@ try:
         span.set_attribute("lifespan.ready", True)
 
     api.logger.info("FastAPI lifespan startup complete: ML model loaded and warmed up",
-                    extra={"model": "bert-classifier", "model_version": "1.2.0"})
+                    extra={"model": "fraud-detection-v3", "model_version": "3.0"})
 
     # Simulate shutdown sequence
     with api.tracer.start_as_current_span(
@@ -375,4 +383,4 @@ api.flush()
 celery.flush()
 pg_svc.flush()
 
-print(f"\n[{SVC}] Done. APM → {SVC} | Metrics: fastapi.requests_total, ml.inference_duration_ms")
+print(f"\n[{SVC}] Done. APM → {SVC} | Metrics: fastapi.request, ml.inference_duration_ms")

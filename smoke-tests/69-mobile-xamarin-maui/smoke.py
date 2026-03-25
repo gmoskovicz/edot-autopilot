@@ -36,6 +36,7 @@ COMMON_ATTRS = {
     "app.version":           "1.4.0",
     "telemetry.sdk.name":    "opentelemetry-dotnet",
     "telemetry.sdk.version": "1.7.0",
+    "telemetry.sdk.language": "dotnet",
 }
 
 # ── Bootstrap: iOS ────────────────────────────────────────────────────────────
@@ -47,6 +48,8 @@ o11y_ios = O11yBootstrap(
         "device.model.name":       "iPhone 13",
         "os.name":                 "iOS",
         "os.version":              "16.0",
+        "os.type":                 "darwin",
+        "os.description":          "iOS 16.0 (20A362)",
     },
 )
 
@@ -59,6 +62,8 @@ o11y_android = O11yBootstrap(
         "device.model.name":       "Redmi Note 12",
         "os.name":                 "Android",
         "os.version":              "12.0",
+        "os.type":                 "linux",
+        "os.description":          "Android 12 (API 32)",
     },
 )
 
@@ -128,7 +133,7 @@ def run_scenarios(o11y, platform, instruments):
             span.set_attribute("sync.records_pending", pending)
             span.set_attribute("azure.service", "sharepoint")
             # Read from SQLite local DB
-            with tracer.start_as_current_span("sync.sqlite_read") as db:
+            with tracer.start_as_current_span("sync.sqlite_read", kind=SpanKind.INTERNAL) as db:
                 db.set_attributes(maui_attrs())
                 db.set_attribute("db.system", "sqlite")
                 db.set_attribute("db.operation", "SELECT")
@@ -137,12 +142,14 @@ def run_scenarios(o11y, platform, instruments):
             # Push delta to SharePoint REST API
             with tracer.start_as_current_span("sync.offline_delta", kind=SpanKind.CLIENT) as push:
                 push.set_attributes(maui_attrs())
-                push.set_attribute("http.method", "PATCH")
-                push.set_attribute("http.url", "https://contoso.sharepoint.com/_api/web/lists/getbytitle('Reports')/items")
+                push.set_attribute("http.request.method", "PATCH")
+                push.set_attribute("url.full", "https://contoso.sharepoint.com/_api/web/lists/getbytitle('Reports')/items")
+                push.set_attribute("server.address", "contoso.sharepoint.com")
+                push.set_attribute("service.peer.name", "sharepoint-api")
                 push.set_attribute("azure.service", "sharepoint")
                 dur_ms = random.uniform(300, 1200)
                 time.sleep(dur_ms / 1000)
-                push.set_attribute("http.status_code", 204)
+                push.set_attribute("http.response.status_code", 204)
                 push.set_attribute("sync.records_pending", pending)
                 instruments["azure_api_dur"].record(dur_ms, attributes={"azure.service": "sharepoint", "platform": platform})
             synced = pending
@@ -160,7 +167,7 @@ def run_scenarios(o11y, platform, instruments):
             span.set_attribute("azure.service", "cognitive-vision")
             span.set_attribute("cognitive.operation", "classify_expense_receipt")
             # Camera capture
-            with tracer.start_as_current_span("camera.capture") as cam:
+            with tracer.start_as_current_span("camera.capture", kind=SpanKind.INTERNAL) as cam:
                 cam.set_attributes(maui_attrs())
                 cam.set_attribute("camera.resolution", "4032x3024")
                 cam.set_attribute("camera.format", "JPEG")
@@ -168,12 +175,14 @@ def run_scenarios(o11y, platform, instruments):
             # Azure Computer Vision API
             with tracer.start_as_current_span("azure.cognitive", kind=SpanKind.CLIENT) as cv:
                 cv.set_attributes(maui_attrs())
-                cv.set_attribute("http.method", "POST")
-                cv.set_attribute("http.url", "https://contoso.cognitiveservices.azure.com/vision/v3.2/analyze")
+                cv.set_attribute("http.request.method", "POST")
+                cv.set_attribute("url.full", "https://contoso.cognitiveservices.azure.com/vision/v3.2/analyze")
+                cv.set_attribute("server.address", "contoso.cognitiveservices.azure.com")
+                cv.set_attribute("service.peer.name", "azure-cognitive-vision")
                 cv.set_attribute("azure.service", "cognitive-vision")
                 dur_ms = random.uniform(400, 1500)
                 time.sleep(dur_ms / 1000)
-                cv.set_attribute("http.status_code", 200)
+                cv.set_attribute("http.response.status_code", 200)
                 instruments["azure_api_dur"].record(dur_ms, attributes={"azure.service": "cognitive-vision", "platform": platform})
             span.set_attribute("cognitive.receipt_total_usd", round(random.uniform(5, 500), 2))
             span.set_attribute("cognitive.confidence", round(random.uniform(0.82, 0.99), 3))
@@ -205,13 +214,16 @@ def run_scenarios(o11y, platform, instruments):
     try:
         with tracer.start_as_current_span("tls.cert_pin_check", kind=SpanKind.CLIENT) as span:
             span.set_attributes(maui_attrs("Login"))
-            span.set_attribute("http.url", "https://api.enterprise-portal.io/v1/auth/token")
+            span.set_attribute("url.full", "https://api.enterprise-portal.io/v1/auth/token")
+            span.set_attribute("server.address", "api.enterprise-portal.io")
+            span.set_attribute("service.peer.name", "enterprise-portal-api")
             span.set_attribute("tls.cert_pin_algorithm", "sha256")
             span.set_attribute("tls.expected_pin", "sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
             time.sleep(random.uniform(0.05, 0.15))
             err = SecurityError("Certificate pinning validation failed: presented certificate does not match pinned certificate — possible MITM attack")
-            span.record_exception(err, attributes={"exception.escaped": True})
+            span.record_exception(err, attributes={"exception.escaped": False})
             span.set_status(StatusCode.ERROR, str(err))
+            span.set_attribute("error.type", type(err).__name__)
             span.set_attribute("tls.pin_failure", True)
             span.set_attribute("security.alert_type", "mitm_suspected")
             logger.error(

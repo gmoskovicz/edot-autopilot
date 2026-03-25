@@ -24,7 +24,7 @@ Run:
     python3 81-mobile-ecommerce/scenario.py
 """
 
-import os, sys, uuid, time, random, threading
+import os, sys, uuid, time, random, threading, hashlib
 from pathlib import Path
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
@@ -53,20 +53,24 @@ propagator = TraceContextTextMapPropagator()
 # ── Per-service O11y bootstrap ────────────────────────────────────────────────
 mobile_client = O11yBootstrap("mobile-shopapp", ENDPOINT, API_KEY, ENV, extra_resource_attrs={
     "os.name": "iOS", "os.version": "17.2.1",
+    "os.type": "darwin",
+    "os.description": "iOS 17.2.1 (21C66)",
+    "os.build_id": "21C66",
     "device.model.name": "iPhone 15 Pro",
     "app.version": "4.2.1", "app.name": "ShopApp",
     "telemetry.sdk.name": "opentelemetry-react-native",
+    "telemetry.sdk.language": "javascript",
     "network.connection.type": "wifi",
 })
-gateway       = O11yBootstrap("api-gateway-mobile",       ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "express",     "node.version": "20.10.0"})
-catalog_svc   = O11yBootstrap("catalog-service",          ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "fastapi",     "python.version": "3.11.6"})
-inventory_svc = O11yBootstrap("inventory-service-go",     ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "gin",         "go.version": "1.21.5"})
-profile_svc   = O11yBootstrap("user-profile-service",     ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "rails",       "ruby.version": "3.2.2"})
-payment_svc   = O11yBootstrap("payment-mobile-service",   ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "spring-boot", "java.version": "21"})
-fraud_svc     = O11yBootstrap("fraud-detection-mobile",   ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "fastapi",     "python.version": "3.11.6"})
-processor_svc = O11yBootstrap("payment-processor-mobile", ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "express",     "node.version": "20.10.0"})
-push_svc      = O11yBootstrap("push-notification-service",ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "express",     "node.version": "20.10.0"})
-analytics_svc = O11yBootstrap("analytics-ingest",         ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "fastapi",     "python.version": "3.11.6"})
+gateway       = O11yBootstrap("api-gateway-mobile",       ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "express",     "node.version": "20.10.0",  "telemetry.sdk.language": "javascript"})
+catalog_svc   = O11yBootstrap("catalog-service",          ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "fastapi",     "python.version": "3.11.6", "telemetry.sdk.language": "python"})
+inventory_svc = O11yBootstrap("inventory-service-go",     ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "gin",         "go.version": "1.21.5",    "telemetry.sdk.language": "go"})
+profile_svc   = O11yBootstrap("user-profile-service",     ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "rails",       "ruby.version": "3.2.2",   "telemetry.sdk.language": "ruby"})
+payment_svc   = O11yBootstrap("payment-mobile-service",   ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "spring-boot", "java.version": "21",      "telemetry.sdk.language": "java"})
+fraud_svc     = O11yBootstrap("fraud-detection-mobile",   ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "fastapi",     "python.version": "3.11.6", "telemetry.sdk.language": "python"})
+processor_svc = O11yBootstrap("payment-processor-mobile", ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "express",     "node.version": "20.10.0",  "telemetry.sdk.language": "javascript"})
+push_svc      = O11yBootstrap("push-notification-service",ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "express",     "node.version": "20.10.0",  "telemetry.sdk.language": "javascript"})
+analytics_svc = O11yBootstrap("analytics-ingest",         ENDPOINT, API_KEY, ENV, extra_resource_attrs={"framework": "fastapi",     "python.version": "3.11.6", "telemetry.sdk.language": "python"})
 
 # ── Metrics instruments ───────────────────────────────────────────────────────
 # mobile-shopapp
@@ -202,7 +206,7 @@ def svc_mobile_app_launch(session_id: str, device: dict, parent_tp: str = None):
         kind=SpanKind.CLIENT,
         attributes={
             "session.id":                 session_id,
-            "device.id":                  device["id"],
+            "device.id":                  hashlib.sha256(device["id"].encode()).hexdigest()[:16],
             "device.model.name":          device["model"],
             "os.name":                    device["os"],
             "os.version":                 device["os_version"],
@@ -237,9 +241,10 @@ def svc_gateway_route(session_id: str, endpoint: str, method: str, parent_tp: st
         "http.client.api_gateway", kind=SpanKind.CLIENT,
         context=parent_ctx,
         attributes={
-            "http.method": method, "net.peer.name": "api-gateway-mobile",
-            "http.url": f"https://api.shopapp.io{endpoint}",
+            "http.request.method": method, "server.address": "api-gateway-mobile",
+            "url.full": f"https://api.shopapp.io{endpoint}",
             "session.id": session_id,
+            "service.peer.name": "api-gateway-mobile",
         }
     ) as exit_span:
         tp = inject_traceparent(exit_span)
@@ -248,7 +253,7 @@ def svc_gateway_route(session_id: str, endpoint: str, method: str, parent_tp: st
             "gateway.route", kind=SpanKind.SERVER,
             context=extract_context(tp),
             attributes={
-                "http.method": method, "http.route": endpoint,
+                "http.request.method": method, "http.route": endpoint,
                 "session.id": session_id, "gateway.version": "v2.1.0",
                 "gateway.upstream": "internal-cluster",
             }
@@ -256,11 +261,11 @@ def svc_gateway_route(session_id: str, endpoint: str, method: str, parent_tp: st
             time.sleep(random.uniform(0.01, 0.04))
             dur_ms = (time.time() - t0) * 1000
             entry_span.set_attribute("gateway.latency_ms", round(dur_ms, 2))
-            gw_requests.add(1, attributes={"http.route": endpoint, "http.method": method})
+            gw_requests.add(1, attributes={"http.route": endpoint, "http.request.method": method})
             gw_latency.record(dur_ms, attributes={"http.route": endpoint})
             gateway.logger.info(
                 f"gateway routed: {method} {endpoint}",
-                extra={"session.id": session_id, "http.method": method,
+                extra={"session.id": session_id, "http.request.method": method,
                        "http.route": endpoint, "gateway.latency_ms": round(dur_ms, 2)}
             )
             return inject_traceparent(entry_span)
@@ -275,9 +280,10 @@ def svc_catalog_fetch(product_ids: list, parent_tp: str, force_timeout: bool = F
         "http.client.catalog", kind=SpanKind.CLIENT,
         context=parent_ctx,
         attributes={
-            "http.method": "POST", "net.peer.name": "catalog-service",
-            "http.url": "http://catalog-service/v1/products/batch",
+            "http.request.method": "POST", "server.address": "catalog-service",
+            "url.full": "http://catalog-service/v1/products/batch",
             "catalog.product_count": len(product_ids),
+            "service.peer.name": "catalog-service",
         }
     ) as exit_span:
         tp = inject_traceparent(exit_span)
@@ -286,7 +292,7 @@ def svc_catalog_fetch(product_ids: list, parent_tp: str, force_timeout: bool = F
             "catalog.batch_fetch", kind=SpanKind.SERVER,
             context=extract_context(tp),
             attributes={
-                "http.method": "POST", "http.route": "/v1/products/batch",
+                "http.request.method": "POST", "http.route": "/v1/products/batch",
                 "catalog.product_count": len(product_ids),
                 "catalog.backend": "elasticsearch",
                 "catalog.version": "v4.0.1",
@@ -295,10 +301,12 @@ def svc_catalog_fetch(product_ids: list, parent_tp: str, force_timeout: bool = F
             if force_timeout:
                 time.sleep(random.uniform(4.0, 6.0))
                 err = Exception("CatalogTimeoutError: product detail API exceeded 4s SLA — returning cached stale data")
-                entry_span.record_exception(err, attributes={"exception.escaped": True})
+                entry_span.record_exception(err, attributes={"exception.escaped": False})
                 entry_span.set_status(StatusCode.ERROR, str(err))
-                exit_span.record_exception(err, attributes={"exception.escaped": True})
+                entry_span.set_attribute("error.type", type(err).__name__)
+                exit_span.record_exception(err, attributes={"exception.escaped": False})
                 exit_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.set_attribute("error.type", type(err).__name__)
                 catalog_svc.logger.warning(
                     "catalog timeout: serving stale cached data",
                     extra={"catalog.product_count": len(product_ids), "catalog.stale": True}
@@ -333,10 +341,11 @@ def svc_inventory_check(product_ids: list, warehouse: str, parent_tp: str,
         "http.client.inventory", kind=SpanKind.CLIENT,
         context=parent_ctx,
         attributes={
-            "http.method": "POST", "net.peer.name": "inventory-service-go",
-            "http.url": "http://inventory-service-go/api/v2/check",
+            "http.request.method": "POST", "server.address": "inventory-service-go",
+            "url.full": "http://inventory-service-go/api/v2/check",
             "inventory.product_count": len(product_ids),
             "inventory.warehouse_id": warehouse,
+            "service.peer.name": "inventory-service-go",
         }
     ) as exit_span:
         tp = inject_traceparent(exit_span)
@@ -345,7 +354,7 @@ def svc_inventory_check(product_ids: list, warehouse: str, parent_tp: str,
             "inventory.check_stock", kind=SpanKind.SERVER,
             context=extract_context(tp),
             attributes={
-                "http.method": "POST", "http.route": "/api/v2/check",
+                "http.request.method": "POST", "http.route": "/api/v2/check",
                 "inventory.warehouse_id": warehouse,
                 "inventory.product_count": len(product_ids),
                 "inventory.backend": "redis-cluster",
@@ -359,9 +368,11 @@ def svc_inventory_check(product_ids: list, warehouse: str, parent_tp: str,
                 err = Exception(f"InsufficientStockError: SKU {sku} has 0 units in {warehouse}")
                 entry_span.record_exception(err, attributes={"exception.escaped": True})
                 entry_span.set_status(StatusCode.ERROR, str(err))
+                entry_span.set_attribute("error.type", type(err).__name__)
                 entry_span.set_attribute("inventory.out_of_stock_sku", sku)
                 exit_span.record_exception(err, attributes={"exception.escaped": True})
                 exit_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.set_attribute("error.type", type(err).__name__)
                 inv_stockouts.add(1, attributes={"warehouse": warehouse, "sku": sku})
                 inventory_svc.logger.error(
                     f"stockout: {sku} unavailable in {warehouse}",
@@ -393,9 +404,10 @@ def svc_profile_load(user_id: str, parent_tp: str, force_503: bool = False):
         "http.client.user_profile", kind=SpanKind.CLIENT,
         context=parent_ctx,
         attributes={
-            "http.method": "GET", "net.peer.name": "user-profile-service",
-            "http.url": f"http://user-profile-service/api/v1/users/{user_id}",
+            "http.request.method": "GET", "server.address": "user-profile-service",
+            "url.full": f"http://user-profile-service/api/v1/users/{user_id}",
             "user.id": user_id,
+            "service.peer.name": "user-profile-service",
         }
     ) as exit_span:
         tp = inject_traceparent(exit_span)
@@ -404,17 +416,19 @@ def svc_profile_load(user_id: str, parent_tp: str, force_503: bool = False):
             "profile.load_user", kind=SpanKind.SERVER,
             context=extract_context(tp),
             attributes={
-                "http.method": "GET", "http.route": "/api/v1/users/:id",
+                "http.request.method": "GET", "http.route": "/api/v1/users/:id",
                 "user.id": user_id, "profile.backend": "postgres",
                 "profile.cache_layer": "memcached",
             }
         ) as entry_span:
             if force_503:
                 err = Exception("ServiceUnavailableError: user-profile-service 503 — all pods in crash loop")
-                entry_span.record_exception(err, attributes={"exception.escaped": True})
+                entry_span.record_exception(err, attributes={"exception.escaped": False})
                 entry_span.set_status(StatusCode.ERROR, str(err))
-                exit_span.record_exception(err, attributes={"exception.escaped": True})
+                entry_span.set_attribute("error.type", type(err).__name__)
+                exit_span.record_exception(err, attributes={"exception.escaped": False})
                 exit_span.set_status(StatusCode.ERROR, str(err))
+                exit_span.set_attribute("error.type", type(err).__name__)
                 profile_svc.logger.error(
                     f"profile service 503: graceful degradation to guest mode",
                     extra={"user.id": user_id, "profile.degraded": True,
@@ -447,9 +461,10 @@ def svc_fraud_check(payment_id: str, customer: dict, amount: float,
         "http.client.fraud_detection", kind=SpanKind.CLIENT,
         context=parent_ctx,
         attributes={
-            "http.method": "POST", "net.peer.name": "fraud-detection-mobile",
-            "http.url": "http://fraud-detection-mobile/v3/score",
+            "http.request.method": "POST", "server.address": "fraud-detection-mobile",
+            "url.full": "http://fraud-detection-mobile/v3/score",
             "payment.id": payment_id, "payment.amount_usd": amount,
+            "service.peer.name": "fraud-detection-mobile",
         }
     ) as exit_span:
         tp = inject_traceparent(exit_span)
@@ -458,7 +473,7 @@ def svc_fraud_check(payment_id: str, customer: dict, amount: float,
             "fraud.score_transaction", kind=SpanKind.SERVER,
             context=extract_context(tp),
             attributes={
-                "http.method": "POST", "http.route": "/v3/score",
+                "http.request.method": "POST", "http.route": "/v3/score",
                 "payment.id": payment_id, "fraud.model_version": "mobile-fraud-v2.3",
                 "fraud.feature_count": 89,
                 "customer.id": customer["id"], "customer.tier": customer["tier"],
@@ -492,13 +507,15 @@ def svc_fraud_check(payment_id: str, customer: dict, amount: float,
                 fraud_blocks.add(1, attributes={"fraud.risk_tier": risk})
                 entry_span.record_exception(
                     ValueError(f"Transaction blocked: fraud score {score}"),
-                    attributes={"exception.escaped": True}
+                    attributes={"exception.escaped": False}
                 )
                 entry_span.set_status(StatusCode.ERROR, f"Transaction blocked: fraud score {score}")
+                entry_span.set_attribute("error.type", "ValueError")
                 exit_span.record_exception(
-                    ValueError("fraud_blocked"), attributes={"exception.escaped": True}
+                    ValueError("fraud_blocked"), attributes={"exception.escaped": False}
                 )
                 exit_span.set_status(StatusCode.ERROR, "fraud_blocked")
+                exit_span.set_attribute("error.type", "ValueError")
                 fraud_svc.logger.warning(
                     f"fraud block: score={score} risk={risk} customer={customer['id']}",
                     extra={"payment.id": payment_id, "fraud.score": score,
@@ -526,10 +543,11 @@ def svc_payment_charge(payment_id: str, customer: dict, amount: float,
         "http.client.payment", kind=SpanKind.CLIENT,
         context=parent_ctx,
         attributes={
-            "http.method": "POST", "net.peer.name": "payment-mobile-service",
-            "http.url": "https://pay.shopapp.io/v2/charge",
+            "http.request.method": "POST", "server.address": "payment-mobile-service",
+            "url.full": "https://pay.shopapp.io/v2/charge",
             "payment.id": payment_id, "payment.amount_usd": amount,
             "customer.id": customer["id"],
+            "service.peer.name": "payment-mobile-service",
         }
     ) as exit_span:
         tp = inject_traceparent(exit_span)
@@ -538,7 +556,7 @@ def svc_payment_charge(payment_id: str, customer: dict, amount: float,
             "payment.process_charge", kind=SpanKind.SERVER,
             context=extract_context(tp),
             attributes={
-                "http.method": "POST", "http.route": "/v2/charge",
+                "http.request.method": "POST", "http.route": "/v2/charge",
                 "payment.id": payment_id, "payment.amount_usd": amount,
                 "customer.id": customer["id"], "customer.tier": customer["tier"],
                 "payment.framework": "spring-boot",
@@ -559,24 +577,27 @@ def svc_payment_charge(payment_id: str, customer: dict, amount: float,
             if fraud_decision == "block":
                 entry_span.record_exception(
                     RuntimeError(f"Payment blocked by fraud: score={fraud_score}"),
-                    attributes={"exception.escaped": True}
+                    attributes={"exception.escaped": False}
                 )
                 entry_span.set_status(StatusCode.ERROR, f"fraud_blocked score={fraud_score}")
+                entry_span.set_attribute("error.type", "RuntimeError")
                 entry_span.set_attribute("payment.status",  "fraud_blocked")
                 entry_span.set_attribute("fraud.score",     fraud_score)
                 exit_span.record_exception(
-                    RuntimeError("fraud_blocked"), attributes={"exception.escaped": True}
+                    RuntimeError("fraud_blocked"), attributes={"exception.escaped": False}
                 )
                 exit_span.set_status(StatusCode.ERROR, "fraud_blocked")
+                exit_span.set_attribute("error.type", "RuntimeError")
                 return False, "fraud_blocked", fraud_score, None
 
             # Step 2: charge via processor
             with payment_svc.tracer.start_as_current_span(
                 "http.client.stripe", kind=SpanKind.CLIENT,
                 attributes={
-                    "http.method": "POST", "net.peer.name": "payment-processor-mobile",
-                    "http.url": "http://payment-processor-mobile/v1/charges",
+                    "http.request.method": "POST", "server.address": "payment-processor-mobile",
+                    "url.full": "http://payment-processor-mobile/v1/charges",
                     "payment.id": payment_id, "payment.amount_usd": amount,
+                    "service.peer.name": "payment-processor-mobile",
                 }
             ) as proc_exit:
                 proc_tp = inject_traceparent(proc_exit)
@@ -585,9 +606,10 @@ def svc_payment_charge(payment_id: str, customer: dict, amount: float,
                     "stripe.charge.create", kind=SpanKind.CLIENT,
                     context=extract_context(proc_tp),
                     attributes={
-                        "http.method": "POST", "net.peer.name": "api.stripe.com",
+                        "http.request.method": "POST", "server.address": "api.stripe.com",
                         "payment.id": payment_id, "payment.amount_usd": amount,
                         "payment.currency": "usd", "payment.provider": "stripe",
+                        "service.peer.name": "api.stripe.com",
                     }
                 ) as stripe_span:
                     stripe_span.add_event("payment.auth.initiated",
@@ -598,23 +620,27 @@ def svc_payment_charge(payment_id: str, customer: dict, amount: float,
                         error_code = random.choice(["card_declined", "insufficient_funds",
                                                     "expired_card", "do_not_honor"])
                         err = Exception(f"StripeCardError: {error_code}")
-                        stripe_span.record_exception(err, attributes={"exception.escaped": True})
+                        stripe_span.record_exception(err, attributes={"exception.escaped": False})
                         stripe_span.set_status(StatusCode.ERROR, str(err))
+                        stripe_span.set_attribute("error.type", type(err).__name__)
                         stripe_span.set_attribute("payment.status",     "failed")
                         stripe_span.set_attribute("payment.error_code", error_code)
-                        proc_exit.record_exception(err, attributes={"exception.escaped": True})
+                        proc_exit.record_exception(err, attributes={"exception.escaped": False})
                         proc_exit.set_status(StatusCode.ERROR, str(err))
+                        proc_exit.set_attribute("error.type", type(err).__name__)
                         entry_span.record_exception(
                             ValueError(f"Card declined: {error_code}"),
-                            attributes={"exception.escaped": True}
+                            attributes={"exception.escaped": False}
                         )
                         entry_span.set_status(StatusCode.ERROR, f"declined: {error_code}")
+                        entry_span.set_attribute("error.type", "ValueError")
                         entry_span.set_attribute("payment.status",     "declined")
                         entry_span.set_attribute("payment.error_code", error_code)
                         exit_span.record_exception(
-                            ValueError("card_declined"), attributes={"exception.escaped": True}
+                            ValueError("card_declined"), attributes={"exception.escaped": False}
                         )
                         exit_span.set_status(StatusCode.ERROR, "card_declined")
+                        exit_span.set_attribute("error.type", "ValueError")
                         t_proc = (time.time() - t0) * 1000
                         proc_charges.add(1, attributes={"payment.status": "declined"})
                         proc_duration.record(t_proc, attributes={"payment.status": "declined"})
@@ -662,9 +688,10 @@ def svc_push_notify(user_id: str, message_type: str, parent_tp: str,
         "http.client.push_notify", kind=SpanKind.CLIENT,
         context=parent_ctx,
         attributes={
-            "http.method": "POST", "net.peer.name": "push-notification-service",
-            "http.url": "http://push-notification-service/v1/send",
+            "http.request.method": "POST", "server.address": "push-notification-service",
+            "url.full": "http://push-notification-service/v1/send",
             "user.id": user_id, "push.message_type": message_type,
+            "service.peer.name": "push-notification-service",
         }
     ) as exit_span:
         tp = inject_traceparent(exit_span)
@@ -673,7 +700,7 @@ def svc_push_notify(user_id: str, message_type: str, parent_tp: str,
             "push.send_notification", kind=SpanKind.SERVER,
             context=extract_context(tp),
             attributes={
-                "http.method": "POST", "http.route": "/v1/send",
+                "http.request.method": "POST", "http.route": "/v1/send",
                 "user.id": user_id, "push.message_type": message_type,
                 "push.provider": "apns",
             }
@@ -683,8 +710,9 @@ def svc_push_notify(user_id: str, message_type: str, parent_tp: str,
             if force_token_expired:
                 # Silent failure — APNs device token expired, non-fatal
                 err = Exception("APNsError: device token expired (BadDeviceToken) — silent failure")
-                entry_span.record_exception(err, attributes={"exception.escaped": True})
+                entry_span.record_exception(err, attributes={"exception.escaped": False})
                 entry_span.set_status(StatusCode.ERROR, str(err))
+                entry_span.set_attribute("error.type", type(err).__name__)
                 entry_span.set_attribute("push.delivered", False)
                 entry_span.set_attribute("push.error",     "BadDeviceToken")
                 push_sent.add(1, attributes={"push.provider": "apns", "push.status": "failed"})
@@ -718,9 +746,10 @@ def svc_analytics_event(event_type: str, properties: dict, parent_tp: str):
         "http.client.analytics", kind=SpanKind.CLIENT,
         context=parent_ctx,
         attributes={
-            "http.method": "POST", "net.peer.name": "analytics-ingest",
-            "http.url": "http://analytics-ingest/v1/events",
+            "http.request.method": "POST", "server.address": "analytics-ingest",
+            "url.full": "http://analytics-ingest/v1/events",
             "analytics.event_type": event_type,
+            "service.peer.name": "analytics-ingest",
         }
     ) as exit_span:
         tp = inject_traceparent(exit_span)
@@ -729,7 +758,7 @@ def svc_analytics_event(event_type: str, properties: dict, parent_tp: str):
             "analytics.ingest_event", kind=SpanKind.SERVER,
             context=extract_context(tp),
             attributes={
-                "http.method": "POST", "http.route": "/v1/events",
+                "http.request.method": "POST", "http.route": "/v1/events",
                 "analytics.event_type": event_type,
                 "analytics.backend": "kafka",
             }
@@ -1020,8 +1049,9 @@ def scen_app_crash_oom(session_id, customer, device):
     ) as crash_span:
         time.sleep(random.uniform(0.05, 0.1))
         oom_err = MemoryError("OOMKilled: heap allocation failed during image decoding — bitmap too large")
-        crash_span.record_exception(oom_err, attributes={"exception.escaped": True})
+        crash_span.record_exception(oom_err, attributes={"exception.escaped": False})
         crash_span.set_status(StatusCode.ERROR, str(oom_err))
+        crash_span.set_attribute("error.type", type(oom_err).__name__)
         mob_crashes.add(1, attributes={"crash.type": "OOMKill", "os": device["os"],
                                         "screen": "ProductGallery"})
         mobile_client.logger.error(

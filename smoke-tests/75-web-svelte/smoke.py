@@ -29,6 +29,7 @@ from o11y_bootstrap import O11yBootstrap
 from opentelemetry import propagate, context
 from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.sdk.metrics.view import View, ExplicitBucketHistogramAggregation
 
 ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
 API_KEY  = os.environ["ELASTIC_API_KEY"]
@@ -36,11 +37,12 @@ ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 
 # ── SvelteKit server bootstrap ─────────────────────────────────────────────────
 server_attrs = {
-    "telemetry.sdk.name":    "opentelemetry-node",
-    "framework":             "sveltekit",
-    "svelte.version":        "4.2.8",
-    "node.version":          "20.10.0",
-    "sveltekit.adapter":     "node",
+    "telemetry.sdk.name":     "opentelemetry-node",
+    "telemetry.sdk.language": "javascript",
+    "framework":              "sveltekit",
+    "svelte.version":         "4.2.8",
+    "node.version":           "20.10.0",
+    "sveltekit.adapter":      "node",
 }
 o11y_server = O11yBootstrap(
     "web-sveltekit-blog-server", ENDPOINT, API_KEY, ENV,
@@ -49,19 +51,35 @@ o11y_server = O11yBootstrap(
 
 # ── Browser (client-side) bootstrap ───────────────────────────────────────────
 browser_attrs = {
-    "browser.name":       "Chrome",
-    "browser.version":    "120.0",
-    "browser.platform":   "MacIntel",
-    "telemetry.sdk.name": "opentelemetry-js-web",
+    "browser.name":           "Chrome",
+    "browser.version":        "120.0",
+    "browser.platform":       "MacIntel",
+    "browser.mobile":         False,
+    "telemetry.sdk.name":     "opentelemetry-js-web",
+    "telemetry.sdk.language": "javascript",
 }
 o11y_client = O11yBootstrap(
     "web-sveltekit-blog-client", ENDPOINT, API_KEY, ENV,
     extra_resource_attrs=browser_attrs,
 )
 
+# Views configure histogram bucket boundaries aligned with CWV thresholds
+cwv_views = [
+    View(instrument_name="webvitals.lcp",
+         aggregation=ExplicitBucketHistogramAggregation([200, 500, 1000, 2500, 4000, 10000])),
+    View(instrument_name="webvitals.inp",
+         aggregation=ExplicitBucketHistogramAggregation([50, 100, 200, 500, 1000])),
+    View(instrument_name="webvitals.cls",
+         aggregation=ExplicitBucketHistogramAggregation([0.01, 0.05, 0.1, 0.15, 0.25, 0.4])),
+    View(instrument_name="webvitals.ttfb",
+         aggregation=ExplicitBucketHistogramAggregation([100, 200, 500, 800, 1800, 3000])),
+    View(instrument_name="webvitals.fcp",
+         aggregation=ExplicitBucketHistogramAggregation([500, 1000, 1800, 3000, 5000])),
+]
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 lcp_hist       = o11y_client.meter.create_histogram("webvitals.lcp",       description="Largest Contentful Paint",  unit="ms")
-fid_hist       = o11y_client.meter.create_histogram("webvitals.fid",       description="First Input Delay",         unit="ms")
+inp_hist       = o11y_client.meter.create_histogram("webvitals.inp",       description="Interaction to Next Paint", unit="ms")
 cls_hist       = o11y_client.meter.create_histogram("webvitals.cls",       description="Cumulative Layout Shift")
 ttfb_hist      = o11y_client.meter.create_histogram("webvitals.ttfb",      description="Time to First Byte",        unit="ms")
 page_views     = o11y_client.meter.create_counter("page.view",             description="Page view count")
@@ -103,13 +121,13 @@ try:
         load_span.set_attributes(attrs)
         load_span.set_attribute("sveltekit.load.type",   "server")
         load_span.set_attribute("sveltekit.page.status", 200)
-        load_span.set_attribute("http.method",           "GET")
+        load_span.set_attribute("http.request.method",   "GET")
         load_span.set_attribute("http.route",            f"/blog/{slug}")
         carrier = inject_traceparent(load_span)
 
         with o11y_server.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "SELECT id, title, content, published_at FROM posts WHERE slug = $1 AND published = TRUE")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "SELECT id, title, content, published_at FROM posts WHERE slug = $1 AND published = TRUE")
             time.sleep(random.uniform(0.01, 0.04))
 
         load_ms = random.uniform(20, 80)
@@ -144,10 +162,10 @@ try:
     with o11y_server.tracer.start_as_current_span("sveltekit.action", kind=SpanKind.SERVER) as action_span:
         attrs = session_attrs("/blog/new")
         action_span.set_attributes(attrs)
-        action_span.set_attribute("sveltekit.action.name", "createPost")
-        action_span.set_attribute("sveltekit.page.status", 303)
-        action_span.set_attribute("http.method",           "POST")
-        action_span.set_attribute("http.route",            "/blog/new")
+        action_span.set_attribute("sveltekit.action.name",        "createPost")
+        action_span.set_attribute("sveltekit.page.status",        303)
+        action_span.set_attribute("http.request.method",          "POST")
+        action_span.set_attribute("http.route",                   "/blog/new")
 
         # Validation
         with o11y_server.tracer.start_as_current_span("form.validate", kind=SpanKind.INTERNAL) as val_span:
@@ -157,14 +175,14 @@ try:
 
         # Insert
         with o11y_server.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "INSERT INTO posts (author_id, title, slug, content, tags) VALUES ($1, $2, $3, $4, $5) RETURNING id, slug")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "INSERT INTO posts (author_id, title, slug, content, tags) VALUES ($1, $2, $3, $4, $5) RETURNING id, slug")
             time.sleep(random.uniform(0.01, 0.04))
 
         # Redirect
         with o11y_server.tracer.start_as_current_span("sveltekit.redirect", kind=SpanKind.INTERNAL) as redir_span:
-            redir_span.set_attribute("http.status_code", 303)
-            redir_span.set_attribute("redirect.target",  "/blog/new-post-slug")
+            redir_span.set_attribute("http.response.status_code", 303)
+            redir_span.set_attribute("redirect.target",           "/blog/new-post-slug")
             time.sleep(random.uniform(0.001, 0.005))
 
     o11y_server.logger.info("Blog post created", extra={"action": "createPost", "route": "/blog/new"})
@@ -178,26 +196,26 @@ try:
         attrs = session_attrs("/admin/posts")
         hook_span.set_attributes(attrs)
         hook_span.set_attribute("hook.name",            "handle")
-        hook_span.set_attribute("http.method",          "GET")
+        hook_span.set_attribute("http.request.method",  "GET")
         hook_span.set_attribute("http.route",           "/admin/posts")
 
         # Auth check from session cookie
         with o11y_server.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "SELECT id, role FROM users WHERE session_token = $1 AND expires_at > NOW()")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "SELECT id, role FROM users WHERE session_token = $1 AND expires_at > NOW()")
             time.sleep(random.uniform(0.005, 0.02))
 
-        hook_span.set_attribute("locals.user.set",  True)
+        hook_span.set_attribute("locals.user.set",    True)
         hook_span.set_attribute("auth.authenticated", True)
 
         # Resolve continues to load function
         with o11y_server.tracer.start_as_current_span("sveltekit.load", kind=SpanKind.INTERNAL) as load_span:
-            load_span.set_attribute("sveltekit.route.id",  "/admin/posts")
-            load_span.set_attribute("sveltekit.load.type", "server")
+            load_span.set_attribute("sveltekit.route.id",    "/admin/posts")
+            load_span.set_attribute("sveltekit.load.type",   "server")
             load_span.set_attribute("sveltekit.page.status", 200)
             with o11y_server.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db2:
-                db2.set_attribute("db.system",    "postgresql")
-                db2.set_attribute("db.statement", "SELECT id, title, status, created_at FROM posts ORDER BY created_at DESC LIMIT 20")
+                db2.set_attribute("db.system.name",   "postgresql")
+                db2.set_attribute("db.query.text",    "SELECT id, title, status, created_at FROM posts ORDER BY created_at DESC LIMIT 20")
                 time.sleep(random.uniform(0.01, 0.03))
 
     o11y_server.logger.info("Hook auth check passed", extra={"route": "/admin/posts", "hook": "handle"})
@@ -207,22 +225,23 @@ except Exception as e:
 
 # ── Scenario 4: Client-side navigation with goto() ────────────────────────────
 try:
-    fid_ms = random.uniform(10, 500)
+    inp_ms = random.uniform(10, 500)
     with o11y_client.tracer.start_as_current_span("sveltekit.navigate", kind=SpanKind.INTERNAL) as nav_span:
         attrs = session_attrs("/blog")
         nav_span.set_attributes(attrs)
-        nav_span.set_attribute("sveltekit.page.status", 200)
+        nav_span.set_attribute("sveltekit.page.status",   200)
         nav_span.set_attribute("sveltekit.navigate.type", "goto")
-        nav_span.set_attribute("sveltekit.streaming",   False)
-        nav_span.set_attribute("page.url",              "https://blog.example.com/blog")
-        nav_span.set_attribute("webvitals.fid_ms",      round(fid_ms, 2))
+        nav_span.set_attribute("sveltekit.streaming",     False)
+        nav_span.set_attribute("page.url",                "https://blog.example.com/blog")
+        nav_span.set_attribute("webvitals.inp_ms",        round(inp_ms, 2))
 
         # Invalidate and refetch load data
         carrier = inject_traceparent(nav_span)
         with o11y_client.tracer.start_as_current_span("fetch.GET /blog", kind=SpanKind.CLIENT) as fetch_span:
-            fetch_span.set_attribute("http.url",         "https://blog.example.com/blog")
-            fetch_span.set_attribute("http.method",      "GET")
-            fetch_span.set_attribute("http.status_code", 200)
+            fetch_span.set_attribute("url.full",                  "https://blog.example.com/blog")
+            fetch_span.set_attribute("http.request.method",       "GET")
+            fetch_span.set_attribute("http.response.status_code", 200)
+            fetch_span.set_attribute("service.peer.name",         "web-sveltekit-blog-server")
             carrier2 = inject_traceparent(fetch_span)
             time.sleep(random.uniform(0.04, 0.12))
 
@@ -231,16 +250,16 @@ try:
         with o11y_server.tracer.start_as_current_span(
             "sveltekit.load", kind=SpanKind.SERVER, context=remote_ctx
         ) as load_span:
-            load_span.set_attribute("sveltekit.route.id",   "/blog")
-            load_span.set_attribute("sveltekit.load.type",  "universal")
+            load_span.set_attribute("sveltekit.route.id",    "/blog")
+            load_span.set_attribute("sveltekit.load.type",   "universal")
             load_span.set_attribute("sveltekit.page.status", 200)
             with o11y_server.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-                db_span.set_attribute("db.system",    "postgresql")
-                db_span.set_attribute("db.statement", "SELECT id, title, slug, excerpt, published_at FROM posts WHERE published = TRUE ORDER BY published_at DESC LIMIT 10")
+                db_span.set_attribute("db.system.name",   "postgresql")
+                db_span.set_attribute("db.query.text",    "SELECT id, title, slug, excerpt, published_at FROM posts WHERE published = TRUE ORDER BY published_at DESC LIMIT 10")
                 time.sleep(random.uniform(0.01, 0.04))
 
     page_views.add(1, attributes={"page.route": "/blog"})
-    fid_hist.record(fid_ms, attributes={"page.route": "/blog"})
+    inp_hist.record(inp_ms, attributes={"page.route": "/blog"})
     o11y_client.logger.info("Client navigation complete", extra={"route": "/blog", "type": "goto"})
     results.append(("Client navigation: goto() → load invalidated → data refreshed", "OK", None))
 except Exception as e:
@@ -252,15 +271,15 @@ try:
         attrs = session_attrs("/api/rss")
         ep_span.set_attributes(attrs)
         ep_span.set_attribute("http.route",              "/api/rss")
-        ep_span.set_attribute("http.method",             "GET")
-        ep_span.set_attribute("http.status_code",        200)
+        ep_span.set_attribute("http.request.method",     "GET")
+        ep_span.set_attribute("http.response.status_code", 200)
         ep_span.set_attribute("sveltekit.page.status",   200)
         ep_span.set_attribute("response.content_type",   "application/xml")
         ep_span.set_attribute("sveltekit.streaming",     False)
 
         with o11y_server.tracer.start_as_current_span("db.query", kind=SpanKind.CLIENT) as db_span:
-            db_span.set_attribute("db.system",    "postgresql")
-            db_span.set_attribute("db.statement", "SELECT title, slug, excerpt, published_at FROM posts WHERE published = TRUE ORDER BY published_at DESC LIMIT 20")
+            db_span.set_attribute("db.system.name",   "postgresql")
+            db_span.set_attribute("db.query.text",    "SELECT title, slug, excerpt, published_at FROM posts WHERE published = TRUE ORDER BY published_at DESC LIMIT 20")
             time.sleep(random.uniform(0.01, 0.04))
 
         with o11y_server.tracer.start_as_current_span("rss.generate", kind=SpanKind.INTERNAL) as rss_span:
@@ -277,11 +296,11 @@ try:
     with o11y_server.tracer.start_as_current_span("sveltekit.stream", kind=SpanKind.SERVER) as stream_span:
         attrs = session_attrs("/blog/[slug]")
         stream_span.set_attributes(attrs)
-        stream_span.set_attribute("http.route",           "/api/comments/stream")
-        stream_span.set_attribute("http.method",          "GET")
-        stream_span.set_attribute("http.status_code",     200)
-        stream_span.set_attribute("sveltekit.streaming",  True)
-        stream_span.set_attribute("response.content_type", "text/event-stream")
+        stream_span.set_attribute("http.route",                   "/api/comments/stream")
+        stream_span.set_attribute("http.request.method",          "GET")
+        stream_span.set_attribute("http.response.status_code",    200)
+        stream_span.set_attribute("sveltekit.streaming",          True)
+        stream_span.set_attribute("response.content_type",        "text/event-stream")
         carrier = inject_traceparent(stream_span)
 
         # Emit 3 SSE events
@@ -323,4 +342,4 @@ for scenario, status, note in results:
 
 print(f"\n[web-sveltekit-blog] Done. {ok} OK | {warn} WARN | {err} ERROR")
 print(f"  Kibana → APM → web-sveltekit-blog-server | web-sveltekit-blog-client")
-print(f"  Metrics: webvitals.lcp | webvitals.fid | webvitals.cls | page.view | sveltekit.load_ms | sveltekit.sse.messages")
+print(f"  Metrics: webvitals.lcp | webvitals.inp | webvitals.cls | page.view | sveltekit.load_ms | sveltekit.sse.messages")

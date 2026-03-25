@@ -36,6 +36,8 @@ o11y = O11yBootstrap(
     extra_resource_attrs={
         "os.name":                 "iOS",
         "os.version":              "17.3.0",
+        "os.type":                 "darwin",
+        "os.description":          "iOS 17.3.0 (21D50)",
         "device.manufacturer":     "Apple",
         "device.model.name":       'iPad Pro 12.9"',
         "device.model.identifier": "iPad14,5",
@@ -43,6 +45,7 @@ o11y = O11yBootstrap(
         "app.version":             "3.0.2",
         "telemetry.sdk.name":      "opentelemetry-swift",
         "telemetry.sdk.version":   "1.9.0",
+        "telemetry.sdk.language":  "swift",
     },
 )
 
@@ -75,7 +78,7 @@ try:
         span.set_attribute("healthkit.data_types", "heart_rate,steps,sleep,workout")
         time.sleep(random.uniform(0.3, 0.8))
         span.set_attribute("healthkit.authorization_result", "granted")
-        with tracer.start_as_current_span("healthkit.initial_sync") as sync_span:
+        with tracer.start_as_current_span("healthkit.initial_sync", kind=SpanKind.INTERNAL) as sync_span:
             sync_span.set_attributes(ios_attrs())
             records = random.randint(200, 1500)
             sync_span.set_attribute("healthkit.records_synced", records)
@@ -96,13 +99,13 @@ try:
         span.set_attribute("workout.gps_enabled", True)
         start_t = time.time()
         # GPS tracking
-        with tracer.start_as_current_span("workout.gps_tracking") as gps:
+        with tracer.start_as_current_span("workout.gps_tracking", kind=SpanKind.INTERNAL) as gps:
             gps.set_attributes(ios_attrs())
             gps.set_attribute("location.accuracy_m", round(random.uniform(2, 8), 1))
             gps.set_attribute("location.samples", random.randint(80, 200))
             time.sleep(random.uniform(0.2, 0.5))
         # Heart rate sampling
-        with tracer.start_as_current_span("workout.heart_rate_sampling") as hr:
+        with tracer.start_as_current_span("workout.heart_rate_sampling", kind=SpanKind.INTERNAL) as hr:
             hr.set_attributes(ios_attrs())
             hr.set_attribute("heart_rate.avg_bpm", random.randint(130, 165))
             hr.set_attribute("heart_rate.max_bpm", random.randint(170, 195))
@@ -125,11 +128,13 @@ try:
         span.set_attribute("background.task", "health_data_fetch")
         with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as req:
             req.set_attributes(ios_attrs())
-            req.set_attribute("http.method", "GET")
-            req.set_attribute("http.url", "https://api.healthtracker.io/v1/health-data")
+            req.set_attribute("http.request.method", "GET")
+            req.set_attribute("url.full", "https://api.healthtracker.io/v1/health-data")
+            req.set_attribute("server.address", "api.healthtracker.io")
+            req.set_attribute("service.peer.name", "healthkit-api")
             dur_ms = random.uniform(200, 600)
             time.sleep(dur_ms / 1000)
-            req.set_attribute("http.status_code", 200)
+            req.set_attribute("http.response.status_code", 200)
             req.set_attribute("http.response_size_bytes", random.randint(4096, 65536))
         records = random.randint(10, 80)
         span.set_attribute("background.records_fetched", records)
@@ -169,10 +174,12 @@ try:
         # Receipt validation
         with tracer.start_as_current_span("storekit.receipt_validation", kind=SpanKind.CLIENT) as val:
             val.set_attributes(ios_attrs())
-            val.set_attribute("http.method", "POST")
-            val.set_attribute("http.url", "https://buy.itunes.apple.com/verifyReceipt")
+            val.set_attribute("http.request.method", "POST")
+            val.set_attribute("url.full", "https://buy.itunes.apple.com/verifyReceipt")
+            val.set_attribute("server.address", "buy.itunes.apple.com")
+            val.set_attribute("service.peer.name", "apple-storekit-api")
             time.sleep(random.uniform(0.3, 0.8))
-            val.set_attribute("http.status_code", 200)
+            val.set_attribute("http.response.status_code", 200)
             val.set_attribute("storekit.receipt_valid", True)
         span.set_attribute("storekit.transaction_id", uuid.uuid4().hex[:12].upper())
         span.set_attribute("storekit.purchase_result", "purchased")
@@ -194,12 +201,14 @@ try:
         # Background data fetch
         with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as req:
             req.set_attributes(ios_attrs())
-            req.set_attribute("http.method", "GET")
-            req.set_attribute("http.url", "https://api.healthtracker.io/v1/alerts")
+            req.set_attribute("http.request.method", "GET")
+            req.set_attribute("url.full", "https://api.healthtracker.io/v1/alerts")
+            req.set_attribute("server.address", "api.healthtracker.io")
+            req.set_attribute("service.peer.name", "healthkit-api")
             time.sleep(random.uniform(0.15, 0.4))
-            req.set_attribute("http.status_code", 200)
+            req.set_attribute("http.response.status_code", 200)
         # Local notification dispatch
-        with tracer.start_as_current_span("push.local_notification") as local:
+        with tracer.start_as_current_span("push.local_notification", kind=SpanKind.INTERNAL) as local:
             local.set_attributes(ios_attrs())
             local.set_attribute("notification.title", "Daily step goal reached!")
             local.set_attribute("notification.body", "You've hit 10,000 steps today.")

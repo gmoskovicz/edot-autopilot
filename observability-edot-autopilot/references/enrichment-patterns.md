@@ -269,3 +269,39 @@ meter.create_observable_gauge(
     description="Messages waiting in the orders queue",
 )
 ```
+
+---
+
+## Core Web Vitals (Browser RUM)
+
+Use INP (Interaction to Next Paint) — Chrome deprecated FID in March 2024.
+
+```python
+from opentelemetry.sdk.metrics.view import View, ExplicitBucketHistogramAggregation
+
+# Configure histogram buckets aligned with CWV Good/NI/Poor thresholds
+cwv_views = [
+    View(instrument_name="webvitals.lcp",
+         aggregation=ExplicitBucketHistogramAggregation([200, 500, 1000, 2500, 4000, 10000])),
+    View(instrument_name="webvitals.inp",
+         aggregation=ExplicitBucketHistogramAggregation([50, 100, 200, 500, 1000])),
+    View(instrument_name="webvitals.cls",
+         aggregation=ExplicitBucketHistogramAggregation([0.01, 0.05, 0.1, 0.15, 0.25, 0.4])),
+    View(instrument_name="webvitals.ttfb",
+         aggregation=ExplicitBucketHistogramAggregation([100, 200, 500, 800, 1800, 3000])),
+    View(instrument_name="webvitals.fcp",
+         aggregation=ExplicitBucketHistogramAggregation([500, 1000, 1800, 3000, 5000])),
+]
+
+# Span attributes (browser RUM)
+span.set_attribute("webvitals.lcp_ms", 1240.5)
+span.set_attribute("webvitals.inp_ms", 85.0)    # INP, not FID
+span.set_attribute("webvitals.cls_score", 0.05)
+span.set_attribute("webvitals.ttfb_ms", 320.0)
+span.set_attribute("webvitals.fcp_ms", 980.0)
+span.set_attribute("browser.name", "Chrome")
+span.set_attribute("browser.version", "120.0")
+span.set_attribute("browser.platform", "Win32")
+span.set_attribute("browser.mobile", False)
+span.set_attribute("user_agent.original", "Mozilla/5.0 ...")
+```

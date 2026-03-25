@@ -35,6 +35,7 @@ COMMON_ATTRS = {
     "app.version":           "2.1.0",
     "telemetry.sdk.name":    "opentelemetry_dart",
     "telemetry.sdk.version": "0.3.0",
+    "telemetry.sdk.language": "dart",
 }
 
 # ── Bootstrap: iOS ────────────────────────────────────────────────────────────
@@ -46,6 +47,8 @@ o11y_ios = O11yBootstrap(
         "device.model.name":       "iPhone 14",
         "os.name":                 "iOS",
         "os.version":              "16.7.2",
+        "os.type":                 "darwin",
+        "os.description":          "iOS 16.7.2 (20H115)",
     },
 )
 
@@ -58,6 +61,8 @@ o11y_android = O11yBootstrap(
         "device.model.name":       "Galaxy S23",
         "os.name":                 "Android",
         "os.version":              "13.0",
+        "os.type":                 "linux",
+        "os.description":          "Android 13 (API 33)",
     },
 )
 
@@ -93,7 +98,7 @@ def run_scenarios(o11y, platform, instruments):
             build_ms = random.uniform(120, 280)
             span.set_attribute("flutter.frame_build_ms", round(build_ms, 2))
             time.sleep(build_ms / 1000)
-            with tracer.start_as_current_span("flutter.frame") as frame:
+            with tracer.start_as_current_span("flutter.frame", kind=SpanKind.INTERNAL) as frame:
                 frame.set_attributes(flutter_attrs("DashboardScreen"))
                 frame_ms = random.uniform(8, 20)
                 frame.set_attribute("flutter.frame_build_ms", round(frame_ms, 2))
@@ -114,12 +119,13 @@ def run_scenarios(o11y, platform, instruments):
             for api in ["balance", "transactions", "portfolio"]:
                 with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as call:
                     call.set_attributes(flutter_attrs(f"{api.capitalize()}Widget"))
-                    call.set_attribute("http.method", "GET")
-                    call.set_attribute("http.url", f"https://api.financeapp.io/v1/{api}")
-                    call.set_attribute("http.target", f"/v1/{api}")
+                    call.set_attribute("http.request.method", "GET")
+                    call.set_attribute("url.full", f"https://api.financeapp.io/v1/{api}")
+                    call.set_attribute("server.address", "api.financeapp.io")
+                    call.set_attribute("service.peer.name", "finance-api")
                     dur_ms = random.uniform(80, 400)
                     time.sleep(dur_ms / 1000)
-                    call.set_attribute("http.status_code", 200)
+                    call.set_attribute("http.response.status_code", 200)
                     instruments["http_duration_ms"].record(dur_ms, attributes={"api": api, "platform": platform})
         logger.info("Dashboard parallel API calls complete", extra={"apis": "balance,transactions,portfolio", "platform": platform})
         results.append(("Dashboard: parallel balance + transactions + portfolio", "OK", None))
@@ -156,12 +162,14 @@ def run_scenarios(o11y, platform, instruments):
                 time.sleep(random.uniform(0.04, 0.12))
         with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as span:
             span.set_attributes(flutter_attrs("TransferConfirmScreen"))
-            span.set_attribute("http.method", "POST")
-            span.set_attribute("http.url", "https://api.financeapp.io/v1/transfers")
+            span.set_attribute("http.request.method", "POST")
+            span.set_attribute("url.full", "https://api.financeapp.io/v1/transfers")
+            span.set_attribute("server.address", "api.financeapp.io")
+            span.set_attribute("service.peer.name", "finance-api")
             span.set_attribute("transfer.amount_usd", round(random.uniform(10, 5000), 2))
             dur_ms = random.uniform(200, 700)
             time.sleep(dur_ms / 1000)
-            span.set_attribute("http.status_code", 201)
+            span.set_attribute("http.response.status_code", 201)
             instruments["http_duration_ms"].record(dur_ms, attributes={"api": "transfer", "platform": platform})
         logger.info("Transfer flow complete", extra={"transfer_id": transfer_id, "platform": platform})
         results.append(("Transfer flow: sender → amount → recipient → confirm → success", "OK", None))
@@ -187,8 +195,10 @@ def run_scenarios(o11y, platform, instruments):
     try:
         with tracer.start_as_current_span("http.client", kind=SpanKind.CLIENT) as span:
             span.set_attributes(flutter_attrs("TransactionListWidget"))
-            span.set_attribute("http.method", "GET")
-            span.set_attribute("http.url", "https://api.financeapp.io/v1/transactions")
+            span.set_attribute("http.request.method", "GET")
+            span.set_attribute("url.full", "https://api.financeapp.io/v1/transactions")
+            span.set_attribute("server.address", "api.financeapp.io")
+            span.set_attribute("service.peer.name", "finance-api")
             for attempt in range(1, 4):
                 dur_ms = random.uniform(100, 300)
                 time.sleep(dur_ms / 1000)
@@ -197,9 +207,10 @@ def run_scenarios(o11y, platform, instruments):
                     logger.warning("Transactions API 503, retrying", extra={"attempt": attempt, "platform": platform})
                 else:
                     err = ConnectionError("transactions API returned 503 after 3 retries")
-                    span.record_exception(err, attributes={"exception.escaped": True})
+                    span.record_exception(err, attributes={"exception.escaped": False})
                     span.set_status(StatusCode.ERROR, str(err))
-                    span.set_attribute("http.status_code", 503)
+                    span.set_attribute("error.type", type(err).__name__)
+                    span.set_attribute("http.response.status_code", 503)
                     span.set_attribute("fallback.used", "local_cache")
             logger.warning("Transactions fallback to cache", extra={"platform": platform})
         results.append(("Network error: 503 → retry → cache fallback", "WARN", "Served from cache"))

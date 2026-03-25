@@ -9,6 +9,7 @@ Run:
     cd smoke-tests && python3 68-mobile-android-kotlin/smoke.py
 """
 
+import hashlib
 import os, sys, time, random, uuid
 from pathlib import Path
 
@@ -36,13 +37,17 @@ o11y = O11yBootstrap(
     extra_resource_attrs={
         "os.name":                         "Android",
         "os.version":                      "13.0",
+        "os.type":                         "linux",
+        "os.description":                  "Android 13 (API 33)",
         "device.manufacturer":             "Samsung",
         "device.model.name":               "Galaxy S23 Ultra",
         "device.model.identifier":         "SM-S918B",
+        "device.id":                       hashlib.sha256("samsung-s23ultra-uuid-ghi789".encode()).hexdigest()[:16],
         "app.name":                        "SecureBank",
         "app.version":                     "5.1.3",
         "telemetry.sdk.name":              "opentelemetry-android",
         "telemetry.sdk.version":           "0.6.0",
+        "telemetry.sdk.language":          "java",
     },
 )
 
@@ -78,7 +83,7 @@ try:
         # Application.onCreate
         start_ms = time.time()
         time.sleep(random.uniform(0.15, 0.35))
-        with tracer.start_as_current_span("compose.recomposition") as comp:
+        with tracer.start_as_current_span("compose.recomposition", kind=SpanKind.INTERNAL) as comp:
             comp.set_attributes(android_attrs())
             comp.set_attribute("compose.composable", "DashboardScreen")
             comp.set_attribute("compose.recomposition_count", 1)
@@ -101,7 +106,7 @@ try:
         time.sleep(random.uniform(0.4, 0.9))
         span.set_attribute("biometric.result_code", 1)  # BIOMETRIC_SUCCESS
         span.set_attribute("biometric.result", "success")
-        with tracer.start_as_current_span("compose.recomposition") as comp:
+        with tracer.start_as_current_span("compose.recomposition", kind=SpanKind.INTERNAL) as comp:
             comp.set_attributes(android_attrs())
             comp.set_attribute("compose.composable", "AccountDashboard")
             comp.set_attribute("compose.recomposition_count", 2)
@@ -120,13 +125,15 @@ try:
         for endpoint in ["balance", "recent_transactions", "card_status"]:
             with tracer.start_as_current_span("retrofit.call", kind=SpanKind.CLIENT) as call:
                 call.set_attributes(android_attrs())
-                call.set_attribute("http.method", "GET")
-                call.set_attribute("http.url", f"https://api.securebank.io/v2/{endpoint}")
+                call.set_attribute("http.request.method", "GET")
+                call.set_attribute("url.full", f"https://api.securebank.io/v2/{endpoint}")
+                call.set_attribute("server.address", "api.securebank.io")
+                call.set_attribute("service.peer.name", "securebank-api")
                 call.set_attribute("retrofit.service", "BankingApiService")
                 call.set_attribute("retrofit.method", f"get{endpoint.title().replace('_', '')}")
                 dur_ms = random.uniform(80, 450)
                 time.sleep(dur_ms / 1000)
-                call.set_attribute("http.status_code", 200)
+                call.set_attribute("http.response.status_code", 200)
         recompose_counter.add(3, attributes={"composable": "AccountDashboard"})
     logger.info("Dashboard parallel Retrofit calls complete", extra={"endpoints": "balance,transactions,card_status"})
     results.append(("Account dashboard: parallel Retrofit calls", "OK", None))
@@ -146,10 +153,12 @@ try:
         time.sleep(random.uniform(0.1, 0.3))  # NFC tap
         with tracer.start_as_current_span("retrofit.call", kind=SpanKind.CLIENT) as auth:
             auth.set_attributes(android_attrs())
-            auth.set_attribute("http.method", "POST")
-            auth.set_attribute("http.url", "https://api.securebank.io/v2/payments/authorize")
+            auth.set_attribute("http.request.method", "POST")
+            auth.set_attribute("url.full", "https://api.securebank.io/v2/payments/authorize")
+            auth.set_attribute("server.address", "api.securebank.io")
+            auth.set_attribute("service.peer.name", "securebank-api")
             time.sleep(random.uniform(0.2, 0.5))
-            auth.set_attribute("http.status_code", 200)
+            auth.set_attribute("http.response.status_code", 200)
             auth.set_attribute("payment.authorization_code", uuid.uuid4().hex[:6].upper())
         span.set_attribute("nfc.payment_result", "approved")
         nfc_txn_hist.record(txn_amount, attributes={"payment.method": "nfc_tap"})
@@ -167,7 +176,7 @@ try:
         span.set_attribute("anr.blocked_ms_estimate", round(random.uniform(2500, 3900), 0))
         # Simulate near-miss: operation offloaded before 5s threshold
         time.sleep(random.uniform(0.08, 0.2))
-        with tracer.start_as_current_span("retrofit.call", kind=SpanKind.CLIENT) as coroutine:
+        with tracer.start_as_current_span("retrofit.call", kind=SpanKind.INTERNAL) as coroutine:
             coroutine.set_attributes(android_attrs())
             coroutine.set_attribute("coroutine.dispatcher", "Dispatchers.IO")
             coroutine.set_attribute("crypto.algorithm", "PBKDF2WithHmacSHA256")
@@ -189,8 +198,9 @@ try:
         try:
             time.sleep(random.uniform(0.02, 0.06))
             err = RuntimeError("NullPointerException: Attempt to invoke virtual method on a null object reference in TransactionAdapter.onBindViewHolder")
-            span.record_exception(err, attributes={"exception.escaped": True})
+            span.record_exception(err, attributes={"exception.escaped": False})
             span.set_status(StatusCode.ERROR, str(err))
+            span.set_attribute("error.type", type(err).__name__)
             span.set_attribute("crash.type", "NullPointerException")
             span.set_attribute("crash.reporter", "firebase_crashlytics_bridge")
             logger.error(
