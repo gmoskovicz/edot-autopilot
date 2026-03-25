@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
 """
-Smoke test: Tier A — Python (native OTel SDK, no framework needed).
+Smoke test: Tier A — Python (native OTel SDK, full O11y: traces + logs + metrics).
 
-Sends a realistic checkout span with business attributes directly to Elastic
-via OTLP/HTTP. Verifies the endpoint accepts it (HTTP 200).
+Sends checkout spans with business attributes, correlated logs, and counters/
+histograms directly to Elastic via OTLP/HTTP.
 
 Run:
     cd smoke-tests && python3 01-tier-a-python/smoke.py
 """
 
 import os, sys, time, random, uuid
-sys.path.insert(0, os.path.dirname(__file__))
-
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.trace import SpanKind
-
-# ── Load env ──────────────────────────────────────────────────────────────────
 from pathlib import Path
+
+# Load .env
 env_file = Path(__file__).parent.parent / ".env"
 if env_file.exists():
     for line in env_file.read_text().splitlines():
@@ -29,60 +21,96 @@ if env_file.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"].rstrip("/")
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from o11y_bootstrap import O11yBootstrap
+
+from opentelemetry.trace import SpanKind, StatusCode
+
+ENDPOINT = os.environ["ELASTIC_OTLP_ENDPOINT"]
 API_KEY  = os.environ["ELASTIC_API_KEY"]
 ENV      = os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "smoke-test")
 SVC      = "smoke-tier-a-python"
 
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
-resource = Resource.create({
-    "service.name": SVC,
-    "service.version": "smoke",
-    "deployment.environment": ENV,
-})
-exporter = OTLPSpanExporter(
-    endpoint=f"{ENDPOINT}/v1/traces",
-    headers={"Authorization": f"ApiKey {API_KEY}"},
-)
-provider = TracerProvider(resource=resource)
-provider.add_span_processor(SimpleSpanProcessor(exporter))  # sync for smoke tests
-trace.set_tracer_provider(provider)
-tracer = trace.get_tracer(SVC)
+# ── Bootstrap all three signals ───────────────────────────────────────────────
+o11y = O11yBootstrap(SVC, ENDPOINT, API_KEY, ENV)
+tracer = o11y.tracer
+logger = o11y.logger
+meter  = o11y.meter
 
-# ── Test spans ────────────────────────────────────────────────────────────────
-print(f"\n[{SVC}] Sending spans to {ENDPOINT}...")
+# Metrics instruments
+checkout_counter    = meter.create_counter("checkout.requests",
+                        description="Total checkout attempts")
+order_value_hist    = meter.create_histogram("checkout.order_value_usd",
+                        description="Order value in USD", unit="USD")
+fraud_score_hist    = meter.create_histogram("checkout.fraud_score",
+                        description="Fraud score distribution (0-1)")
+payment_duration    = meter.create_histogram("payment.duration_ms",
+                        description="Payment processing latency", unit="ms")
 
+# ── Test data ─────────────────────────────────────────────────────────────────
 orders = [
-    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "value": 4200.00, "tier": "enterprise", "fraud": 0.12},
-    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "value": 29.99,   "tier": "free",       "fraud": 0.88},
-    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "value": 1250.00, "tier": "pro",        "fraud": 0.34},
+    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "value": 4200.00, "tier": "enterprise",
+     "fraud": 0.12, "method": "wire_transfer"},
+    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "value": 29.99,   "tier": "free",
+     "fraud": 0.88, "method": "card"},
+    {"id": f"ORD-{uuid.uuid4().hex[:6].upper()}", "value": 1250.00, "tier": "pro",
+     "fraud": 0.34, "method": "paypal"},
 ]
 
+print(f"\n[{SVC}] Sending traces + logs + metrics to {ENDPOINT.split('@')[-1].split('/')[0]}...")
+
 for order in orders:
+    decision = "blocked" if order["fraud"] > 0.85 else "approved"
+
     with tracer.start_as_current_span("checkout.complete", kind=SpanKind.SERVER) as span:
-        span.set_attribute("order.id",            order["id"])
-        span.set_attribute("order.value_usd",     order["value"])
-        span.set_attribute("customer.tier",       order["tier"])
-        span.set_attribute("fraud.score",         order["fraud"])
-        span.set_attribute("fraud.decision",      "blocked" if order["fraud"] > 0.85 else "approved")
-        span.set_attribute("payment.method",      random.choice(["card", "wire_transfer", "paypal"]))
-        span.set_attribute("inventory.reserved",  order["fraud"] < 0.85)
-        span.set_attribute("test.run_id",         SVC)
+        span.set_attribute("order.id",           order["id"])
+        span.set_attribute("order.value_usd",    order["value"])
+        span.set_attribute("customer.tier",      order["tier"])
+        span.set_attribute("fraud.score",        order["fraud"])
+        span.set_attribute("fraud.decision",     decision)
+        span.set_attribute("payment.method",     order["method"])
+        span.set_attribute("inventory.reserved", order["fraud"] < 0.85)
+        span.set_attribute("test.run_id",        SVC)
 
-        # Simulate nested span for payment processing
-        with tracer.start_as_current_span("payment.process", kind=SpanKind.CLIENT) as pay_span:
-            pay_span.set_attribute("payment.provider",   "stripe")
-            pay_span.set_attribute("payment.amount_usd", order["value"])
+        # Nested payment span
+        pay_start = time.time()
+        with tracer.start_as_current_span("payment.process", kind=SpanKind.CLIENT) as pay:
+            pay.set_attribute("payment.provider",   "stripe")
+            pay.set_attribute("payment.amount_usd", order["value"])
             time.sleep(0.05)
+            if order["fraud"] > 0.85:
+                pay.set_attribute("payment.declined", True)
+                pay.set_status(StatusCode.ERROR, "payment skipped — fraud block")
+        pay_ms = (time.time() - pay_start) * 1000
 
-        status = "blocked" if order["fraud"] > 0.85 else "confirmed"
         if order["fraud"] > 0.85:
-            span.set_status(trace.StatusCode.ERROR, "Fraud block")
+            span.set_status(StatusCode.ERROR, "Fraud block")
+
+        # Metrics — recorded inside span so trace context is attached automatically
+        attrs = {"customer.tier": order["tier"], "fraud.decision": decision}
+        checkout_counter.add(1, attributes=attrs)
+        order_value_hist.record(order["value"], attributes=attrs)
+        fraud_score_hist.record(order["fraud"],  attributes={"customer.tier": order["tier"]})
+        payment_duration.record(pay_ms,          attributes={"payment.method": order["method"]})
+
+        # Structured log — trace.id auto-populated from active span context
+        if order["fraud"] > 0.85:
+            logger.warning(
+                "checkout blocked by fraud engine",
+                extra={"order.id": order["id"], "fraud.score": order["fraud"],
+                       "customer.tier": order["tier"], "order.value_usd": order["value"]},
+            )
+        else:
+            logger.info(
+                "checkout completed successfully",
+                extra={"order.id": order["id"], "payment.method": order["method"],
+                       "customer.tier": order["tier"], "order.value_usd": order["value"]},
+            )
 
     icon = "🚫" if order["fraud"] > 0.85 else "✅"
-    print(f"  {icon} {order['id']}  ${order['value']:>8.2f}  [{order['tier']:10}]  fraud={order['fraud']:.2f}  → {status}")
+    print(f"  {icon} {order['id']}  ${order['value']:>8.2f}  [{order['tier']:10}]  "
+          f"fraud={order['fraud']:.2f}  → {decision}")
 
-# Force flush before exit
-provider.force_flush()
-print(f"\n[{SVC}] Done. Verify: Kibana → APM → Services → {SVC}")
-print(f"         ES query: FROM traces-apm* | WHERE service.name == \"{SVC}\" | LIMIT 5")
+o11y.flush()
+print(f"\n[{SVC}] Done. Kibana → APM → {SVC} | Logs: service.name:{SVC} | "
+      f"Metrics: checkout.requests")

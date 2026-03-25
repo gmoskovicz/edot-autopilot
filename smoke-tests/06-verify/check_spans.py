@@ -35,6 +35,11 @@ SERVICES = [
     ("smoke-tier-c-monkey-patch",  "Python Tier C — Stripe monkey-patch"),
     ("smoke-tier-d-sidecar",       "Tier D — Bash/Perl via sidecar"),
     ("smoke-tier-d-sidecar-client","Tier D — Python sidecar client (COBOL/Bash pattern)"),
+    # Cross-tier full O11y scenario
+    ("activation-api",             "Cross-tier: Tier A — service activation gateway"),
+    ("legacy-billing-engine",      "Cross-tier: Tier B — legacy credit check system"),
+    ("payment-gateway-stripe",     "Cross-tier: Tier C — Stripe charge proxy"),
+    ("notification-sms-bash",      "Cross-tier: Tier D — SMS notification via sidecar"),
 ]
 
 print("\n" + "="*70)

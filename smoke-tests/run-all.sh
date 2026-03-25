@@ -144,6 +144,50 @@ else
   fi
 fi
 
+# ── Cross-tier full O11y scenario ─────────────────────────────────────────────
+echo -e "${CYAN}── Cross-Tier: Full O11y End-to-End Scenario ─────────────────${NC}"
+
+SCENARIO_SCRIPT="$(pwd)/07-cross-tier-full-o11y/scenario.py"
+if [ ! -f "$SCENARIO_SCRIPT" ]; then
+  warn "07-cross-tier-full-o11y/scenario.py not found — skipping"
+else
+  if [ -n "$SIDECAR_PID" ] && kill -0 "$SIDECAR_PID" 2>/dev/null; then
+    # Sidecar is running — set its service name to the cross-tier Tier D service
+    info "Restarting sidecar with service name: notification-sms-bash"
+    kill "$SIDECAR_PID" 2>/dev/null || true
+    sleep 0.3
+    export OTEL_SERVICE_NAME="notification-sms-bash"
+    python3 "$SIDECAR_SCRIPT" &
+    SIDECAR_PID=$!
+    for i in {1..10}; do
+      sleep 0.3
+      if curl -sf -X POST "http://127.0.0.1:${SIDECAR_PORT:-9411}" \
+           -H "Content-Type: application/json" \
+           -d '{"action":"health"}' >/dev/null 2>&1; then
+        break
+      fi
+    done
+    export OTEL_SIDECAR_URL="http://127.0.0.1:${SIDECAR_PORT:-9411}"
+    run_test "07-cross-tier-full-o11y" "python3 $SCENARIO_SCRIPT"
+  else
+    warn "Sidecar not running — starting it for cross-tier Tier D"
+    export OTEL_SERVICE_NAME="notification-sms-bash"
+    python3 "$SIDECAR_SCRIPT" &
+    SIDECAR_PID=$!
+    for i in {1..10}; do
+      sleep 0.3
+      if curl -sf -X POST "http://127.0.0.1:${SIDECAR_PORT:-9411}" \
+           -H "Content-Type: application/json" \
+           -d '{"action":"health"}' >/dev/null 2>&1; then
+        ok "Sidecar ready for cross-tier scenario"
+        break
+      fi
+    done
+    export OTEL_SIDECAR_URL="http://127.0.0.1:${SIDECAR_PORT:-9411}"
+    run_test "07-cross-tier-full-o11y" "python3 $SCENARIO_SCRIPT"
+  fi
+fi
+
 # ── Verify ────────────────────────────────────────────────────────────────────
 echo -e "${CYAN}── Verification ──────────────────────────────────────────────${NC}"
 python3 06-verify/check_spans.py 2>&1 | grep -v NotOpenSSLWarning | grep -v "warnings.warn"
