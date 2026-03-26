@@ -21,6 +21,7 @@ services:
     environment:
       OTEL_SERVICE_NAME: inttest-fastapi
       OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_DEPLOYMENT_ENVIRONMENT: integration-test
       OTEL_METRICS_EXPORTER: otlp
       OTEL_LOGS_EXPORTER: otlp
@@ -63,6 +64,9 @@ services:
     environment:
       OTEL_SERVICE_NAME: inttest-springboot
       OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+      # Spring Boot 3.x OTLP tracing uses management.otlp.tracing.endpoint
+      # (env var form: MANAGEMENT_OTLP_TRACING_ENDPOINT)
+      MANAGEMENT_OTLP_TRACING_ENDPOINT: http://collector:4318/v1/traces
       OTEL_DEPLOYMENT_ENVIRONMENT: integration-test
       OTEL_METRICS_EXPORTER: otlp
       OTEL_LOGS_EXPORTER: otlp
