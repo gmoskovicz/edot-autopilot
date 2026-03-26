@@ -399,12 +399,50 @@ try:
         except Exception as exc:
             check("Sidecar payload simulation completed without error", False, str(exc))
 
-        print("\n  Waiting 3s for OTLP export to Elastic...")
-        time.sleep(3)
+        print("\n  Waiting 5s for BatchSpanProcessor to flush to Elastic...")
+        time.sleep(5)
 
         check("Sidecar process still alive after payload simulation",
               sidecar_proc.poll() is None,
               "sidecar died unexpectedly")
+
+        # ── Step 7: Verify spans actually landed in Elastic ───────────────────
+        print("\nStep 7: Verifying spans reached Elastic")
+        ES_URL = os.environ.get("ELASTICSEARCH_URL", "").rstrip("/")
+        ES_KEY = os.environ.get("ELASTICSEARCH_API_KEY", "")
+        if not ES_URL or not ES_KEY:
+            print("  [SKIP] ELASTICSEARCH_URL / ELASTICSEARCH_API_KEY not set — skipping ES|QL check")
+        else:
+            import json as _json
+            span_confirmed = False
+            for attempt in range(3):
+                try:
+                    body = _json.dumps({"query": (
+                        f'FROM traces-generic.otel-default,traces-apm* '
+                        f'| WHERE service.name == "{SVC}" '
+                        f'| LIMIT 1'
+                    )}).encode()
+                    req = urllib.request.Request(
+                        f"{ES_URL}/_query",
+                        data=body,
+                        headers={
+                            "Authorization": f"ApiKey {ES_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        method="POST",
+                    )
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    result = _json.loads(resp.read())
+                    if result.get("values") and len(result["values"]) > 0:
+                        span_confirmed = True
+                        break
+                    print(f"  ES|QL attempt {attempt+1}/3: no spans yet, retrying in 5s...")
+                    time.sleep(5)
+                except Exception as e:
+                    print(f"  ES|QL attempt {attempt+1}/3 failed: {e}")
+                    time.sleep(5)
+            check("Spans confirmed in Elastic (ES|QL)", span_confirmed,
+                  f"service '{SVC}' not found in traces-generic.otel-default after 3 attempts")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     if sidecar_proc.poll() is None:
