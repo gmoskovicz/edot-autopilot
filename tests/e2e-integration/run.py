@@ -87,7 +87,8 @@ check("claude CLI available", claude_bin is not None,
 check("ANTHROPIC_API_KEY set", bool(os.environ.get("ANTHROPIC_API_KEY")),
       "export ANTHROPIC_API_KEY=<elastic-eis-key>")
 check("ANTHROPIC_BASE_URL set", bool(os.environ.get("ANTHROPIC_BASE_URL")),
-      "export ANTHROPIC_BASE_URL=https://<es-host>/_inference/anthropic/<inference-id>")
+      "In CI: set by workflow to http://127.0.0.1:9999 (EIS proxy). "
+      "Locally: run eis-proxy.py first then export ANTHROPIC_BASE_URL=http://127.0.0.1:9999")
 check("CLAUDE.md exists",    CLAUDE_MD.exists(),    str(CLAUDE_MD))
 check("Blank fixture exists", FIXTURE_DIR.is_dir(), str(FIXTURE_DIR))
 check("Docker available",    shutil.which("docker") is not None)
@@ -97,8 +98,8 @@ check("Fixture has no OTel", not any(
     if (FIXTURE_DIR / f).exists()
 ), "fixture already contains opentelemetry — test is invalid")
 
-if not os.environ.get("ANTHROPIC_API_KEY") or not os.environ.get("ANTHROPIC_BASE_URL"):
-    print("\nANTHROPIC_API_KEY / ANTHROPIC_BASE_URL not set — skipping E2E test (EIS not configured).")
+if not os.environ.get("ANTHROPIC_API_KEY"):
+    print("\nANTHROPIC_API_KEY not set — skipping E2E test (EIS not configured).")
     sys.exit(0)
 
 if any(s == "FAIL" for s, _, _ in CHECKS):

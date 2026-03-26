@@ -263,9 +263,14 @@ jobs:
           echo "PASS: otel-contracts.py compiles"
 
   # ── Job 6: E2E Instrumentation Test ──────────────────────────────────────────
-  # Claude (via Elastic EIS) instruments a blank app from scratch.
-  # Spans are validated via a local OTel Collector — no Elastic ingest needed.
-  # Uses EIS (Elastic Inference Service) via ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL.
+  # Claude instruments a blank app from scratch; spans validated via local OTel Collector.
+  #
+  # Auth flow:
+  #   Claude Code CLI uses Anthropic format:  x-api-key: <key>
+  #   Elastic EIS requires:                   Authorization: ApiKey <key>
+  #   Solution: eis-proxy.py translates the header on the fly, running on localhost:9999.
+  #   ANTHROPIC_BASE_URL for the test is overridden to http://127.0.0.1:9999
+  #   so Claude Code talks to the proxy, which forwards to the real EIS endpoint.
   e2e-integration:
     name: E2E Instrumentation Test (Claude instruments blank app)
     runs-on: ubuntu-latest
@@ -276,7 +281,7 @@ jobs:
       github.event_name == 'schedule'
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+      EIS_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -292,14 +297,31 @@ jobs:
 
       - name: Check EIS credentials are set
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$ANTHROPIC_BASE_URL" ]; then
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$EIS_BASE_URL" ]; then
             echo "SKIP: ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL not configured — skipping E2E test."
             echo "      Add them in repo Settings → Secrets → Actions (use Elastic EIS credentials)."
             exit 0
           fi
           echo "EIS endpoint configured."
 
+      - name: Start EIS auth proxy (localhost:9999 → EIS)
+        run: |
+          python3 tests/e2e-integration/eis-proxy.py \
+            --target "$EIS_BASE_URL" \
+            --port 9999 &
+          # Wait for the proxy to bind its port
+          for i in $(seq 1 10); do
+            sleep 1
+            if curl -sf http://127.0.0.1:9999/ >/dev/null 2>&1 || \
+               nc -z 127.0.0.1 9999 2>/dev/null; then
+              echo "Proxy ready"
+              break
+            fi
+          done
+
       - name: Run E2E instrumentation test
+        env:
+          ANTHROPIC_BASE_URL: http://127.0.0.1:9999
         run: python3 tests/e2e-integration/run.py
 
       - name: Upload collector output on failure
