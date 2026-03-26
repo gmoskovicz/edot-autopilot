@@ -36,8 +36,9 @@ CLAUDE_MD   = REPO_ROOT / "CLAUDE.md"
 OUTPUT_DIR  = HERE / "output"
 TRACES_FILE = OUTPUT_DIR / "traces.jsonl"
 
-COLLECTOR_PORT = 4318
-APP_PORT       = 15002
+COLLECTOR_OTLP_PORT   = 4318   # OTLP HTTP — where the app sends spans
+COLLECTOR_HEALTH_PORT = 13133  # health_check extension — used for readiness poll
+APP_PORT              = 15002
 
 CHECKS: list[tuple[str, bool, str]] = []
 
@@ -118,21 +119,22 @@ subprocess.run(
     cwd=HERE, check=True, capture_output=True,
 )
 
-# Poll the collector health endpoint rather than using --wait
-# (the collector image may not have wget/curl available for healthchecks)
+# Poll the health_check extension (port 13133) — returns 200 when collector is ready.
+# Port 4318 (OTLP HTTP) rejects GET requests, so health polling must use 13133.
 collector_ready = False
-for _ in range(15):
+for _ in range(20):
     time.sleep(2)
     try:
         with urllib.request.urlopen(
-            f"http://localhost:{COLLECTOR_PORT}/", timeout=2
+            f"http://localhost:{COLLECTOR_HEALTH_PORT}/", timeout=2
         ) as r:
-            collector_ready = True
-            break
+            if r.status == 200:
+                collector_ready = True
+                break
     except Exception:
         pass
 check("OTel Collector started and ready", collector_ready,
-      f"port {COLLECTOR_PORT} not responding after 30s")
+      f"port {COLLECTOR_HEALTH_PORT} not responding after 40s")
 print()
 
 
@@ -168,7 +170,7 @@ try:
 
     observe_prompt = (
         "Observe this project.\n"
-        f"My Elastic endpoint: http://localhost:{COLLECTOR_PORT}\n"
+        f"My Elastic endpoint: http://localhost:{COLLECTOR_OTLP_PORT}\n"
         "My Elastic API key: e2e-test-key"
     )
 
@@ -235,15 +237,20 @@ try:
     print("Step 5: Starting instrumented app")
 
     env = os.environ.copy()
+    collector_url = f"http://localhost:{COLLECTOR_OTLP_PORT}"
     env.update({
         "PORT":                          str(APP_PORT),
         "OTEL_SERVICE_NAME":             "e2e-inttest",
-        # Override whatever endpoint Claude configured — always point at local collector
-        "OTEL_EXPORTER_OTLP_ENDPOINT":   f"http://localhost:{COLLECTOR_PORT}",
+        # Override whatever endpoint Claude configured — always point at local collector.
+        # Set both OTEL_* standard and ELASTIC_OTLP_ENDPOINT (used by CLAUDE.md pattern).
+        "ELASTIC_OTLP_ENDPOINT":         collector_url,
+        "OTEL_EXPORTER_OTLP_ENDPOINT":   collector_url,
         "OTEL_EXPORTER_OTLP_PROTOCOL":   "http/protobuf",
         "OTEL_METRICS_EXPORTER":         "otlp",
         "OTEL_LOGS_EXPORTER":            "otlp",
         "OTEL_DEPLOYMENT_ENVIRONMENT":   "e2e-test",
+        # Suppress the real Elastic API key so the app doesn't accidentally send to prod
+        "ELASTIC_API_KEY":               "e2e-test-key",
     })
 
     app_proc = subprocess.Popen(
