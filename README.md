@@ -458,8 +458,29 @@ edot-autopilot/
     ├── opentelemetry-dotnet-framework-4x.md
     ├── opentelemetry-python2.md
     ├── telemetry-sidecar-pattern.md
-    └── business-span-enrichment.md
+    ├── business-span-enrichment.md
+    ├── opentelemetry-sap-abap.md
+    └── opentelemetry-ibm-rpg.md
 ```
+
+---
+
+## Language guides
+
+Per-language OpenTelemetry guides for runtimes that every other tool ignores:
+
+| Language / Runtime | Guide |
+|---|---|
+| COBOL (mainframe batch) | [opentelemetry-cobol.md](docs/opentelemetry-cobol.md) |
+| Perl (AIX, legacy Linux) | [opentelemetry-perl.md](docs/opentelemetry-perl.md) |
+| Bash / shell scripts | [opentelemetry-bash-shell-scripts.md](docs/opentelemetry-bash-shell-scripts.md) |
+| PowerShell | [opentelemetry-powershell.md](docs/opentelemetry-powershell.md) |
+| Classic ASP / VBScript | [opentelemetry-classic-asp-vbscript.md](docs/opentelemetry-classic-asp-vbscript.md) |
+| .NET Framework 4.x | [opentelemetry-dotnet-framework-4x.md](docs/opentelemetry-dotnet-framework-4x.md) |
+| Python 2.7 | [opentelemetry-python2.md](docs/opentelemetry-python2.md) |
+| SAP ABAP | [opentelemetry-sap-abap.md](docs/opentelemetry-sap-abap.md) |
+| IBM RPG / AS400 | [opentelemetry-ibm-rpg.md](docs/opentelemetry-ibm-rpg.md) |
+| Legacy runtimes (overview) | [opentelemetry-legacy-runtimes.md](docs/opentelemetry-legacy-runtimes.md) |
 
 ---
 
@@ -485,6 +506,14 @@ Use `span.set_attribute("order.value_usd", 249.99)` for any data with business m
 
 ### Which AI coding assistants does this work with?
 Claude Code, Cursor, GitHub Copilot, Gemini CLI, Windsurf, Roo, Cline, Codex — any agent that supports the [agentskills.io](https://agentskills.io) open skill specification. Install with `npx skills add gmoskovicz/edot-autopilot/observability-edot-autopilot`. For Claude Code specifically, you can also drop [`CLAUDE.md`](CLAUDE.md) directly into your repo root.
+
+### How do I add OpenTelemetry to SAP ABAP?
+
+SAP ABAP has no official OTel SDK. The approach: add a small utility class (`ZCL_OTEL_SIDECAR`) to your ABAP system that wraps HTTP calls to the telemetry sidecar. The sidecar runs as a Docker container or process on a Linux host the SAP Application Server can reach. ABAP programs call `ZCL_OTEL_SIDECAR=>emit_event()` after business operations — sales order creation, delivery processing, FI postings, batch job steps. All calls are fire-and-forget inside a `CATCH cx_root` block, so telemetry failures can never impact business processes. See the [complete SAP ABAP guide](docs/opentelemetry-sap-abap.md).
+
+### How do I add OpenTelemetry to IBM RPG (AS/400)?
+
+IBM RPG programs can emit telemetry via shell-out to `curl` using `QSYS/QCMDEXC`, or via the IBM i HTTP APIs on newer releases. The sidecar runs on a Linux host or Docker container on the same network as the IBM i system; RPG programs call it by IP address. For batch RPG jobs that run for minutes, use `OtelStartSpan` / `OtelEndSpan` pairs to capture real duration. CL procedures can emit telemetry the same way. See the [complete IBM RPG guide](docs/opentelemetry-ibm-rpg.md).
 
 ### How do I instrument a React Native / Flutter / mobile app with OpenTelemetry?
 Mobile apps require platform-specific OTel resource attributes (`device.model.name`, `device.manufacturer`, `os.type`, `os.version`, `os.build_id`, `app.version`, `telemetry.sdk.name`) plus session and network context. The smoke tests in `65–70` demonstrate full 3-signal instrumentation for React Native, Flutter, iOS Swift, Android Kotlin, .NET MAUI, and Ionic/Capacitor — each with crash reporting, biometric auth flows, and push notification correlation. Use the `extra_resource_attrs` parameter in `o11y_bootstrap.py` to inject platform attributes at the OTel Resource level (semantically correct per spec). Note: `device.id` carries GDPR implications — the examples SHA-256 hash it.
