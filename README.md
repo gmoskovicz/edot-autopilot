@@ -10,23 +10,19 @@ OpenTelemetry auto-instrumentation for any language — modern or legacy — pow
 
 ---
 
-## What makes this different
+## Why this exists
 
-Every other auto-instrumentation tool stops at the languages with an official OpenTelemetry SDK. This project does not.
+Every APM vendor supports Python, Java, Node.js, and .NET. Add the agent, restart the process, done.
 
-| | Datadog OneAgent | Dynatrace | Upstream OTel | This project |
-|---|---|---|---|---|
-| Java, Python, .NET, Node | ✅ | ✅ | ✅ | ✅ |
-| Legacy .NET Framework 4.x | ⚠️ | ⚠️ | ❌ | ✅ |
-| Python 2.7 / old frameworks | ❌ | ❌ | ❌ | ✅ |
-| COBOL / RPG / Fortran | ❌ | ❌ | ❌ | ✅ |
-| Perl / Bash / PowerShell | ❌ | ❌ | ❌ | ✅ |
-| Classic ASP / VBScript | ❌ | ❌ | ❌ | ✅ |
-| Business-aware span enrichment | ❌ | ❌ | ❌ | ✅ |
-| Reads codebase before instrumenting | ❌ | ❌ | ❌ | ✅ |
-| Works with any AI coding assistant | ❌ | ❌ | ❌ | ✅ |
+That works for greenfield services. It doesn't work for the COBOL batch job that processes payroll, the Perl script running on AIX, or the Python 2.7 monolith nobody has touched since 2016. Those systems often carry the most business risk — and they have zero observability, because every tool quietly stops where the SDK support ends.
 
-> If you're dealing with a language in that bottom half of the table, this project was built for you. [⭐ Star it](https://github.com/gmoskovicz/edot-autopilot) — so it shows up when the next person searches for the same problem.
+**This project doesn't stop there.**
+
+For languages with no OpenTelemetry SDK, it generates a telemetry sidecar — a tiny HTTP bridge the legacy process calls with a simple POST. No SDK. No upgrade. No rewrite. The COBOL job emits a span. The Perl script emits a span. They appear in Elastic APM alongside your modern services, in the same trace, with the same SLOs applied.
+
+The other thing generic agents don't do: read your code before instrumenting it. They instrument what the SDK can detect — HTTP calls, DB queries, framework hooks. They don't know that `POST /api/v1/txn` is a payment authorization, that `fraud_score` is the field ops needs during an incident, or that the slow path through your checkout flow costs $40k/hour when it degrades. This project reads first. The spans it generates carry order values, customer tiers, and fraud decisions — not just status codes.
+
+> **If you have a language in your stack that no other tool supports, this was built for you.**
 
 ---
 
