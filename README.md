@@ -91,7 +91,7 @@ No other tool has a graceful degradation strategy that covers every runtime ever
 
 | Tier | Strategy | When to use | Examples |
 |------|----------|-------------|---------|
-| **A** — Native OTel SDK | App imports OTel directly | New services, greenfield | Python, Node.js, Java, Go, Ruby, .NET, PHP |
+| **A** — OTel SDK (direct) | App imports OTel SDK directly — upstream or EDOT distribution | New services, greenfield, any platform with an OTel SDK | Python, Node.js, Java, Go, Ruby, .NET, PHP, iOS (Swift), Android (Kotlin) |
 | **B** — Manual span wrapping | Decorator/wrapper at startup | Frameworks without auto-instrumentation | Django ORM, Flask raw, Tornado, Bottle, Falcon |
 | **C** — Library monkey-patch | Patch third-party SDK at import | All call sites covered in one place | Stripe, Twilio, boto3, Redis, OpenAI, CUDA |
 | **D** — HTTP sidecar bridge | Curl/HTTP to a local OTel proxy | No SDK exists for the runtime | COBOL, SAP ABAP, IBM RPG, PowerShell, MATLAB |
