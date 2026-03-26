@@ -109,7 +109,10 @@ docker compose stop tier-a-python tier-a-nodejs tier-a-java 2>/dev/null || true
 sleep 3
 
 # Files written by container root — make readable before validation
-chmod -R a+r output/ 2>/dev/null || true
+# Use a privileged container (same root context) to chmod rather than relying on
+# the host runner having sudo or owning the files.
+docker run --rm -v "$(pwd)/output:/output" alpine chmod -R a+r /output 2>/dev/null || \
+  sudo chmod -R a+r output/ 2>/dev/null || true
 
 # ── Validate collector output ─────────────────────────────────────────────────
 echo ""
