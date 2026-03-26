@@ -163,7 +163,9 @@ jobs:
             --root .
 
       - name: Syntax-check otel-contracts.py
-        run: python -m py_compile tools/otel-contracts.py && echo "PASS: otel-contracts.py compiles"
+        run: |
+          python -m py_compile tools/otel-contracts.py
+          echo "PASS: otel-contracts.py compiles"
 
   # ── Job 3: Real SDK integration tests (Docker) ────────────────────────────────
   # Runs real Java / Node.js / Python processes against a local OTel Collector.
