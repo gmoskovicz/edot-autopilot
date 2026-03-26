@@ -36,6 +36,7 @@ trap cleanup EXIT
 
 # ── Prepare output directory ──────────────────────────────────────────────────
 mkdir -p output
+chmod 777 output  # collector container user must be able to write here
 rm -f output/traces.jsonl output/metrics.jsonl output/logs.jsonl
 
 # ── Build and start the stack ─────────────────────────────────────────────────
