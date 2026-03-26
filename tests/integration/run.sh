@@ -108,6 +108,9 @@ sleep 5
 docker compose stop tier-a-python tier-a-nodejs tier-a-java 2>/dev/null || true
 sleep 3
 
+# Files written by container root — make readable before validation
+chmod -R a+r output/ 2>/dev/null || true
+
 # ── Validate collector output ─────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}── Validating spans ──────────────────────────────────────────${NC}"
