@@ -3,5 +3,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
-# edot-bootstrap auto-instruments at startup
-CMD ["edot-bootstrap", "--", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# opentelemetry-instrument auto-instruments at startup (upstream equivalent of edot-bootstrap)
+CMD ["opentelemetry-instrument", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
