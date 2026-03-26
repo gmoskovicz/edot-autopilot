@@ -110,14 +110,29 @@ print()
 print("Step 1: Starting local OTel Collector")
 
 OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.chmod(0o777)  # container (root) must be able to write here
 TRACES_FILE.unlink(missing_ok=True)
 
 subprocess.run(
-    ["docker", "compose", "up", "-d", "--wait"],
+    ["docker", "compose", "up", "-d"],
     cwd=HERE, check=True, capture_output=True,
 )
-check("OTel Collector started and healthy", True)
-time.sleep(2)
+
+# Poll the collector health endpoint rather than using --wait
+# (the collector image may not have wget/curl available for healthchecks)
+collector_ready = False
+for _ in range(15):
+    time.sleep(2)
+    try:
+        with urllib.request.urlopen(
+            f"http://localhost:{COLLECTOR_PORT}/", timeout=2
+        ) as r:
+            collector_ready = True
+            break
+    except Exception:
+        pass
+check("OTel Collector started and ready", collector_ready,
+      f"port {COLLECTOR_PORT} not responding after 30s")
 print()
 
 
