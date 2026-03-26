@@ -94,6 +94,10 @@ check("Fixture has no OTel", not any(
     if (FIXTURE_DIR / f).exists()
 ), "fixture already contains opentelemetry — test is invalid")
 
+if not os.environ.get("ANTHROPIC_API_KEY"):
+    print("\nANTHROPIC_API_KEY not set — skipping E2E test (not configured in CI).")
+    sys.exit(0)
+
 if any(s == "FAIL" for s, _, _ in CHECKS):
     print("\nPrerequisites failed — cannot continue.")
     sys.exit(2)
