@@ -776,8 +776,6 @@ def svc_analytics_event(event_type: str, properties: dict, parent_tp: str):
 
 # ── Scenario runner ───────────────────────────────────────────────────────────
 
-global _active_sessions
-
 def run_scenario(label: str, customer: dict, device: dict, scenario_fn):
     """Wrap a scenario with a root mobile span and session tracking."""
     session_id = f"SES-{uuid.uuid4().hex[:12].upper()}"
