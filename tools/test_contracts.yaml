@@ -1,0 +1,41 @@
+# Self-test contracts — validates that the Tier A Python FastAPI reference app
+# correctly sets all required business attributes on its spans.
+#
+# Used in CI to verify otel-contracts.py itself works correctly against a
+# known-good instrumented fixture. Run via:
+#   python tools/otel-contracts.py validate --contracts tools/test_contracts.yaml
+
+version: "1"
+service: "inttest-fastapi"
+
+contracts:
+
+  - id: create-order
+    description: "Customer places an order (Tier A FastAPI reference)"
+    span_name: "POST /orders"
+    auto_instrumented: true             # EDOT creates the span; developer enriches it
+    source_files:
+      - path: tests/tier-a-python-fastapi/main.py
+        language: python
+    required_attributes:
+      - order.customer_id
+      - order.amount_usd
+      - order.item
+      - customer.tier
+      - fraud.score
+      - fraud.decision
+      - order.id
+    forbidden_attributes:
+      - customer.email
+      - customer.phone
+      - customer.name
+
+  - id: get-order
+    description: "Customer retrieves an order"
+    span_name: "GET /orders/{order_id}"
+    auto_instrumented: true
+    source_files:
+      - path: tests/tier-a-python-fastapi/main.py
+        language: python
+    required_attributes:
+      - order.id

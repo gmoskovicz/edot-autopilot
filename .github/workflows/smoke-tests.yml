@@ -138,6 +138,32 @@ jobs:
           path: smoke-tests/*.log
           if-no-files-found: ignore
 
+  # ── Job 4: Telemetry contract validation ─────────────────────────────────────
+  # Runs on every push and PR. No Elastic credentials required — pure static analysis.
+  # Validates that reference app source files satisfy their declared span attribute contracts.
+  contract-check:
+    name: Telemetry Contract Check
+    runs-on: ubuntu-latest
+    needs: syntax-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Validate telemetry contracts against reference apps
+        run: |
+          python tools/otel-contracts.py validate \
+            --contracts tools/test_contracts.yaml \
+            --root .
+
+      - name: Syntax-check otel-contracts.py
+        run: python -m py_compile tools/otel-contracts.py && echo "PASS: otel-contracts.py compiles"
+
   # ── Job 3: Real SDK integration tests (Docker) ────────────────────────────────
   # Runs real Java / Node.js / Python processes against a local OTel Collector.
   # No Elastic credentials required — spans are validated from collector file output.

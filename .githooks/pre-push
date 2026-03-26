@@ -1,0 +1,65 @@
+#!/bin/bash
+# EDOT Autopilot — Telemetry drift detection (pre-push hook)
+#
+# Checks that commits about to be pushed haven't removed required span attributes
+# from source files covered by .otel/contracts.yaml.
+#
+# Non-blocking by default. Set OTEL_STRICT=1 to fail the push on drift.
+#
+# Install:
+#   git config core.hooksPath .githooks
+#
+# Bypass (use sparingly):
+#   SKIP_OTEL_CHECK=1 git push
+
+set -euo pipefail
+
+if [ "${SKIP_OTEL_CHECK:-0}" = "1" ]; then
+  exit 0
+fi
+
+CONTRACTS="${OTEL_CONTRACTS:-.otel/contracts.yaml}"
+TOOL="tools/otel-contracts.py"
+
+# Silently skip if this repo has no contracts defined
+if [ ! -f "$CONTRACTS" ]; then
+  exit 0
+fi
+
+if ! command -v python3 &>/dev/null; then
+  echo "otel-contracts: python3 not found, skipping drift check" >&2
+  exit 0
+fi
+
+if [ ! -f "$TOOL" ]; then
+  echo "otel-contracts: $TOOL not found, skipping drift check" >&2
+  exit 0
+fi
+
+echo "otel-contracts: checking for telemetry drift..."
+
+DRIFT_FOUND=0
+
+# Git calls pre-push with push details on stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>
+while read -r _local_ref _local_sha _remote_ref remote_sha; do
+  # If remote_sha is all zeros, this is a new branch — diff against one commit back
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    BASE="HEAD~1"
+  else
+    BASE="$remote_sha"
+  fi
+
+  OUTPUT=$(python3 "$TOOL" drift --contracts "$CONTRACTS" --base "$BASE" 2>&1) || DRIFT_FOUND=1
+  [ -n "$OUTPUT" ] && echo "$OUTPUT"
+done
+
+if [ "$DRIFT_FOUND" = "1" ]; then
+  echo ""
+  echo "otel-contracts: contract violation(s) detected in pushed commits."
+  if [ "${OTEL_STRICT:-0}" = "1" ]; then
+    echo "Push blocked. Fix violations or set SKIP_OTEL_CHECK=1 to bypass."
+    exit 1
+  else
+    echo "Push allowed (advisory mode). Set OTEL_STRICT=1 to enforce."
+  fi
+fi

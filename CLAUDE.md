@@ -521,6 +521,70 @@ the on-call engineer know exactly what happened and what to do?"*
 
 ---
 
+## Phase 3.5 — Generate Telemetry Contracts (Lock in what was instrumented)
+
+After Phase 3, generate `.otel/contracts.yaml` — a machine-readable record of what
+each golden path span is contractually required to carry. This file is the bridge
+between one-time instrumentation and ongoing correctness: CI fails the build if a
+required attribute disappears, and the drift detector warns when contracted source
+files change without updating spans.
+
+**Generate one contract entry for every golden path instrumented in Phase 2 and 3:**
+
+```yaml
+version: "1"
+service: "<OTEL_SERVICE_NAME>"
+generated_by: "edot-autopilot"
+generated_at: "<ISO-8601 timestamp>"
+
+contracts:
+  - id: <stable-slug>                   # e.g. create-order — never rename this
+    description: "<Business action from Phase 1 Recon>"
+    span_name: "<exact span name in code>"
+    auto_instrumented: true|false       # true = EDOT framework creates the span
+    source_files:
+      - path: <path/from/repo/root.py>
+        language: python                # python | nodejs | java | go | ruby | php | dotnet | bash | perl
+    required_attributes:
+      - <every set_attribute key added in Phase 3>
+    forbidden_attributes:               # always include PII fields
+      - customer.email
+      - customer.phone
+      - customer.name
+      - customer.ip_address
+```
+
+**Rules:**
+- Set `auto_instrumented: true` for Tier A spans — the span is created by the framework,
+  not a `start_as_current_span()` call in user code
+- List every `set_attribute` key added in Phase 3 as a `required_attribute`
+- Include all modified source files in `source_files` — if enrichment spans multiple
+  files (e.g., a middleware adds attributes, then a handler adds more), list both
+- Always populate `forbidden_attributes` with PII fields for every customer-facing flow
+
+**Also generate `otel-contracts.py` at the repo root** (copy from EDOT Autopilot's
+`tools/otel-contracts.py`). This gives the team a zero-dependency CLI to validate
+contracts in CI and as a git hook:
+
+```bash
+# Validate all contracts against source code (run in CI, no credentials needed)
+python otel-contracts.py validate
+
+# Check for attribute drift in staged changes (pre-commit hook)
+python otel-contracts.py drift
+
+# Full coverage summary
+python otel-contracts.py report
+```
+
+Install as a git hook:
+```bash
+cp .githooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# or: git config core.hooksPath .githooks
+```
+
+---
+
 ## Phase 4 — SLOs Grounded in Business Reality (What are the real performance contracts this codebase already encodes?)
 
 Use the `slo-management` Elastic Skill to create SLOs via the Kibana API.
@@ -583,9 +647,11 @@ At the end of this workflow, produce:
 .otel/
   README.md           — what was instrumented, decisions made, gaps remaining
   golden-paths.md     — business flows mapped to span names and attributes
+  contracts.yaml      — machine-readable span attribute contracts (validates in CI)
   slos.json           — SLO definitions (version controlled)
   coverage-report.md  — tier breakdown per component
 
+otel-contracts.py     — contract validator and drift detector (always generated)
 otel-sidecar.py       — generated only if Tier D components exist
 Dockerfile.sidecar    — generated only if Tier D components exist
 .env.otel.example     — variable template (no secrets)
