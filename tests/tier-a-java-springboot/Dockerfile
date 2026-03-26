@@ -13,13 +13,8 @@ FROM eclipse-temurin:21-jre-jammy
 
 WORKDIR /app
 
-# Download upstream OTel Java agent (EDOT agent is on Maven Central, not GitHub releases)
-RUN curl -fsSL -o /app/opentelemetry-javaagent.jar \
-    https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
-
 COPY --from=build /build/target/edot-springboot-tier-a-1.0.0.jar app.jar
 
-# -javaagent injects EDOT auto-instrumentation at JVM startup — zero code changes needed
-CMD ["java", \
-     "-javaagent:/app/opentelemetry-javaagent.jar", \
-     "-jar", "app.jar"]
+# The pom.xml uses opentelemetry-spring-boot-starter (library instrumentation).
+# No -javaagent needed — the starter handles OTel at compile time, not via agent.
+CMD ["java", "-jar", "app.jar"]
