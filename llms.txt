@@ -61,21 +61,22 @@ For Claude Code specifically, drop CLAUDE.md into any repository root and use th
 
 ## Test suite
 
-85 tests across three layers:
+82 tests across three layers:
 
-- **Layer 1 (tests 01–81)**: Verify that the correct instrumentation pattern for each
+- **Layer 1 (tests 01–52)**: Verify that the correct instrumentation pattern for each
   technology produces correct telemetry — spans, metrics, and logs with the right names,
   attributes, and semantic conventions. Covers 65+ technologies: Python, Node.js, Java, Go,
   Ruby, .NET, PHP, React Native, Flutter, iOS, Android, React SPA, Next.js, Vue, Angular,
   SvelteKit, NestJS, Gin, Rails, FastAPI, HTMX, COBOL, Perl, Bash, PowerShell, SAP ABAP,
-  IBM RPG, Classic ASP, Lua, Tcl, MATLAB, Fortran, Ada, Nim, CUDA/NVML, DCGM, Zapier.
+  IBM RPG, Classic ASP, Lua, Tcl, MATLAB, Fortran, Ada, Nim, CUDA/NVML, DCGM, Zapier,
+  Gen-AI (OpenAI, Anthropic, AWS Bedrock via gen_ai.* semconv).
 - **Layer 2 (tests/integration/)**: Real SDK tests — Java Spring Boot + OTel Java agent,
   Node.js Express + OTel Node SDK, Python FastAPI + auto-instrumentation, .NET Framework 4.x,
   Python 2.7 — running in Docker against a local OTel Collector.
-- **Layer 3 (tests 82–85)**: E2E workflow tests — spin up a real uninstrumented app (Flask,
-  FastAPI, Django), apply the instrumentation the workflow generates, verify spans carry
-  business attributes, `.otel/slos.json` exists with code-derived thresholds, and
-  `record_exception` is present on every error path.
+- **Layer 3 (tests 60–89)**: Multi-service scenario tests and E2E workflow tests — spin up
+  real uninstrumented apps, apply the instrumentation the workflow generates, verify spans
+  carry business attributes, `.otel/golden-paths.md` exists, and `record_exception` is
+  present on every error path.
 
 Multi-service scenarios (9-service e-commerce, 7-service auth platform, 7-service data
 pipeline, 7-service ML inference, 7-service SaaS ops) produce realistic service maps
@@ -110,7 +111,7 @@ and cascading failures.
   - `scripts/o11y_bootstrap.py` — 3-signal helper (traces + logs + metrics)
   - `scripts/otel-sidecar.py` — HTTP-to-OTLP bridge for legacy runtimes
 - `otel-sidecar/otel-sidecar.py` — Universal Tier D bridge
-- `smoke-tests/` — 85 tests covering all 4 tiers and 65+ technologies
+- `smoke-tests/` — 82 tests covering all 4 tiers and 65+ technologies
 - `tests/integration/` — Real SDK tests in Docker (Java, Node.js, Python, .NET, Python 2.7)
 - `docs/` — Per-language OpenTelemetry guides for COBOL, Perl, Bash, PowerShell,
   Classic ASP, .NET Framework 4.x, Python 2.7, legacy runtimes, business span enrichment,
@@ -125,3 +126,5 @@ and cascading failures.
 - agentskills.io standard: https://agentskills.io
 - OTLP Specification: https://opentelemetry.io/docs/specs/otlp/
 - OTel Semantic Conventions: https://opentelemetry.io/docs/specs/semconv/
+
+Last updated: March 2026

@@ -4,7 +4,8 @@
 [![Elastic EDOT](https://img.shields.io/badge/Elastic-EDOT-005571?logo=elastic)](https://www.elastic.co/docs/reference/opentelemetry)
 [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-agentskills.io-8A2BE2)](https://agentskills.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Languages](https://img.shields.io/badge/languages-85%2B-brightgreen)](smoke-tests/README.md)
+[![Languages](https://img.shields.io/badge/languages-65%2B-brightgreen)](smoke-tests/README.md)
+[![CI](https://github.com/gmoskovicz/edot-autopilot/actions/workflows/smoke-tests.yml/badge.svg)](https://github.com/gmoskovicz/edot-autopilot/actions/workflows/smoke-tests.yml)
 
 OpenTelemetry auto-instrumentation for any language — modern or legacy — powered by Elastic EDOT, with full support for runtimes that have no OTel SDK.
 
@@ -99,7 +100,7 @@ No other tool has a graceful degradation strategy that covers every runtime ever
 
 ## Test suite
 
-86 real-world eval tests. Each one starts with a blank, uninstrumented app, runs `claude -p "Observe this project."`, and verifies that the agent correctly instruments it — right packages, right tier, right business attributes — then starts the app and confirms it runs. No simulations, no hardcoded expected output. See [`smoke-tests/`](smoke-tests/) for the full list.
+82 real-world eval tests. Each one starts with a blank, uninstrumented app, runs `claude -p "Observe this project."`, and verifies that the agent correctly instruments it — right packages, right tier, right business attributes — then starts the app and confirms it runs. No simulations, no hardcoded expected output. See [`smoke-tests/`](smoke-tests/) for the full list.
 
 ---
 
@@ -167,6 +168,152 @@ an HTTP POST can emit spans, logs, and metrics to Elastic APM — zero changes t
 
 Supported actions: `event`, `start_span`, `end_span`, `log`, `metric_counter`,
 `metric_gauge`, `metric_histogram`. See [`otel-sidecar/README.md`](otel-sidecar/README.md).
+
+---
+
+## Kubernetes: zero-touch instrumentation with the OTel Operator
+
+For cloud-native services running in Kubernetes, the
+[OpenTelemetry Operator](https://github.com/open-telemetry/opentelemetry-operator)
+can auto-inject instrumentation into pods without touching application code at all.
+
+### Install the operator
+
+```bash
+kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml
+```
+
+### Create an Instrumentation resource pointing at Elastic
+
+```yaml
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: edot-instrumentation
+  namespace: default
+spec:
+  exporter:
+    endpoint: https://<deployment>.apm.<region>.cloud.es.io
+  env:
+    - name: OTEL_EXPORTER_OTLP_HEADERS
+      valueFrom:
+        secretKeyRef:
+          name: elastic-otel-secret
+          key: headers
+  propagators:
+    - tracecontext
+    - baggage
+    - b3
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1.0"
+  python:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:latest
+  java:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest
+  nodejs:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-nodejs:latest
+  dotnet:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-dotnet:latest
+```
+
+### Annotate your deployments — no code changes needed
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-python-api
+spec:
+  template:
+    metadata:
+      annotations:
+        instrumentation.opentelemetry.io/inject-python: "true"
+        # For Java:  instrumentation.opentelemetry.io/inject-java: "true"
+        # For Node:  instrumentation.opentelemetry.io/inject-nodejs: "true"
+        # For .NET:  instrumentation.opentelemetry.io/inject-dotnet: "true"
+```
+
+The operator injects the EDOT agent as an init container. Your pod restarts once
+and begins sending traces, metrics, and logs to Elastic — zero application changes.
+
+For legacy workloads in Kubernetes that the operator cannot inject (Tier D),
+run the `otel-sidecar` as a sidecar container in the same pod:
+
+```yaml
+containers:
+  - name: legacy-app
+    image: my-legacy-app
+  - name: otel-sidecar
+    image: gmoskovicz/edot-autopilot-sidecar:latest
+    env:
+      - name: OTEL_SERVICE_NAME
+        value: legacy-app
+    envFrom:
+      - secretRef:
+          name: elastic-otel-secret
+```
+
+---
+
+## AWS Lambda: serverless observability
+
+AWS Lambda has official OTel support via the
+[AWS Distro for OpenTelemetry (ADOT) Lambda layer](https://aws-otel.github.io/docs/getting-started/lambda).
+Configure it to send directly to Elastic:
+
+```bash
+# Add the ADOT layer to your Lambda function
+aws lambda update-function-configuration \
+  --function-name my-function \
+  --layers arn:aws:lambda:<region>:901920570463:layer:aws-otel-python-<arch>-ver-1-x-x:1
+
+# Set environment variables
+aws lambda update-function-configuration \
+  --function-name my-function \
+  --environment "Variables={
+    OPENTELEMETRY_COLLECTOR_CONFIG_URI=/var/task/collector.yaml,
+    OTEL_SERVICE_NAME=my-lambda-function,
+    OTEL_DEPLOYMENT_ENVIRONMENT=production
+  }"
+```
+
+**`collector.yaml`** (bundled with your Lambda deployment package):
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: localhost:4317
+
+exporters:
+  otlphttp:
+    endpoint: https://<deployment>.apm.<region>.cloud.es.io
+    headers:
+      Authorization: "ApiKey <your-api-key>"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlphttp]
+    metrics:
+      receivers: [otlp]
+      exporters: [otlphttp]
+```
+
+**Key Lambda-specific attributes to set:**
+
+```python
+span.set_attribute("faas.trigger",        "http")        # or timer/pubsub/datasource
+span.set_attribute("faas.invocation_id",  context.aws_request_id)
+span.set_attribute("cloud.provider",      "aws")
+span.set_attribute("cloud.region",        os.environ["AWS_REGION"])
+span.set_attribute("faas.name",           os.environ["AWS_LAMBDA_FUNCTION_NAME"])
+span.set_attribute("faas.version",        os.environ["AWS_LAMBDA_FUNCTION_VERSION"])
+span.set_attribute("faas.coldstart",      is_cold_start)  # track cold starts explicitly
+```
 
 ---
 
@@ -269,7 +416,7 @@ edot-autopilot/
 │   ├── Dockerfile
 │   └── README.md
 │
-├── smoke-tests/                      # 85 smoke tests — all 4 tiers, 65+ technologies
+├── smoke-tests/                      # 82 smoke tests — all 4 tiers, 65+ technologies
 │   ├── run-all.sh                    #   Run everything locally
 │   ├── requirements.txt              #   All Python dependencies for the suite
 │   ├── docker-compose.yml            #   Full suite with Docker profiles
@@ -345,6 +492,16 @@ Mobile apps require platform-specific OTel resource attributes (`device.model.na
 ### How do I instrument browser RUM and Core Web Vitals with OpenTelemetry?
 The smoke tests in `71–75` cover React SPA, Next.js, Vue, Angular, and SvelteKit. Each emits Core Web Vitals as OTel histograms with bucket boundaries aligned to Google's Good/Needs Improvement/Poor thresholds. Use **INP** (Interaction to Next Paint) — Chrome deprecated FID in March 2024. Metrics: `webvitals.lcp`, `webvitals.inp`, `webvitals.cls`, `webvitals.ttfb`, `webvitals.fcp`. Set `browser.name`, `browser.version`, `browser.platform`, `browser.mobile`, and `user_agent.original` as resource attributes for proper segmentation in Kibana.
 
+### How do I instrument OpenAI, Anthropic, or AWS Bedrock calls with OpenTelemetry?
+
+Use the `gen_ai.*` semantic conventions. The required span attributes are
+`gen_ai.system` (e.g. `openai`, `anthropic`, `aws.bedrock`), `gen_ai.operation.name`
+(`chat`, `text_completion`, `embeddings`), and `gen_ai.request.model`. After the call,
+set `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and
+`gen_ai.response.finish_reasons`. Never log raw prompt or completion content —
+use content hashes for debugging. See smoke test 89 for a complete working example
+covering all three providers.
+
 ### How do I use the correct OTel semantic convention attribute names?
 OTel stabilized new HTTP and database attribute names in semconv 1.20–1.22. Many examples online still use the deprecated names. Quick rules: `http.method` → `http.request.method`, `http.status_code` → `http.response.status_code`, `http.url` → `url.full`, `db.system` → `db.system.name`, `db.statement` → `db.query.text`, `db.operation` → `db.operation.name`. OTel counters never include `_total` (the Prometheus exporter adds it on export). Always set `service.peer.name` on CLIENT spans — Elastic APM service maps require it to draw edges between services. The full cheatsheet is at [`observability-edot-autopilot/references/semconv-conventions.md`](observability-edot-autopilot/references/semconv-conventions.md).
 
@@ -369,6 +526,6 @@ or a new multi-service scenario. New Tier D languages are especially welcome —
 ---
 
 > **Repo topics to add** (improves GitHub discoverability):
-> `opentelemetry` `otel` `elastic` `edot` `observability` `tracing` `auto-instrumentation` `cobol` `legacy` `devops` `sre` `apm` `agent-skills` `cursor` `copilot`
+> `opentelemetry` `otel` `elastic` `edot` `observability` `tracing` `auto-instrumentation` `cobol` `legacy` `devops` `sre` `apm` `agent-skills` `cursor` `copilot` `kubernetes` `opentelemetry-operator` `k8s`
 >
 > Set these at: https://github.com/gmoskovicz/edot-autopilot → About → Topics

@@ -234,6 +234,49 @@ RPG/AS400 · Fortran · Tcl · Lua · COBOL · Bash · Perl · PowerShell · Cla
 
 ---
 
+## How to Add a Gen-AI Provider (Test 89)
+
+Test `89-tier-c-genai-llm` instruments LLM API calls from OpenAI, Anthropic, and
+AWS Bedrock. To add a new provider (Gemini, Mistral, Ollama, etc.):
+
+1. Open `smoke-tests/89-tier-c-genai-llm/app.py`
+2. Add a new entry to the `PROVIDERS` list:
+
+```python
+{"name": "gemini",  "model": "gemini-1.5-pro",   "system": "vertex_ai"},
+{"name": "mistral", "model": "mistral-large",     "system": "mistral_ai"},
+{"name": "ollama",  "model": "llama3.1",          "system": "ollama"},
+```
+
+The `system` value must match the official OTel `gen_ai.system` value from the
+[semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/). For
+providers not yet in the semconv, use a lowercase hyphenated string (e.g. `mistral_ai`).
+
+3. Update the smoke test count assertion in `smoke.py` if needed.
+4. Add an entry to `README.md` in the test's own directory.
+
+No real API key is needed — the mock call simulates latency and token counts.
+
+---
+
+## How to Add a Kubernetes Smoke Test
+
+Kubernetes instrumentation tests verify that the OTel Operator injection pattern
+produces correct spans without modifying application source.
+
+1. Create `smoke-tests/<N>-k8s-<scenario>/` with `smoke.py` and a fixture
+2. The fixture should be a minimal Kubernetes manifest (`deployment.yaml`) with the
+   `instrumentation.opentelemetry.io/inject-python: "true"` annotation
+3. `smoke.py` validates that the annotation is present and that the generated
+   manifest references the correct OTel images
+4. For full integration: spin up a local kind cluster, apply the manifest, generate
+   traffic, and assert spans appear in a local OTel Collector
+
+Use the existing `tests/integration/` pattern (Docker Compose + file exporter) as a
+reference for the collector setup.
+
+---
+
 ## Code of Conduct
 
 Contributors are expected to be respectful to one another. This is a technical project maintained by practitioners; assume good faith, keep feedback constructive, and focus on the work.
