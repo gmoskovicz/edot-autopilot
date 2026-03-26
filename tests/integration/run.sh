@@ -65,7 +65,7 @@ wait_healthy() {
 
 wait_healthy "tier-a-python" "http://localhost:8000/health"        "FastAPI (Python)"   16
 wait_healthy "tier-a-nodejs" "http://localhost:3001/health"        "Express (Node.js)"  16
-wait_healthy "tier-a-java"   "http://localhost:8080/actuator/health" "Spring Boot (Java)" 24
+wait_healthy "tier-a-java"   "http://localhost:8080/actuator/health" "Spring Boot (Java)" 50
 echo ""
 
 # ── Exercise each service to generate spans ───────────────────────────────────
