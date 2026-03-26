@@ -94,6 +94,12 @@ Output a **Reconnaissance Report** before proceeding:
 
 ## Phase 2 — Coverage Triage (Which tier does each component fall into, and what instrumentation strategy does that require?)
 
+**If the codebase already has instrumentation** (Datadog, Sentry, plain OTel, New Relic, etc.):
+- Do NOT remove or replace it. Augment it: add business enrichment attributes to existing spans.
+- If a `TracerProvider` is already configured, reuse it — do not create a second one.
+- If using Datadog tracer: map attribute names to OTel semconv (e.g. Datadog's `resource.name` → `http.route`, `service` → `service.name`).
+- If deprecated OTel attribute names are present (e.g. `http.method`, `db.system`), upgrade them to semconv 1.22+ (`http.request.method`, `db.system.name`) in the same pass.
+
 Every component falls into one of four tiers.
 
 ### Tier A — Full Native EDOT Support
@@ -265,7 +271,7 @@ resource = Resource.create({
     "deployment.environment": os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "production"),
 })
 exporter = OTLPSpanExporter(
-    endpoint=os.environ["ELASTIC_OTLP_ENDPOINT"] + "/v1/traces",
+    endpoint=os.environ["ELASTIC_OTLP_ENDPOINT"].rstrip("/") + "/v1/traces",
     headers={"Authorization": f"ApiKey {os.environ['ELASTIC_API_KEY']}"},
 )
 provider = TracerProvider(resource=resource)
@@ -429,6 +435,8 @@ would need during an incident.
   `invoice.amount`, `payment.method`
 - Customer-facing flows must carry identity context (no PII):
   `customer.tier`, `customer.segment`, `account.age_days`
+  Safe: `customer.tier`, `customer.segment`, `account.age_days`, `account.id` (opaque internal ID)
+  Never: `customer.email`, `customer.name`, `customer.phone`, `customer.ip_address`, `user.password_hash`
 - Failure paths must carry actionability: `error.category` (auth/quota/upstream/data),
   `retry.attempt`, `circuit_breaker.state`
 - Async / queue flows must carry lag: `queue.depth`, `consumer.lag_ms`, `message.age_ms`
@@ -470,6 +478,11 @@ Use specific, meaningful exception types — not generic `Exception`:
 
 Set `exception.escaped=True` when the error is fatal for the request (the transaction fails).
 This causes Elastic APM to display it prominently at the top of the transaction detail.
+
+Set `exception.escaped=False` for caught exceptions that are handled and do not propagate.
+Note: Elastic APM shows these less prominently — on-call engineers may miss them unless they
+explicitly filter by `exception.escaped: false` in Discover. Prefer `escaped=True` on any
+error that causes a degraded or failed response to the caller.
 
 For caught exceptions, the same rule applies:
 ```python
@@ -544,6 +557,15 @@ Do not declare success until data is confirmed flowing in Elastic.
    | SORT @timestamp DESC | LIMIT 5
 6. If any service is missing: check OTEL_SERVICE_NAME, endpoint has no trailing slash,
    API key has APM write access
+7. **Ensure spans are not dropped on process exit.** `BatchSpanProcessor` queues spans and
+   flushes every 5 seconds by default. If the process exits before the next flush, the last
+   batch is silently lost. Always register a shutdown hook:
+   ```python
+   import atexit
+   atexit.register(lambda: provider.force_flush(timeout_millis=5000))
+   ```
+   This is especially critical for: CLI scripts, Lambda functions, short-lived batch jobs,
+   and any process whose lifetime may be under 30 seconds.
 ```
 
 ---

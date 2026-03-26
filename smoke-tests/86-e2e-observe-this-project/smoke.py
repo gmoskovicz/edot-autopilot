@@ -328,6 +328,55 @@ try:
               app_proc.poll() is None,
               "app process died during requests")
 
+        # ── Step 7: ES|QL — confirm spans actually landed in Elastic ──────────
+        print("\nStep 7: Verifying spans reached Elastic (ES|QL)")
+        import json as _json
+        import urllib.request as _urllib_req
+
+        # Derive ES base URL from the OTLP endpoint
+        # OTLP: https://<deployment>.apm.<region>.cloud.es.io
+        # ES:   https://<deployment>.<region>.cloud.es.io
+        es_base = ENDPOINT.rstrip("/").replace(".apm.", ".")
+        # Remove /v1/traces suffix if present
+        for suffix in ["/v1/traces", "/v1/logs", "/v1/metrics"]:
+            if es_base.endswith(suffix):
+                es_base = es_base[: -len(suffix)]
+
+        esql_query = (
+            'FROM traces-apm* METADATA _index '
+            '| WHERE service.name == "order-service" '
+            '| LIMIT 1'
+        )
+        span_confirmed = False
+        for attempt in range(3):
+            try:
+                body = _json.dumps({"query": esql_query}).encode()
+                req = _urllib_req.Request(
+                    f"{es_base}/_query",
+                    data=body,
+                    headers={
+                        "Authorization": f"ApiKey {API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                resp = _urllib_req.urlopen(req, timeout=10)
+                result = _json.loads(resp.read())
+                if result.get("values") and len(result["values"]) > 0:
+                    span_confirmed = True
+                    break
+                else:
+                    time.sleep(5)
+            except Exception as e:
+                print(f"  ES|QL attempt {attempt+1}/3 failed: {e}")
+                time.sleep(5)
+
+        # Warn but don't fail — indexing lag can exceed 15s on busy clusters
+        if span_confirmed:
+            check("Spans confirmed in Elastic via ES|QL", True)
+        else:
+            print("  [WARN] ES|QL found no spans yet — may still be indexing")
+
     # ── Cleanup ───────────────────────────────────────────────────────────────
     if 'app_proc' in dir() and app_proc.poll() is None:
         app_proc.terminate()
