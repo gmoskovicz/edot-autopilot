@@ -11,7 +11,7 @@ on:
 
 jobs:
   # ── Job 1: Syntax + structure check ─────────────────────────────────────────
-  # Runs on every push and PR. No Elastic credentials required.
+  # Runs on every push and PR. No credentials required.
   syntax-check:
     name: Syntax & Structure Check
     runs-on: ubuntu-latest
@@ -47,7 +47,7 @@ jobs:
           fi
           echo "PASS: sidecar uses record_exception correctly"
 
-      - name: Verify .otel/ output files exist in tests/ reference apps
+      - name: Verify required files exist in reference apps
         run: |
           MISSING=0
           for app in tests/tier-a-python-fastapi tests/tier-a-nodejs-express tests/tier-a-java-springboot; do
@@ -66,14 +66,106 @@ jobs:
           fi
           echo "PASS: All reference app files present"
 
-  # ── Job 2: Full smoke test suite ─────────────────────────────────────────────
+      - name: Lint smoke test structure (CHECKS pattern)
+        run: |
+          # Every smoke.py must define CHECKS, use check(), and call sys.exit(1)
+          FAIL=0
+          while IFS= read -r f; do
+            if ! grep -q "^CHECKS" "$f"; then
+              echo "MISSING CHECKS list: $f"
+              FAIL=$((FAIL+1))
+            fi
+            if ! grep -q "def check(" "$f"; then
+              echo "MISSING check() function: $f"
+              FAIL=$((FAIL+1))
+            fi
+            if ! grep -q "sys.exit(1)" "$f"; then
+              echo "MISSING sys.exit(1): $f"
+              FAIL=$((FAIL+1))
+            fi
+          done < <(find smoke-tests -name "smoke.py")
+          if [ $FAIL -gt 0 ]; then
+            echo "FAIL: $FAIL smoke.py file(s) missing canonical CHECKS pattern"
+            exit 1
+          fi
+          echo "PASS: All $(find smoke-tests -name smoke.py | wc -l | tr -d ' ') smoke.py files follow CHECKS pattern"
+
+      - name: Validate blank fixtures contain no pre-existing OTel
+        run: |
+          FAIL=0
+          while IFS= read -r dir; do
+            for src in "$dir/app.py" "$dir/requirements.txt" "$dir/package.json"; do
+              if [ -f "$src" ] && grep -qi "opentelemetry\|elastic-apm\|ddtrace\|newrelic" "$src"; then
+                echo "FAIL: fixture already has instrumentation — $src"
+                FAIL=$((FAIL+1))
+              fi
+            done
+          done < <(find smoke-tests/*/fixtures -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+          if [ $FAIL -gt 0 ]; then
+            echo "FAIL: $FAIL fixture file(s) contain pre-existing instrumentation"
+            exit 1
+          fi
+          echo "PASS: All blank fixtures are clean"
+
+  # ── Job 2: Docker build check ────────────────────────────────────────────────
+  # Builds all reference app Docker images on every push and PR.
+  # Catches Dockerfile / pom.xml / requirements.txt errors before they hit main.
+  docker-build-check:
+    name: Docker Build Check (reference apps)
+    runs-on: ubuntu-latest
+    needs: syntax-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Python FastAPI image
+        run: docker build --no-cache -t edot-test-python tests/tier-a-python-fastapi/
+
+      - name: Build Node.js Express image
+        run: docker build --no-cache -t edot-test-nodejs tests/tier-a-nodejs-express/
+
+      - name: Build Java Spring Boot image
+        run: docker build --no-cache -t edot-test-java tests/tier-a-java-springboot/
+
+  # ── Job 3: SDK Integration Tests (Docker, no credentials) ───────────────────
+  # Builds and runs Java / Node.js / Python services against a local OTel
+  # Collector (file exporter). Validates real spans are produced.
+  # No Elastic credentials required.
+  sdk-integration:
+    name: SDK Integration Tests (Docker)
+    runs-on: ubuntu-latest
+    needs: docker-build-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run integration tests
+        working-directory: tests/integration
+        run: bash run.sh
+
+      - name: Upload collector output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collector-output
+          path: tests/integration/output/
+          if-no-files-found: ignore
+
+  # ── Job 4: Full smoke test suite ─────────────────────────────────────────────
   # Runs on push to main, workflow_dispatch, and nightly schedule.
   # Skipped on pull requests from forks (no access to secrets).
   smoke-tests:
     name: Smoke Tests (live Elastic)
     runs-on: ubuntu-latest
     needs: syntax-check
-    # Only run when Elastic credentials are available
     if: >
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
@@ -139,8 +231,8 @@ jobs:
           path: smoke-tests/*.log
           if-no-files-found: ignore
 
-  # ── Job 4: Telemetry contract validation ─────────────────────────────────────
-  # Runs on every push and PR. No Elastic credentials required — pure static analysis.
+  # ── Job 5: Telemetry contract validation ─────────────────────────────────────
+  # Runs on every push and PR. No credentials required — pure static analysis.
   # Validates that reference app source files satisfy their declared span attribute contracts.
   contract-check:
     name: Telemetry Contract Check
@@ -167,10 +259,10 @@ jobs:
           python -m py_compile tools/otel-contracts.py
           echo "PASS: otel-contracts.py compiles"
 
-  # ── Job 3: E2E Instrumentation Test ──────────────────────────────────────────
-  # Claude instruments a blank app from scratch → spans validated via local OTel Collector.
-  # Tests the full workflow end-to-end: blank fixture → AI instrumentation → real spans.
-  # Requires ANTHROPIC_API_KEY. No Elastic credentials needed.
+  # ── Job 6: E2E Instrumentation Test ──────────────────────────────────────────
+  # Claude (via Elastic EIS) instruments a blank app from scratch.
+  # Spans are validated via a local OTel Collector — no Elastic ingest needed.
+  # Uses EIS (Elastic Inference Service) via ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL.
   e2e-integration:
     name: E2E Instrumentation Test (Claude instruments blank app)
     runs-on: ubuntu-latest
@@ -181,6 +273,7 @@ jobs:
       github.event_name == 'schedule'
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -194,14 +287,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Check ANTHROPIC_API_KEY is set
+      - name: Check EIS credentials are set
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "SKIP: ANTHROPIC_API_KEY not configured — skipping E2E instrumentation test."
-            echo "      Add it in repo Settings → Secrets → Actions to enable this test."
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$ANTHROPIC_BASE_URL" ]; then
+            echo "SKIP: ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL not configured — skipping E2E test."
+            echo "      Add them in repo Settings → Secrets → Actions (use Elastic EIS credentials)."
             exit 0
           fi
-          echo "ANTHROPIC_API_KEY is set."
+          echo "EIS endpoint configured."
 
       - name: Run E2E instrumentation test
         run: python3 tests/e2e-integration/run.py
