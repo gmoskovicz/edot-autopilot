@@ -29,9 +29,10 @@ def make_handler(target: str, api_key: str) -> type:
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
 
-            # self.path includes the path + query string Claude Code sends,
-            # e.g. /v1/messages?beta=true
-            url = target.rstrip("/") + self.path
+            # Claude Code appends /v1/messages (and query params) to ANTHROPIC_BASE_URL.
+            # EIS expects POST directly to the inference endpoint with no extra path.
+            # Strip the Claude-added path and forward straight to the target URL.
+            url = target.rstrip("/")
 
             # Translate auth: drop x-api-key, inject Authorization: ApiKey
             headers: dict[str, str] = {
