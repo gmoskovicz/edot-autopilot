@@ -13,13 +13,13 @@ FROM eclipse-temurin:21-jre-jammy
 
 WORKDIR /app
 
-# Download Elastic EDOT Java agent (curl follows redirects reliably vs ADD)
-RUN curl -fsSL -o /app/elastic-otel-javaagent.jar \
-    https://github.com/elastic/elastic-otel-java/releases/latest/download/elastic-otel-javaagent.jar
+# Download upstream OTel Java agent (EDOT agent is on Maven Central, not GitHub releases)
+RUN curl -fsSL -o /app/opentelemetry-javaagent.jar \
+    https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
 
 COPY --from=build /build/target/edot-springboot-tier-a-1.0.0.jar app.jar
 
 # -javaagent injects EDOT auto-instrumentation at JVM startup — zero code changes needed
 CMD ["java", \
-     "-javaagent:/app/elastic-otel-javaagent.jar", \
+     "-javaagent:/app/opentelemetry-javaagent.jar", \
      "-jar", "app.jar"]
