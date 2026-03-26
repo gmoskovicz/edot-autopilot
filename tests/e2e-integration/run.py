@@ -219,6 +219,32 @@ try:
               "order.total", "total_usd", "payment.status",
           ]),
           "no business enrichment attributes found in app.py")
+
+    # SLOs grounded in code constants
+    slos_file = otel_dir / "slos.json"
+    slos_content = slos_file.read_text() if slos_file.exists() else ""
+    check(".otel/slos.json created", slos_file.exists())
+    check("SLOs reference business operations",
+          any(k in slos_content for k in [
+              "order", "payment", "fraud", "checkout",
+          ]),
+          f"slos.json:\n{slos_content[:300]}")
+
+    # Telemetry contracts
+    contracts_file = (otel_dir / "contracts.yaml")
+    check(".otel/contracts.yaml created", contracts_file.exists(),
+          "agent should generate a contracts.yaml with required span attributes")
+
+    # exception.escaped usage — critical for Elastic APM error visibility
+    check("record_exception used in app.py",
+          "record_exception" in app_content,
+          "no record_exception found — errors won't appear in Elastic APM error view")
+
+    # force_flush / atexit — prevents span loss on process exit
+    check("force_flush / atexit registered in app.py",
+          any(k in app_content for k in ["force_flush", "atexit"]),
+          "no force_flush or atexit found — spans may be lost on process exit")
+
     print()
 
 
