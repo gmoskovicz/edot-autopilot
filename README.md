@@ -1,4 +1,4 @@
-# EDOT Autopilot — OpenTelemetry Auto-Instrumentation for Any Language (Including COBOL, Perl, and Legacy Runtimes)
+# EDOT Autopilot — OpenTelemetry Autopilot for Any Codebase (Including COBOL, Perl, and Legacy Runtimes)
 
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-compatible-blue?logo=opentelemetry)](https://opentelemetry.io)
 [![Elastic EDOT](https://img.shields.io/badge/Elastic-EDOT-005571?logo=elastic)](https://www.elastic.co/docs/reference/opentelemetry)
@@ -7,7 +7,7 @@
 [![Languages](https://img.shields.io/badge/languages-65%2B-brightgreen)](smoke-tests/README.md)
 [![CI](https://github.com/gmoskovicz/edot-autopilot/actions/workflows/smoke-tests.yml/badge.svg)](https://github.com/gmoskovicz/edot-autopilot/actions/workflows/smoke-tests.yml)
 
-OpenTelemetry auto-instrumentation for any language — modern or legacy — powered by Elastic EDOT, with full support for runtimes that have no OTel SDK.
+**EDOT Autopilot** is an OpenTelemetry autopilot for any language — modern or legacy — powered by Elastic EDOT, with full support for runtimes that have no OTel SDK.
 
 ---
 
