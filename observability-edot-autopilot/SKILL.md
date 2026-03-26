@@ -243,6 +243,40 @@ Elastic APM to display it prominently at the top of the transaction detail.
 
 **Full enrichment examples:** see `references/enrichment-patterns.md`
 
+**Before the process exits**, always register a flush so the BatchSpanProcessor
+drains before shutdown. Default batch delay is 5 seconds — without this, spans
+generated in the last batch window are silently dropped:
+
+```python
+import atexit
+atexit.register(lambda: provider.force_flush(timeout_millis=5000))
+```
+
+---
+
+## Phase 3.5 — Generate Telemetry Contracts
+
+After Phase 3, generate `.otel/contracts.yaml` — a machine-readable record of what
+each golden path span is contractually required to carry. This locks in what was
+instrumented and lets CI catch regressions if a required attribute disappears.
+
+Generate one contract entry per golden path:
+
+```yaml
+contracts:
+  - span: order.create
+    service: fraud-detection
+    required_attributes:
+      - order.value_usd
+      - customer.tier
+      - fraud.score
+      - fraud.decision
+      - payment.status
+    forbidden_attributes:
+      - customer.email
+      - customer.name
+```
+
 ---
 
 ## Phase 4 — SLOs Grounded in Business Reality
@@ -300,6 +334,7 @@ At the end of this workflow, produce:
   README.md           — what was instrumented, decisions made, gaps remaining
   golden-paths.md     — business flows mapped to span names and attributes
   slos.json           — SLO definitions (version controlled)
+  contracts.yaml      — machine-readable span attribute contracts (validates in CI)
   coverage-report.md  — tier breakdown per component
 
 otel-sidecar.py       — generated only if Tier D components exist
