@@ -92,6 +92,8 @@ jobs:
 
       - name: Validate blank fixtures contain no pre-existing OTel
         run: |
+          # Only check single-tier tests (01–59). Tests 60+ are complex scenarios
+          # where fixtures may be partially instrumented by design (e.g. 88-pre-existing-otel).
           FAIL=0
           while IFS= read -r dir; do
             for src in "$dir/app.py" "$dir/requirements.txt" "$dir/package.json"; do
@@ -100,12 +102,13 @@ jobs:
                 FAIL=$((FAIL+1))
               fi
             done
-          done < <(find smoke-tests/*/fixtures -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+          done < <(find smoke-tests/0[0-9]-*/fixtures smoke-tests/[1-5][0-9]-*/fixtures \
+                        -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
           if [ $FAIL -gt 0 ]; then
             echo "FAIL: $FAIL fixture file(s) contain pre-existing instrumentation"
             exit 1
           fi
-          echo "PASS: All blank fixtures are clean"
+          echo "PASS: All single-tier blank fixtures are clean"
 
   # ── Job 2: Docker build check ────────────────────────────────────────────────
   # Builds all reference app Docker images on every push and PR.
