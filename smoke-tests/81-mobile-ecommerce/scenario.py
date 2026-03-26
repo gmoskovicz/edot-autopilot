@@ -162,10 +162,10 @@ CUSTOMERS = [
     {"id": "MCUST-PRO-001", "name": "Alice Fernandez",    "tier": "pro",        "email": "alice.f@startup.dev",    "fraud_history": 0, "credit_score": 745, "stored_payment": True},
     {"id": "MCUST-PRO-002", "name": "Bob Nakamura",       "tier": "pro",        "email": "bob.n@techco.jp",        "fraud_history": 0, "credit_score": 720, "stored_payment": True},
     {"id": "MCUST-PRO-003", "name": "Clara Santos",       "tier": "pro",        "email": "clara.s@design.br",      "fraud_history": 1, "credit_score": 690, "stored_payment": False},
-    {"id": "MCUST-FREE-001","name": "Dan Okafor",         "tier": "free",       "email": "dan.o@gmail.com",         "fraud_history": 0, "credit_score": 650, "stored_payment": False},
-    {"id": "MCUST-FREE-002","name": "Eva Müller",         "tier": "free",       "email": "eva.m@web.de",            "fraud_history": 0, "credit_score": 670, "stored_payment": False},
-    {"id": "MCUST-FREE-003","name": "Frank Osei",         "tier": "free",       "email": "frank.o@yahoo.com",       "fraud_history": 2, "credit_score": 590, "stored_payment": False},
-    {"id": "MCUST-SUSP-001","name": "Grace Anon",         "tier": "free",       "email": "grace@tempmail.xyz",      "fraud_history": 6, "credit_score": 410, "stored_payment": False},
+    {"id": "MCUST-FREE-001","name": "Dan Okafor",         "tier": "free",       "email": "dan.o@example.com",       "fraud_history": 0, "credit_score": 650, "stored_payment": False},
+    {"id": "MCUST-FREE-002","name": "Eva Müller",         "tier": "free",       "email": "eva.m@example.com",       "fraud_history": 0, "credit_score": 670, "stored_payment": False},
+    {"id": "MCUST-FREE-003","name": "Frank Osei",         "tier": "free",       "email": "frank.o@example.com",     "fraud_history": 2, "credit_score": 590, "stored_payment": False},
+    {"id": "MCUST-SUSP-001","name": "Grace Anon",         "tier": "free",       "email": "grace@tempmail.invalid",  "fraud_history": 6, "credit_score": 410, "stored_payment": False},
     {"id": "MCUST-GUEST-001","name": "Guest User",        "tier": "guest",      "email": "",                        "fraud_history": 0, "credit_score": 0,   "stored_payment": False},
 ]
 

@@ -34,6 +34,22 @@ If you need to run the sidecar in a shared environment where untrusted processes
 
 ---
 
+## Smoke Tests and `--dangerously-skip-permissions`
+
+The eval smoke tests under `smoke-tests/` invoke Claude Code with `--dangerously-skip-permissions`. This flag allows Claude to read and write files in the temporary workspace directory without prompting for approval on each action, which is required for fully automated eval runs.
+
+**This flag is intentional and scoped to isolated temp directories created by `tempfile.mkdtemp()`.** Each test creates a fresh temp dir, copies a blank fixture into it, runs the agent, inspects the result, and deletes the dir on success.
+
+Security properties of this design:
+- The temp directory is isolated from the rest of the filesystem by construction
+- The agent operates on the fixture app, not on your production code
+- No credentials other than the Elastic endpoint/key (required for telemetry export) are passed to the agent
+- `--dangerously-skip-permissions` does **not** grant network access beyond what the host already allows
+
+**Do not run the smoke tests with credentials that have write access to production Elastic indices.** Use a dedicated eval Elastic deployment or a scoped API key with `apm:write` only.
+
+---
+
 ## Reporting a Vulnerability
 
 If you discover a security issue in this project, please report it privately rather than opening a public GitHub issue.
