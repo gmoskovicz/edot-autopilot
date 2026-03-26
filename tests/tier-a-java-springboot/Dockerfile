@@ -13,8 +13,9 @@ FROM eclipse-temurin:21-jre-jammy
 
 WORKDIR /app
 
-# Download Elastic EDOT Java agent
-ADD https://github.com/elastic/elastic-otel-java/releases/latest/download/elastic-otel-javaagent.jar /app/elastic-otel-javaagent.jar
+# Download Elastic EDOT Java agent (curl follows redirects reliably vs ADD)
+RUN curl -fsSL -o /app/elastic-otel-javaagent.jar \
+    https://github.com/elastic/elastic-otel-java/releases/latest/download/elastic-otel-javaagent.jar
 
 COPY --from=build /build/target/edot-springboot-tier-a-1.0.0.jar app.jar
 

@@ -50,8 +50,9 @@ fi
 set -a && source .env && set +a
 
 if [ -z "${ELASTIC_OTLP_ENDPOINT:-}" ] || [ -z "${ELASTIC_API_KEY:-}" ]; then
-  fail "ELASTIC_OTLP_ENDPOINT or ELASTIC_API_KEY not set in .env"
-  exit 1
+  echo "SKIP: ELASTIC_OTLP_ENDPOINT / ELASTIC_API_KEY not configured — skipping live smoke tests."
+  echo "      Set them in smoke-tests/.env to run against a real Elastic deployment."
+  exit 0
 fi
 info "OTLP endpoint: ${ELASTIC_OTLP_ENDPOINT}"
 echo ""
