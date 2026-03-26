@@ -220,16 +220,17 @@ The following languages have no snippet yet. If you work with any of these, a co
 
 | Language | Notes |
 |---|---|
-| MUMPS / Cache | Used in healthcare systems (Epic, VistA). `%Net.HttpRequest` may be available. |
-| RPG (AS/400) | Used in manufacturing and finance on IBM i. `QzhbSendHTTP` or subprocess curl. |
-| Fortran | Scientific computing. `libcurl` Fortran bindings exist. |
+| MUMPS / Caché | Used in healthcare systems (Epic, VistA). `%Net.HttpRequest` may be available. |
 | REXX | IBM mainframe and OS/2 scripts. `rxsocket` or shell-out to curl. |
-| Tcl | Embedded in network appliances and legacy EDA tools. `http` package is stdlib. |
-| Erlang / Elixir | OTel SDK exists for Elixir but not all legacy Erlang versions. |
-| Haskell | OTel SDK is incomplete. `http-client` is available. |
+| Erlang (legacy) | OTel SDK exists for modern Elixir but not old Erlang/OTP versions. `httpc` is stdlib. |
+| Haskell | No complete OTel SDK. `http-client` or `wreq` available. |
 | OCaml | No OTel SDK. `cohttp` or `curl` bindings available. |
 | PHP 5 (legacy) | PHP 8 has OTel support but PHP 5 does not. `curl_exec` is available. |
-| Lua | Used in embedded systems and game engines. `socket.http` or `luasocket`. |
+| PL/I | Used in IBM mainframe financial systems. Shell-out to curl or `CEEGTST` socket API. |
+| Natural (Software AG) | Used in mainframe banking and insurance. `HTTP-GET`/`HTTP-POST` built-in available. |
+
+Already covered (smoke tests exist, no new snippet needed):
+RPG/AS400 · Fortran · Tcl · Lua · COBOL · Bash · Perl · PowerShell · Classic ASP · VBA/Excel · MATLAB · R · AWK · Delphi · ColdFusion · Julia · Nim · Ada · SAP ABAP
 
 ---
 
