@@ -10,11 +10,7 @@ services:
     ports:
       - "4317:4317"   # OTLP gRPC
       - "4318:4318"   # OTLP HTTP
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:13133/"]
-      interval: 3s
-      timeout: 5s
-      retries: 10
+      - "13133:13133" # health_check extension
 
   # ── Tier A: Python FastAPI ────────────────────────────────────────────────────
   tier-a-python:
@@ -29,8 +25,7 @@ services:
       OTEL_METRICS_EXPORTER: otlp
       OTEL_LOGS_EXPORTER: otlp
     depends_on:
-      collector:
-        condition: service_healthy
+      - collector
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8000/health"]
       interval: 5s
@@ -50,8 +45,7 @@ services:
       OTEL_METRICS_EXPORTER: otlp
       OTEL_LOGS_EXPORTER: otlp
     depends_on:
-      collector:
-        condition: service_healthy
+      - collector
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
       interval: 5s
@@ -73,8 +67,7 @@ services:
       OTEL_METRICS_EXPORTER: otlp
       OTEL_LOGS_EXPORTER: otlp
     depends_on:
-      collector:
-        condition: service_healthy
+      - collector
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
       interval: 10s

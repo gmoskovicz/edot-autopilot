@@ -45,6 +45,7 @@ echo ""
 
 info "Starting OTel Collector + all SDK services..."
 docker compose up -d
+sleep 5  # give the collector time to bind ports before health checks begin
 
 # ── Wait for all services to be healthy ───────────────────────────────────────
 wait_healthy() {
