@@ -72,25 +72,76 @@ try (Scope scope = span.makeCurrent()) {
 }
 ```
 
-### Node.js
+### Node.js — EDOT require hook (CRITICAL — read before writing any code)
+
+`@elastic/opentelemetry-node` is a **require hook**, not an importable module.
+It has no exported `NodeSDK` class. Importing it directly causes TypeScript errors.
 
 ```bash
-npm install @elastic/opentelemetry-node
+npm install @elastic/opentelemetry-node @opentelemetry/api
 ```
 
-```javascript
-// index.js — must be first import
-require('@elastic/opentelemetry-node');
-
-// Or via environment variable (no code change):
-// NODE_OPTIONS="--require @elastic/opentelemetry-node" node server.js
+**❌ WRONG — will fail with TypeScript errors:**
+```typescript
+import { NodeSDK } from '@elastic/opentelemetry-node'  // ← does not exist
+import { Resource } from '@opentelemetry/resources'     // ← not needed
+const sdk = new NodeSDK({ ... })
+sdk.start()
 ```
 
+**✅ CORRECT — wire via NODE_OPTIONS in package.json scripts:**
+```json
+{
+  "scripts": {
+    "dev":   "NODE_OPTIONS='--require dotenv/config --require @elastic/opentelemetry-node' ts-node-dev --respawn src/index.ts",
+    "start": "NODE_OPTIONS='--require dotenv/config --require @elastic/opentelemetry-node' node dist/index.js"
+  }
+}
+```
+
+**Why `--require dotenv/config` comes first:**
+The EDOT SDK initializes at require-time and reads `OTEL_EXPORTER_OTLP_ENDPOINT` from
+`process.env`. If your app loads env vars via `dotenv.config()` inside app code, those
+vars aren't set yet when the SDK starts — it silently falls back to `localhost:4318`.
+Loading `dotenv/config` first ensures the SDK sees the correct endpoint.
+
+> Note: `--env-file=.env` is NOT allowed in `NODE_OPTIONS` (Node.js blocks it for
+> security). Use `--require dotenv/config` instead.
+
+**`instrumentation.ts` — only export a tracer, no SDK setup:**
+```typescript
+// instrumentation.ts
+import { trace } from '@opentelemetry/api';
+export const tracer = trace.getTracer('my-service');
+// SDK is already running via NODE_OPTIONS — nothing else needed here
+```
+
+**Set these env vars in your `.env` file (backend only, not root):**
 ```bash
-# Environment variables
-export OTEL_SERVICE_NAME=my-node-service
-export OTEL_EXPORTER_OTLP_ENDPOINT=$ELASTIC_OTLP_ENDPOINT
-export OTEL_EXPORTER_OTLP_HEADERS="Authorization=ApiKey $ELASTIC_API_KEY"
+OTEL_SERVICE_NAME=my-node-service
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<deployment>.ingest.<region>.cloud.es.io:443
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=ApiKey <base64key>
+OTEL_DEPLOYMENT_ENVIRONMENT=production
+```
+
+**For manual spans, use `@opentelemetry/api` directly with `span.end()` in finally:**
+```typescript
+import { trace, SpanStatusCode } from '@opentelemetry/api';
+const tracer = trace.getTracer('my-service');
+
+tracer.startActiveSpan('order.create', async (span) => {
+  try {
+    span.setAttributes({ 'order.value_usd': order.total })
+    const result = await processOrder(order)
+    res.json(result)
+  } catch (err) {
+    span.recordException(err as Error)
+    span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) })
+    res.status(500).json({ error: (err as Error).message })
+  } finally {
+    span.end()  // ← REQUIRED — startActiveSpan does NOT auto-end
+  }
+})
 ```
 
 ### Go

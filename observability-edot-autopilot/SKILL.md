@@ -177,6 +177,35 @@ If the user says **yes**: continue to Phase 1.
 **Before writing a single line of instrumentation**, read the codebase to understand
 what it actually does. Do not skip this phase.
 
+### Step 0: Verify package versions before writing any package.json
+
+Never guess or extrapolate version numbers — models hallucinate versions that don't exist.
+Run these before generating any dependency list:
+
+```bash
+npm show @opentelemetry/api version
+npm show @elastic/opentelemetry-node version
+# Python
+pip index versions opentelemetry-sdk 2>/dev/null | head -1
+```
+
+Only use versions confirmed to exist. If a command fails, the package may not exist under that name.
+
+### Step 1: Detect framework from package.json BEFORE writing any code
+
+Read `package.json` (or equivalent manifest) first and check for these signals:
+
+| Signal in package.json | Runtime | Do NOT assume |
+|---|---|---|
+| `"expo"` or `"react-native"` | React Native/Expo | NOT Next.js |
+| `"next"` | Next.js | NOT plain Node.js |
+| `"express"` / `"fastify"` / `"koa"` | Node.js server | — |
+| `"django"` / `"flask"` / `"fastapi"` | Python server | — |
+
+Never infer framework from folder name alone.
+
+### Step 2: Perform full reconnaissance
+
 Perform a full reconnaissance:
 
 1. List every entry point: HTTP handlers, queue consumers, cron jobs, CLI commands,
@@ -287,6 +316,51 @@ would the on-call engineer know exactly what happened and what to do?"*
 - Async / queue flows must carry lag: `queue.depth`, `consumer.lag_ms`, `message.age_ms`
 - External dependency calls must carry SLA status: `dependency.sla_ms`,
   `dependency.sla_breached` (boolean)
+
+### span.end() — REQUIRED or spans are silently dropped
+
+`startActiveSpan` does **not** auto-end the span when the callback returns.
+Without `span.end()`, spans are created, child spans export fine, but the business
+span itself is never exported — invisible in Kibana with no error or warning.
+
+**Always use a `finally` block in every `startActiveSpan` callback:**
+
+```typescript
+// ❌ Wrong — child spans (ES, HTTP) appear in Kibana but product.search is MISSING
+tracer.startActiveSpan('product.search', async (span) => {
+  try {
+    const results = await esClient.search(...)
+    span.setAttributes({ 'search.results_count': results.length })
+    res.json(results)
+  } catch (err) {
+    span.recordException(err)
+    span.setStatus({ code: SpanStatusCode.ERROR })
+    res.status(500).json({ error: err.message })
+  }
+  // ← span.end() never called — span silently dropped
+})
+
+// ✅ Correct — span.end() guaranteed on every exit path
+tracer.startActiveSpan('product.search', async (span) => {
+  try {
+    const results = await esClient.search(...)
+    span.setAttributes({ 'search.results_count': results.length })
+    res.json(results)
+  } catch (err) {
+    span.recordException(err)
+    span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) })
+    res.status(500).json({ error: err.message })
+  } finally {
+    span.end()  // ← required on every startActiveSpan callback
+  }
+})
+```
+
+This applies to **every language**: TypeScript/JS, Java, Go, .NET. Python's
+`with tracer.start_as_current_span(...)` context manager handles this automatically —
+no `span.end()` needed in Python.
+
+---
 
 ### Error capture — the rule that makes errors visible in Elastic APM
 
