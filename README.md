@@ -477,26 +477,46 @@ An agentic `claude -p` run is a multi-turn conversation. Three things determine 
 2. **File reads** — Claude reads entry points, imported modules, config files, and business logic files selectively. It does not read the entire codebase. Typical read surface: 5–15% of total LOC.
 3. **Conversation history** — the largest driver. Each turn appends the previous turn's output to the input. A 20-turn session with a 30K-token history means ~600K total input tokens — even if the underlying codebase is small.
 
-### Estimates by project size (claude-sonnet-4-6)
+### Cost by lines of code (claude-sonnet-4-6)
 
 Pricing: $3 / 1M input tokens · $15 / 1M output tokens (as of early 2026)
 
-| Project size | LOC | Approx turns | Est. total input | Est. total output | **Approx cost** |
-|---|---|---|---|---|---|
-| Micro (single script) | < 500 | 8–12 | 200K | 12K | **$0.60–1.00** |
-| Small (single service) | 1K–5K | 12–20 | 500K | 25K | **$1.50–2.50** |
-| Medium (monolith / 3–5 services) | 10K–30K | 20–35 | 1.5M | 60K | **$4.50–7.50** |
-| Large (multi-repo / 10+ services) | 50K–200K | 35–60 | 4M | 120K | **$12–18** |
+| LOC | Sonnet 4.6 | Haiku 4.5 | Opus 4.6 |
+|-----|-----------|-----------|----------|
+| 200 | ~$0.65 | ~$0.17 | ~$3.25 |
+| 500 | ~$1.00 | ~$0.27 | ~$5.00 |
+| 1,000 | ~$1.30 | ~$0.35 | ~$6.50 |
+| 2,000 | ~$1.65 | ~$0.44 | ~$8.25 |
+| 5,000 | ~$2.10 | ~$0.56 | ~$10.50 |
+| 10,000 | ~$3.20 | ~$0.85 | ~$16.00 |
+| 30,000 | ~$4.50 | ~$1.20 | ~$22.50 |
+| 100,000 | ~$8.00 | ~$2.13 | ~$40.00 |
+| 200,000 | ~$10.70 | ~$2.85 | ~$53.50 |
 
-> These are estimates based on the token cost model above. Actual cost depends on how many entry points, how many Tier D components (sidecar generation adds output), and how deeply Claude needs to read to map business flows. The [E2E test](tests/e2e-integration/run.py) uses a $3.00 cap for the 177-LOC blank fixture — real cost for that size is roughly $0.70–1.20.
+> Multi-language or multi-service projects cost ~20–50% more than single-service projects of the same LOC, because reconnaissance requires more turns to map cross-service flows.
+
+### Formula
+
+Cost scales with LOC at roughly **LOC^0.4** — not linearly. Doubling the codebase doesn't double the cost because Claude reads selectively (~10–15% of total files).
+
+```
+cost_usd = 0.08 × LOC^0.4          # claude-sonnet-4-6
+cost_usd = 0.021 × LOC^0.4         # claude-haiku-4-5  (÷ 3.75)
+cost_usd = 0.40 × LOC^0.4          # claude-opus-4-6   (× 5)
+```
+
+Example — 6,200 LOC Node.js + React Native + scraper project:
+```
+0.08 × 6200^0.4 = 0.08 × 28.7 ≈ $2.30  (Sonnet)
+```
 
 ### Model comparison
 
-| Model | Relative cost | When to use |
+| Model | vs Sonnet | When to use |
 |---|---|---|
-| **claude-haiku-4-5** | ~10× cheaper | Quick instrumentation of simple, well-structured code |
-| **claude-sonnet-4-6** | baseline | Recommended — best balance for complex codebases |
-| **claude-opus-4-6** | ~5× more | Legacy codebases with poor naming, deep call graphs, unusual patterns |
+| **claude-haiku-4-5** | ÷ 3.75 | Simple, well-structured single-language codebases |
+| **claude-sonnet-4-6** | baseline | Recommended for most projects |
+| **claude-opus-4-6** | × 5 | Legacy codebases with poor naming, deep call graphs, Tier D components |
 
 ### How to cap and measure
 
