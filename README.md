@@ -156,164 +156,41 @@ To run against a real GPU, replace the mock in `51-tier-c-cuda-nvml/smoke.py` wi
 
 ## The sidecar: what makes "any language" real
 
-`otel-sidecar/otel-sidecar.py` is a universal telemetry bridge. Any process that can make
-an HTTP POST can emit spans, logs, and metrics to Elastic APM — zero changes to the legacy binary.
+[`otel-sidecar/otel-sidecar.py`](otel-sidecar/README.md) is a tiny HTTP server. Any process that can POST to `localhost:9411` emits spans to Elastic — no SDK, no changes to the legacy binary. Supports `event`, `start_span`, `end_span`, `log`, `metric_counter`, `metric_gauge`, `metric_histogram`.
 
 ```
-[COBOL on AIX]   --curl--> [sidecar:9411] --OTLP--> [Elastic Cloud]
-[SAP ABAP]       --http--> [sidecar:9411] --OTLP--> [Elastic Cloud]
-[Bash script]    --curl--> [sidecar:9411] --OTLP--> [Elastic Cloud]
-[PowerShell]     --http--> [sidecar:9411] --OTLP--> [Elastic Cloud]
+[COBOL / SAP ABAP / IBM RPG / Bash / PowerShell]
+        --HTTP POST--> [sidecar:9411] --OTLP--> [Elastic Cloud]
 ```
-
-Supported actions: `event`, `start_span`, `end_span`, `log`, `metric_counter`,
-`metric_gauge`, `metric_histogram`. See [`otel-sidecar/README.md`](otel-sidecar/README.md).
 
 ---
 
-## Kubernetes: zero-touch instrumentation with the OTel Operator
+## Kubernetes
 
-For cloud-native services running in Kubernetes, the
-[OpenTelemetry Operator](https://github.com/open-telemetry/opentelemetry-operator)
-can auto-inject instrumentation into pods without touching application code at all.
-
-### Install the operator
-
-```bash
-kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml
-```
-
-### Create an Instrumentation resource pointing at Elastic
+Add one annotation to any pod — the [OTel Operator](https://github.com/open-telemetry/opentelemetry-operator) injects the agent as an init container, zero code changes:
 
 ```yaml
-apiVersion: opentelemetry.io/v1alpha1
-kind: Instrumentation
-metadata:
-  name: edot-instrumentation
-  namespace: default
-spec:
-  exporter:
-    endpoint: https://<deployment>.apm.<region>.cloud.es.io
+annotations:
+  instrumentation.opentelemetry.io/inject-python: "true"  # or java / nodejs / dotnet
+```
+
+For Tier D workloads the operator can't inject, run the sidecar as a container in the same pod:
+
+```yaml
+- name: otel-sidecar
+  image: gmoskovicz/edot-autopilot-sidecar:latest
   env:
-    - name: OTEL_EXPORTER_OTLP_HEADERS
-      valueFrom:
-        secretKeyRef:
-          name: elastic-otel-secret
-          key: headers
-  propagators:
-    - tracecontext
-    - baggage
-    - b3
-  sampler:
-    type: parentbased_traceidratio
-    argument: "1.0"
-  python:
-    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:latest
-  java:
-    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest
-  nodejs:
-    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-nodejs:latest
-  dotnet:
-    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-dotnet:latest
-```
-
-### Annotate your deployments — no code changes needed
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-python-api
-spec:
-  template:
-    metadata:
-      annotations:
-        instrumentation.opentelemetry.io/inject-python: "true"
-        # For Java:  instrumentation.opentelemetry.io/inject-java: "true"
-        # For Node:  instrumentation.opentelemetry.io/inject-nodejs: "true"
-        # For .NET:  instrumentation.opentelemetry.io/inject-dotnet: "true"
-```
-
-The operator injects the EDOT agent as an init container. Your pod restarts once
-and begins sending traces, metrics, and logs to Elastic — zero application changes.
-
-For legacy workloads in Kubernetes that the operator cannot inject (Tier D),
-run the `otel-sidecar` as a sidecar container in the same pod:
-
-```yaml
-containers:
-  - name: legacy-app
-    image: my-legacy-app
-  - name: otel-sidecar
-    image: gmoskovicz/edot-autopilot-sidecar:latest
-    env:
-      - name: OTEL_SERVICE_NAME
-        value: legacy-app
-    envFrom:
-      - secretRef:
-          name: elastic-otel-secret
+    - name: OTEL_SERVICE_NAME
+      value: legacy-app
+  envFrom:
+    - secretRef: { name: elastic-otel-secret }
 ```
 
 ---
 
-## AWS Lambda: serverless observability
+## AWS Lambda
 
-AWS Lambda has official OTel support via the
-[AWS Distro for OpenTelemetry (ADOT) Lambda layer](https://aws-otel.github.io/docs/getting-started/lambda).
-Configure it to send directly to Elastic:
-
-```bash
-# Add the ADOT layer to your Lambda function
-aws lambda update-function-configuration \
-  --function-name my-function \
-  --layers arn:aws:lambda:<region>:901920570463:layer:aws-otel-python-<arch>-ver-1-x-x:1
-
-# Set environment variables
-aws lambda update-function-configuration \
-  --function-name my-function \
-  --environment "Variables={
-    OPENTELEMETRY_COLLECTOR_CONFIG_URI=/var/task/collector.yaml,
-    OTEL_SERVICE_NAME=my-lambda-function,
-    OTEL_DEPLOYMENT_ENVIRONMENT=production
-  }"
-```
-
-**`collector.yaml`** (bundled with your Lambda deployment package):
-
-```yaml
-receivers:
-  otlp:
-    protocols:
-      grpc:
-        endpoint: localhost:4317
-
-exporters:
-  otlphttp:
-    endpoint: https://<deployment>.apm.<region>.cloud.es.io
-    headers:
-      Authorization: "ApiKey <your-api-key>"
-
-service:
-  pipelines:
-    traces:
-      receivers: [otlp]
-      exporters: [otlphttp]
-    metrics:
-      receivers: [otlp]
-      exporters: [otlphttp]
-```
-
-**Key Lambda-specific attributes to set:**
-
-```python
-span.set_attribute("faas.trigger",        "http")        # or timer/pubsub/datasource
-span.set_attribute("faas.invocation_id",  context.aws_request_id)
-span.set_attribute("cloud.provider",      "aws")
-span.set_attribute("cloud.region",        os.environ["AWS_REGION"])
-span.set_attribute("faas.name",           os.environ["AWS_LAMBDA_FUNCTION_NAME"])
-span.set_attribute("faas.version",        os.environ["AWS_LAMBDA_FUNCTION_VERSION"])
-span.set_attribute("faas.coldstart",      is_cold_start)  # track cold starts explicitly
-```
+Use the [ADOT Lambda layer](https://aws-otel.github.io/docs/getting-started/lambda) with an `otlphttp` exporter pointing at your Elastic endpoint. Key attributes: `faas.trigger`, `faas.invocation_id`, `faas.coldstart`, `cloud.region`.
 
 ---
 
