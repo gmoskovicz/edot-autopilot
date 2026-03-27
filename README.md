@@ -134,63 +134,15 @@ docker compose --env-file .env up --abort-on-container-exit
 
 ---
 
-## NVIDIA GPU / CUDA observability
+## Platform coverage
 
-Two dedicated tests instrument GPU workloads end-to-end:
+**Legacy runtimes (Tier D)** — [`otel-sidecar/`](otel-sidecar/README.md) is a tiny HTTP server at `localhost:9411`. Any process that can make an HTTP POST (COBOL, SAP ABAP, IBM RPG, Bash, PowerShell) emits spans to Elastic with no SDK and no binary changes.
 
-**`51-tier-c-cuda-nvml`** — monkey-patches `nvidia-ml-py` to capture LLM inference telemetry:
-- Traces: `cuda.kernel.prefill`, `cuda.kernel.decode`, `cuda.htod_transfer`
-- Metrics: `hw.gpu.utilization`, `hw.gpu.memory.usage` (official OTel `hw.gpu.*` semconv)
-  plus `gpu.temperature_c`, `gpu.power_usage_w`, `gpu.sm_clock_mhz`
-- Logs: per-request events with `llm.tokens_per_second`, `gpu.uuid`, `gpu.power_w`
+**Kubernetes** — add one pod annotation; the [OTel Operator](https://github.com/open-telemetry/opentelemetry-operator) injects the agent automatically (`inject-python`, `inject-java`, `inject-nodejs`, `inject-dotnet`). For Tier D pods, run the sidecar as a second container in the same pod.
 
-**`52-tier-d-dcgm-exporter`** — simulates the DCGM Exporter → OTel Collector → Elastic pipeline
-for a 4× H100 distributed training job:
-- Metrics: `dcgm.tensor_pipe_active`, `dcgm.nvlink_bandwidth_gbps`, `dcgm.xid_errors`,
-  `training.loss`, `training.samples_per_sec`
+**AWS Lambda** — use the [ADOT Lambda layer](https://aws-otel.github.io/docs/getting-started/lambda) with an `otlphttp` exporter pointing at your Elastic endpoint.
 
-To run against a real GPU, replace the mock in `51-tier-c-cuda-nvml/smoke.py` with
-`import pynvml; pynvml.nvmlInit()` — the instrumentation layer is unchanged.
-
----
-
-## The sidecar: what makes "any language" real
-
-[`otel-sidecar/otel-sidecar.py`](otel-sidecar/README.md) is a tiny HTTP server. Any process that can POST to `localhost:9411` emits spans to Elastic — no SDK, no changes to the legacy binary. Supports `event`, `start_span`, `end_span`, `log`, `metric_counter`, `metric_gauge`, `metric_histogram`.
-
-```
-[COBOL / SAP ABAP / IBM RPG / Bash / PowerShell]
-        --HTTP POST--> [sidecar:9411] --OTLP--> [Elastic Cloud]
-```
-
----
-
-## Kubernetes
-
-Add one annotation to any pod — the [OTel Operator](https://github.com/open-telemetry/opentelemetry-operator) injects the agent as an init container, zero code changes:
-
-```yaml
-annotations:
-  instrumentation.opentelemetry.io/inject-python: "true"  # or java / nodejs / dotnet
-```
-
-For Tier D workloads the operator can't inject, run the sidecar as a container in the same pod:
-
-```yaml
-- name: otel-sidecar
-  image: gmoskovicz/edot-autopilot-sidecar:latest
-  env:
-    - name: OTEL_SERVICE_NAME
-      value: legacy-app
-  envFrom:
-    - secretRef: { name: elastic-otel-secret }
-```
-
----
-
-## AWS Lambda
-
-Use the [ADOT Lambda layer](https://aws-otel.github.io/docs/getting-started/lambda) with an `otlphttp` exporter pointing at your Elastic endpoint. Key attributes: `faas.trigger`, `faas.invocation_id`, `faas.coldstart`, `cloud.region`.
+**NVIDIA GPU / CUDA** — two smoke tests cover GPU workloads: `51-tier-c-cuda-nvml` monkey-patches `nvidia-ml-py` for LLM inference traces and `hw.gpu.*` metrics; `52-tier-d-dcgm-exporter` covers the DCGM → Collector → Elastic pipeline for multi-GPU training jobs.
 
 ---
 
