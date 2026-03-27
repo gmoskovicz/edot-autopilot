@@ -129,6 +129,35 @@ If the user says **yes**: continue to Phase 1.
 **Before writing a single line of instrumentation code**, read the codebase to understand
 what it actually does. Do not skip this phase. Generic instrumentation is worthless.
 
+### Step 0: Verify package versions before writing any package.json
+
+Never guess or extrapolate version numbers — models hallucinate versions that don't exist.
+Run these before generating any dependency list:
+
+```bash
+npm show @opentelemetry/api version
+npm show @elastic/opentelemetry-node version
+# Python
+pip index versions opentelemetry-sdk 2>/dev/null | head -1
+```
+
+Only use versions confirmed to exist. If a command fails, the package may not exist under that name.
+
+### Step 1: Detect framework from package.json BEFORE writing any code
+
+Read `package.json` (or equivalent manifest) and check for these signals:
+
+| Signal in package.json | Runtime | Do NOT assume |
+|---|---|---|
+| `"expo"` or `"react-native"` | React Native/Expo | NOT Next.js |
+| `"next"` | Next.js | NOT plain Node.js |
+| `"express"` / `"fastify"` / `"koa"` | Node.js server | — |
+| `"django"` / `"flask"` / `"fastapi"` | Python server | — |
+
+Never infer framework from folder name alone.
+
+### Step 2: Perform full reconnaissance
+
 Perform a full reconnaissance:
 
 ```
@@ -196,12 +225,31 @@ Frameworks with zero-config auto-instrumentation:
 
 Action: Apply EDOT SDK with `edot-bootstrap` / `-javaagent` / `require()`. Done.
 
+> **Node.js EDOT — CRITICAL: it is a require hook, not an importable module.**
+> `import { NodeSDK } from '@elastic/opentelemetry-node'` does not work — there is no exported `NodeSDK` class.
+> Wire it via `NODE_OPTIONS` in `package.json` scripts instead:
+>
+> ```json
+> "dev":   "NODE_OPTIONS='--require dotenv/config --require @elastic/opentelemetry-node' ts-node-dev --respawn src/index.ts",
+> "start": "NODE_OPTIONS='--require dotenv/config --require @elastic/opentelemetry-node' node dist/index.js"
+> ```
+>
+> `--require dotenv/config` **must come first**: the EDOT SDK reads `OTEL_EXPORTER_OTLP_ENDPOINT` from `process.env`
+> at require-time, before any app code runs. If dotenv hasn't loaded yet, the SDK silently falls back to `localhost:4318`.
+> Note: `--env-file=.env` is NOT allowed in `NODE_OPTIONS` (Node.js blocks it for security) — use `dotenv/config` instead.
+>
+> `instrumentation.ts` should only export a tracer — no SDK setup needed:
+> ```typescript
+> import { trace } from '@opentelemetry/api';
+> export const tracer = trace.getTracer('my-service');
+> ```
+
 **Exact packages to install:**
 
 | Language | Install command | Auto-instrument command |
 |----------|----------------|------------------------|
 | Python | `pip install opentelemetry-distro opentelemetry-exporter-otlp` then `opentelemetry-bootstrap -a install` | `opentelemetry-instrument python app.py` |
-| Node.js | `npm install @opentelemetry/sdk-node @opentelemetry/auto-instrumentations-node @opentelemetry/exporter-trace-otlp-http` | require at startup or `--require ./tracing.js` |
+| Node.js | `npm install @elastic/opentelemetry-node @opentelemetry/api` | see Node.js EDOT note below |
 | Java | Download `elastic-otel-javaagent.jar` | `java -javaagent:elastic-otel-javaagent.jar -jar app.jar` |
 | .NET 6+ | `dotnet add package Elastic.Apm` + `AddElasticApm()` in Program.cs | built into SDK |
 | Go | `go get go.opentelemetry.io/otel go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc go.opentelemetry.io/contrib/instrumentation/...` | manual init + per-framework contrib package |
@@ -525,6 +573,48 @@ would need during an incident.
 - Async / queue flows must carry lag: `queue.depth`, `consumer.lag_ms`, `message.age_ms`
 - External dependency calls must carry SLA status:
   `dependency.sla_ms`, `dependency.sla_breached` (boolean)
+
+### span.end() — REQUIRED or spans are silently dropped
+
+`startActiveSpan` does **not** auto-end the span when the callback returns.
+Without `span.end()`, the business span is created and child spans export fine,
+but the parent span itself is silently dropped — invisible in Kibana, no warning.
+
+**Always use a `finally` block in every `startActiveSpan` callback:**
+
+```typescript
+// ❌ Wrong — child spans appear in Kibana but this span is MISSING
+tracer.startActiveSpan('order.create', async (span) => {
+  try {
+    const result = await processOrder(order)
+    res.json(result)
+  } catch (err) {
+    span.recordException(err as Error)
+    span.setStatus({ code: SpanStatusCode.ERROR })
+    res.status(500).json({ error: (err as Error).message })
+  }
+  // ← span.end() never called — span silently dropped
+})
+
+// ✅ Correct
+tracer.startActiveSpan('order.create', async (span) => {
+  try {
+    const result = await processOrder(order)
+    res.json(result)
+  } catch (err) {
+    span.recordException(err as Error)
+    span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) })
+    res.status(500).json({ error: (err as Error).message })
+  } finally {
+    span.end()  // ← required on every startActiveSpan callback
+  }
+})
+```
+
+This applies to TypeScript/JS, Java, Go, and .NET.
+Python's `with tracer.start_as_current_span(...)` handles this automatically — no `span.end()` needed.
+
+---
 
 ### Error Capture — the rule that makes errors visible in Elastic APM
 
