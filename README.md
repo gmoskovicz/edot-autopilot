@@ -393,75 +393,15 @@ FROM traces-apm*
 
 ## Repository structure
 
-```
-edot-autopilot/
-│
-├── observability-edot-autopilot/     # AI skill package (agentskills.io spec)
-│   ├── SKILL.md                      #   Agent-agnostic instructions for all coding assistants
-│   ├── references/
-│   │   ├── semconv-conventions.md    #   OTel semconv cheatsheet — agents read this first
-│   │   ├── tier-guide.md             #   Full code for Tier A–C (Python, Java, Node, Go, .NET)
-│   │   ├── sidecar-callers.md        #   COBOL, Perl, Bash, PowerShell, Classic ASP snippets
-│   │   └── enrichment-patterns.md   #   Span events, observable gauges, span links, CWV
-│   ├── scripts/                      #   o11y_bootstrap.py + otel-sidecar.py
-│   └── assets/                       #   Docker Compose + .env template
-│
-├── CLAUDE.md                         # Claude Code–specific version (drop into any repo)
-├── llms.txt                          # LLM-readable project summary (agentskills.io standard)
-├── README.md                         # This file
-├── .env.example                      # Credentials template
-│
-├── otel-sidecar/                     # Universal Tier D bridge (traces + logs + metrics)
-│   ├── otel-sidecar.py
-│   ├── Dockerfile
-│   └── README.md
-│
-├── smoke-tests/                      # 82 smoke tests — all 4 tiers, 65+ technologies
-│   ├── run-all.sh                    #   Run everything locally
-│   ├── requirements.txt              #   All Python dependencies for the suite
-│   ├── docker-compose.yml            #   Full suite with Docker profiles
-│   ├── o11y_bootstrap.py             #   Shared helper: tracer + logger + meter
-│   │
-│   ├── 01-tier-a-python/             #   Tier A: Python (real SDK)
-│   ├── 02-tier-a-nodejs/             #   Tier A: Node.js (real SDK, multi-service, 25 scenarios)
-│   ├── 08–12-tier-a-*/               #   Tier A: Java / Go / Ruby / .NET / PHP (instrumentation pattern tests)
-│   ├── 03,13–19-tier-b-*/            #   Tier B: Flask / Django / Tornado / Bottle …
-│   ├── 04,20–32,51-tier-c-*/         #   Tier C: Stripe / Twilio / boto3 / CUDA …
-│   ├── 05,33–52-tier-d-*/            #   Tier D: COBOL / SAP / MATLAB / DCGM …
-│   ├── 07-cross-tier-full-o11y/      #   A→B→C→D with shared trace_id
-│   ├── 06-verify/                    #   OTLP ping + ES content verification
-│   │
-│   ├── 60-ecommerce/                 #   9-service checkout platform (30 scenarios)
-│   ├── 61-auth-platform/             #   7-service auth stack (25 scenarios)
-│   ├── 62-data-pipeline/             #   7-service ETL pipeline (14 scenarios)
-│   ├── 63-ml-inference/              #   7-service ML serving (25 scenarios)
-│   ├── 64-saas-ops/                  #   7-service SaaS platform (25 scenarios)
-│   ├── 65–70-mobile-*/              #   Mobile: React Native / Flutter / iOS / Android / MAUI / Ionic
-│   ├── 71–75-web-*/                 #   Web RUM: React / Next.js / Vue / Angular / Svelte
-│   ├── 76–80-web-*/                 #   Backends: NestJS / Gin / Rails / FastAPI / HTMX
-│   ├── 81-mobile-ecommerce/         #   9-service mobile e-commerce scenario
-│   └── 82–85-e2e-*/                 #   E2E workflow verification (real apps, InMemory + Elastic)
-│
-├── tests/
-│   └── integration/                  # Real SDK tests — Java + Node.js + Python in Docker
-│       ├── docker-compose.yml        #   Collector + real app containers
-│       ├── otel-collector-config.yml #   File exporter (no Elastic credentials needed)
-│       ├── validate.py               #   Parses collector JSONL, asserts span shapes
-│       └── run.sh                    #   Build → start → traffic → validate → teardown
-│
-└── docs/                             # Per-language OpenTelemetry guides (SEO pages)
-    ├── opentelemetry-cobol.md
-    ├── opentelemetry-perl.md
-    ├── opentelemetry-bash-shell-scripts.md
-    ├── opentelemetry-powershell.md
-    ├── opentelemetry-classic-asp-vbscript.md
-    ├── opentelemetry-dotnet-framework-4x.md
-    ├── opentelemetry-python2.md
-    ├── telemetry-sidecar-pattern.md
-    ├── business-span-enrichment.md
-    ├── opentelemetry-sap-abap.md
-    └── opentelemetry-ibm-rpg.md
-```
+| Directory | Purpose |
+|---|---|
+| `observability-edot-autopilot/` | AI skill package — drop-in for Claude Code, Cursor, Copilot, Gemini CLI, and any agentskills.io-compatible agent |
+| `CLAUDE.md` | Claude Code–specific version — drop into any repo root and run `Observe this project.` |
+| `otel-sidecar/` | Universal Tier D bridge — HTTP server that translates legacy HTTP POSTs into OTLP spans |
+| `smoke-tests/` | 86 eval tests across all 4 tiers and 65+ technologies (single-language → multi-service → mobile → E2E) |
+| `tests/integration/` | Real SDK integration tests — Java, Node.js, Python running in Docker against a local OTel Collector |
+| `docs/` | Per-language OpenTelemetry guides for runtimes no other tool covers (COBOL, SAP ABAP, IBM RPG, Perl, PowerShell…) |
+| `tools/` | `otel-contracts.py` — CLI validator for telemetry contracts in CI |
 
 ---
 
