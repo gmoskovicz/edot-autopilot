@@ -560,6 +560,23 @@ For each one, add business-meaningful attributes to the spans — not just HTTP 
 latencies, but the data a VP of Engineering, a product manager, or a support engineer
 would need during an incident.
 
+**The test for every attribute:** *"Does this help a product manager or on-call engineer understand what happened to a real user?"*
+
+Input parameters alone (`search.query`, `user.id`) do not pass this test — any HTTP log already has them.
+The response shape is where business context lives: what was returned, how complete it was, how fresh, how much it cost.
+
+**For every Golden Path, read the response object and instrument from it:**
+
+```
+search handler   → results_count, store_count, stores, price_min, price_max, data_age_hours, cache_hit
+checkout handler → order.value_usd, item_count, payment.method, fraud.score, inventory.all_reserved
+feed/list handler → items_returned, items_total, filter_applied, sort_applied, empty_result
+async job        → items_processed, items_failed, duration_ms, lag_behind_schedule_ms
+```
+
+A span with only input attributes (`search.query: "leche"`) is not business context.
+A span with output attributes (`search.results_count: 0, search.cache_hit: false`) is.
+
 **Rules:**
 
 - Revenue-bearing flows must carry value: `order.value_usd`, `subscription.mrr`,
