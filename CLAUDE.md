@@ -51,10 +51,24 @@ Run the following to count lines in all source files (exclude dependencies, buil
 
 ```bash
 find . \
-  \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.tsx" -o -name "*.jsx" \
-     -o -name "*.java" -o -name "*.go" -o -name "*.rb" -o -name "*.php" \
-     -o -name "*.cs" -o -name "*.cpp" -o -name "*.c" -o -name "*.rs" \
-     -o -name "*.cob" -o -name "*.cbl" -o -name "*.pl" -o -name "*.sh" \) \
+  \( \
+    -name "*.py"   -o -name "*.js"   -o -name "*.ts"   -o -name "*.tsx"  -o -name "*.jsx"  \
+    -o -name "*.java" -o -name "*.kt" -o -name "*.kts" -o -name "*.scala" \
+    -o -name "*.go"   -o -name "*.rs" -o -name "*.swift" \
+    -o -name "*.rb"   -o -name "*.php" -o -name "*.cs"  -o -name "*.vb"  \
+    -o -name "*.cpp"  -o -name "*.cc" -o -name "*.cxx"  -o -name "*.c"   -o -name "*.h"  \
+    -o -name "*.m"    -o -name "*.mm" \
+    -o -name "*.lua"  -o -name "*.tcl" -o -name "*.pl"  -o -name "*.pm"  \
+    -o -name "*.r"    -o -name "*.R"   -o -name "*.jl"  \
+    -o -name "*.ex"   -o -name "*.exs" -o -name "*.erl" -o -name "*.hrl" \
+    -o -name "*.hs"   -o -name "*.ml"  -o -name "*.mli" \
+    -o -name "*.sh"   -o -name "*.bash" -o -name "*.zsh" -o -name "*.ps1" \
+    -o -name "*.cob"  -o -name "*.cbl" -o -name "*.cpy" \
+    -o -name "*.f"    -o -name "*.f90" -o -name "*.for" \
+    -o -name "*.abap" -o -name "*.rpgle" -o -name "*.sqlrpgle" \
+    -o -name "*.asp"  -o -name "*.aspx" -o -name "*.cfm" \
+    -o -name "*.dart" -o -name "*.nim"  -o -name "*.ada" -o -name "*.adb" \
+  \) \
   -not -path "*/node_modules/*" \
   -not -path "*/.git/*" \
   -not -path "*/vendor/*" \
@@ -62,6 +76,9 @@ find . \
   -not -path "*/build/*" \
   -not -path "*/__pycache__/*" \
   -not -path "*/target/*" \
+  -not -path "*/.expo/*" \
+  -not -path "*/generated/*" \
+  -not -path "*/*.min.js" \
   | xargs wc -l 2>/dev/null | tail -1
 ```
 
