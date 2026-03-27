@@ -58,7 +58,7 @@ The agent reads the codebase, assigns each component to the right instrumentatio
 | `scripts/otel-sidecar.py` | HTTP-to-OTLP bridge for legacy runtimes |
 | `assets/docker-compose-sidecar.yml` | Tier D Docker deployment with healthcheck |
 
-> Not using an AI assistant? Drop [`CLAUDE.md`](CLAUDE.md) into any repo root for the same workflow in Claude Code specifically.
+> The skill is the single source of truth — install it once and use it across any compatible agent.
 
 ---
 
@@ -224,8 +224,7 @@ FROM traces-apm*
 
 | Directory | Purpose |
 |---|---|
-| `observability-edot-autopilot/` | AI skill package — drop-in for Claude Code, Cursor, Copilot, Gemini CLI, and any agentskills.io-compatible agent |
-| `CLAUDE.md` | Claude Code–specific version — drop into any repo root and run `Observe this project.` |
+| `observability-edot-autopilot/` | AI skill package — single source of truth for Claude Code, Cursor, Copilot, Gemini CLI, and any agentskills.io-compatible agent |
 | `otel-sidecar/` | Universal Tier D bridge — HTTP server that translates legacy HTTP POSTs into OTLP spans |
 | `smoke-tests/` | 86 eval tests across all 4 tiers and 65+ technologies (single-language → multi-service → mobile → E2E) |
 | `tests/integration/` | Real SDK integration tests — Java, Node.js, Python running in Docker against a local OTel Collector |
@@ -242,7 +241,7 @@ This is a one-time cost — paid once when you instrument the project, not on ev
 
 An agentic `claude -p` run is a multi-turn conversation. Three things determine how many tokens are consumed:
 
-1. **CLAUDE.md** — ~8,000 tokens, loaded as context on every turn (prompt-cached after the first at ~10× discount)
+1. **SKILL.md** — ~8,000 tokens, loaded as context on every turn (prompt-cached after the first at ~10× discount)
 2. **File reads** — Claude reads entry points, imported modules, config files, and business logic files selectively. It does not read the entire codebase. Typical read surface: 5–15% of total LOC.
 3. **Conversation history** — the largest driver. Each turn appends the previous turn's output to the input. A 20-turn session with a 30K-token history means ~600K total input tokens — even if the underlying codebase is small.
 
@@ -345,7 +344,7 @@ Create an API key in Elastic Cloud → Stack Management → API Keys, set the `A
 Use `span.set_attribute("order.value_usd", 249.99)` for any data with business meaning. Standard auto-instrumentation captures `http.status_code=200`. Business-enriched instrumentation captures `customer.tier=enterprise`, `fraud.score=0.23`, `payment.method=amex`, `order.items_count=3`. See [`observability-edot-autopilot/references/enrichment-patterns.md`](observability-edot-autopilot/references/enrichment-patterns.md) for patterns across e-commerce, auth, ML inference, SaaS ops, and data pipeline domains.
 
 ### Which AI coding assistants does this work with?
-Claude Code, Cursor, GitHub Copilot, Gemini CLI, Windsurf, Roo, Cline, Codex — any agent that supports the [agentskills.io](https://agentskills.io) open skill specification. Install with `npx skills add gmoskovicz/edot-autopilot/observability-edot-autopilot`. For Claude Code specifically, you can also drop [`CLAUDE.md`](CLAUDE.md) directly into your repo root.
+Claude Code, Cursor, GitHub Copilot, Gemini CLI, Windsurf, Roo, Cline, Codex — any agent that supports the [agentskills.io](https://agentskills.io) open skill specification. Install with `npx skills add gmoskovicz/edot-autopilot/observability-edot-autopilot`.
 
 ### How do I add OpenTelemetry to SAP ABAP?
 
