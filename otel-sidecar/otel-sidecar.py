@@ -24,6 +24,11 @@ Environment variables:
   SERVICE_VERSION             (default: unknown)
   SIDECAR_PORT                (default: 9411)
   SIDECAR_HOST                (default: 127.0.0.1)
+  SIDECAR_LANGUAGE            (optional) — overrides telemetry.sdk.language so Elastic APM
+                              shows the real originating language (e.g. abap, cobol, rpg)
+                              instead of python. Also sets process.runtime.name.
+  SIDECAR_RUNTIME_NAME        (optional) — human-readable runtime label shown in Elastic
+                              (e.g. "SAP ABAP 7.52"). Defaults to SIDECAR_LANGUAGE uppercased.
 """
 
 import os
@@ -56,12 +61,22 @@ log = logging.getLogger("otel-sidecar")
 
 # ── Bootstrap OTel providers ──────────────────────────────────────────────────
 
-resource = Resource.create({
+_resource_attrs: dict = {
     "service.name":                os.environ["OTEL_SERVICE_NAME"],
     "service.version":             os.environ.get("SERVICE_VERSION", "unknown"),
     "service.instance.id":         str(uuid.uuid4()),
     "deployment.environment.name": os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "production"),
-})
+}
+# Tier D runtimes (ABAP, COBOL, RPG, etc.) are bridged through this Python sidecar
+# but should appear as their actual language in the Elastic APM UI, not as Python.
+# Set SIDECAR_LANGUAGE to override telemetry.sdk.language (e.g. "abap", "cobol", "rpg").
+if _lang := os.environ.get("SIDECAR_LANGUAGE"):
+    _resource_attrs["telemetry.sdk.language"] = _lang
+    _resource_attrs["process.runtime.name"] = os.environ.get(
+        "SIDECAR_RUNTIME_NAME", _lang.upper()
+    )
+
+resource = Resource.create(_resource_attrs)
 
 otlp_endpoint = os.environ["ELASTIC_OTLP_ENDPOINT"].rstrip("/")
 api_key = os.environ["ELASTIC_API_KEY"]

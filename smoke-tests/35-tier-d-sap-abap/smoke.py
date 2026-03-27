@@ -245,6 +245,8 @@ try:
     sidecar_env["ELASTIC_API_KEY"]             = API_KEY
     sidecar_env["OTEL_DEPLOYMENT_ENVIRONMENT"] = "smoke-test"
     sidecar_env["SIDECAR_PORT"]                = str(SIDECAR_PORT)
+    sidecar_env["SIDECAR_LANGUAGE"]            = "abap"
+    sidecar_env["SIDECAR_RUNTIME_NAME"]        = "SAP ABAP 7.52"
 
     sidecar_proc = subprocess.Popen(
         [sys.executable, sidecar_py],
