@@ -91,6 +91,70 @@ hasn't provided them, ask before proceeding.
 
 ---
 
+## Phase 0 — Cost Estimate (Run this before touching anything)
+
+**Before any reconnaissance or instrumentation**, count the codebase and show the user an estimated cost. Do not skip this step. Do not proceed until the user confirms.
+
+### Step 1: Count source lines of code
+
+```bash
+find . \
+  \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.tsx" -o -name "*.jsx" \
+     -o -name "*.java" -o -name "*.go" -o -name "*.rb" -o -name "*.php" \
+     -o -name "*.cs" -o -name "*.cpp" -o -name "*.c" -o -name "*.rs" \
+     -o -name "*.cob" -o -name "*.cbl" -o -name "*.pl" -o -name "*.sh" \) \
+  -not -path "*/node_modules/*" \
+  -not -path "*/.git/*" \
+  -not -path "*/vendor/*" \
+  -not -path "*/dist/*" \
+  -not -path "*/build/*" \
+  -not -path "*/__pycache__/*" \
+  -not -path "*/target/*" \
+  | xargs wc -l 2>/dev/null | tail -1
+```
+
+Also note: number of distinct languages, number of services/components, whether any Tier D languages (no OTel SDK) are present.
+
+### Step 2: Apply the cost formula
+
+```
+cost_usd = 0.08 × LOC^0.4          (claude-sonnet — recommended)
+cost_usd = 0.021 × LOC^0.4         (claude-haiku  — simple/single-language projects)
+cost_usd = 0.40 × LOC^0.4          (claude-opus   — complex legacy / Tier D heavy)
+```
+
+Multiply by **1.3** if the project has 3 or more distinct components or languages.
+
+### Step 3: Present the estimate and ask for confirmation
+
+Show the user a message in this exact format — **do not proceed until they reply yes**:
+
+---
+
+**EDOT Autopilot — Cost Estimate**
+
+| | |
+|---|---|
+| Source lines counted | `<LOC>` |
+| Languages detected | `<list>` |
+| Components / services | `<count>` |
+| Model | `<model in use>` |
+| **Estimated cost** | **~$<X.XX>** |
+
+> This estimate covers the full instrumentation run (reconnaissance → code generation → .otel/ deliverables). Actual cost may vary ±40% depending on codebase complexity.
+>
+> To use a cheaper model: re-run with a Haiku model (~3.75× lower cost).
+> To cap spending: use `--max-budget-usd <amount>` if your agent supports it.
+
+**Proceed with instrumentation? (yes / no)**
+
+---
+
+If the user says **no**: stop. Do not read any project files or make any changes.
+If the user says **yes**: continue to Phase 1.
+
+---
+
 ## Phase 1 — Read Before You Touch
 
 **Before writing a single line of instrumentation**, read the codebase to understand

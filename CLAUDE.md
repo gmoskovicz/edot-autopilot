@@ -41,6 +41,72 @@ Claude will do the rest. No flags. No config files to fill in. No language selec
 
 ---
 
+## Phase 0 — Cost Estimate (Run this before touching anything)
+
+**Before any reconnaissance or instrumentation**, count the codebase and show the user an estimated cost. Do not skip this step. Do not proceed until the user confirms.
+
+### Step 1: Count source lines of code
+
+Run the following to count lines in all source files (exclude dependencies, build artifacts, and test fixtures):
+
+```bash
+find . \
+  \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.tsx" -o -name "*.jsx" \
+     -o -name "*.java" -o -name "*.go" -o -name "*.rb" -o -name "*.php" \
+     -o -name "*.cs" -o -name "*.cpp" -o -name "*.c" -o -name "*.rs" \
+     -o -name "*.cob" -o -name "*.cbl" -o -name "*.pl" -o -name "*.sh" \) \
+  -not -path "*/node_modules/*" \
+  -not -path "*/.git/*" \
+  -not -path "*/vendor/*" \
+  -not -path "*/dist/*" \
+  -not -path "*/build/*" \
+  -not -path "*/__pycache__/*" \
+  -not -path "*/target/*" \
+  | xargs wc -l 2>/dev/null | tail -1
+```
+
+Also note: number of distinct languages, number of services/components, and whether any Tier D languages (no OTel SDK) are present.
+
+### Step 2: Apply the cost formula
+
+```
+cost_usd = 0.08 × LOC^0.4          (claude-sonnet-4-6 — recommended)
+cost_usd = 0.021 × LOC^0.4         (claude-haiku-4-5  — simple/single-language projects)
+cost_usd = 0.40 × LOC^0.4          (claude-opus-4-6   — complex legacy / Tier D heavy)
+```
+
+Multiply by **1.3** if the project has 3 or more distinct components or languages.
+
+### Step 3: Present the estimate and ask for confirmation
+
+Show the user a message in this exact format — **do not proceed until they reply yes**:
+
+---
+
+**EDOT Autopilot — Cost Estimate**
+
+| | |
+|---|---|
+| Source lines counted | `<LOC>` |
+| Languages detected | `<list>` |
+| Components / services | `<count>` |
+| Model | `claude-<model>` |
+| **Estimated cost** | **~$<X.XX>** |
+
+> This estimate is based on the formula `0.08 × LOC^0.4` and covers the full instrumentation run (reconnaissance → code generation → .otel/ deliverables). Actual cost may vary ±40% depending on codebase complexity.
+>
+> To use a cheaper model: re-run with `--model claude-haiku-4-5` (~3.75× lower cost).
+> To cap spending: add `--max-budget-usd <amount>` to the CLI command.
+
+**Proceed with instrumentation? (yes / no)**
+
+---
+
+If the user says **no**: stop. Do not read any project files or make any changes.
+If the user says **yes**: continue to Phase 1.
+
+---
+
 ## Phase 1 — Read Before You Touch (What does this codebase actually do?)
 
 **Before writing a single line of instrumentation code**, read the codebase to understand
